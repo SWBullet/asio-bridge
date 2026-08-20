@@ -12,6 +12,18 @@ bool loadAsioDriver(char* name);
 
 static AsioRender* g_self = nullptr;
 
+// 纯 POD 的驱动加载+初始化（SEH 可安全包裹：设备掉线会清空驱动函数指针表，
+// 调用会 AV）。返回 true 表示 loadAsioDriver 成功（驱动已加载），*ae 存 ASIOInit 结果
+static bool asioLoadInitSafe(char* name, ASIODriverInfo* info, ASIOError* ae) {
+    __try {
+        if (!loadAsioDriver(name)) return false;
+        *ae = ASIOInit(info);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 static const char* typeName(long t) {
     switch (t) {
         case ASIOSTInt16LSB:      return "Int16LSB";
@@ -50,7 +62,17 @@ bool AsioRender::init(const std::string& driverName, double sampleRate, std::str
     char name[64] = {0};
     strncpy_s(name, sizeof(name), driverName.c_str(), _TRUNCATE);
 
-    if (!loadAsioDriver(name)) {
+    ASIODriverInfo info = {};
+    strncpy_s(info.name, sizeof(info.name), name, _TRUNCATE);
+    info.sysRef = nullptr;
+    ASIOError ae = ASE_NotPresent;
+
+    // 设备掉线可能清空驱动函数指针表，loadAsioDriver/ASIOInit 会 AV —— SEH 兜底
+    if (asioLoadInitSafe(name, &info, &ae)) {
+        loaded_ = true;
+    }
+
+    if (!loaded_) {
         err = "加载 ASIO 驱动失败: " + driverName + "（请确认注册表 HKLM\\SOFTWARE\\ASIO 下存在该驱动）";
         // 诊断：手动复现 SDK 加载链，定位失败环节
         HKEY hk = nullptr;
@@ -75,13 +97,7 @@ bool AsioRender::init(const std::string& driverName, double sampleRate, std::str
         }
         return false;
     }
-    loaded_ = true;
 
-    ASIODriverInfo info = {};
-    strncpy_s(info.name, sizeof(info.name), name, _TRUNCATE);
-    info.sysRef = nullptr;
-
-    ASIOError ae = ASIOInit(&info);
     if (ae != ASE_OK) {
         err = std::string("ASIOInit 失败: ") + info.errorMessage;
         shutdown();
@@ -155,9 +171,18 @@ void AsioRender::shutdown() {
     // 先切断回调路由：ASIOStop/DisposeBuffers 期间若仍有在途回调命中
     // render()，会访问正被释放的缓冲导致 use-after-free 崩溃
     g_self = nullptr;
-    if (started_) { printf("[ASIO] Stop...\n"); ASIOStop(); started_ = false; }
-    if (!bufInfos_.empty()) { printf("[ASIO] DisposeBuffers...\n"); ASIODisposeBuffers(); bufInfos_.clear(); }
-    if (loaded_) { printf("[ASIO] Exit...\n"); ASIOExit(); loaded_ = false; }   // 内部 removeCurrentDriver
+    // 设备掉线会清空驱动的函数指针表，调用 ASIOStop/DisposeBuffers 会在
+    // 本进程内访问违例（0xc0000005）——SEH 兜底，跳过已死驱动的清理
+    __try {
+        if (started_) { printf("[ASIO] Stop...\n"); ASIOStop(); started_ = false; }
+        if (!bufInfos_.empty()) { printf("[ASIO] DisposeBuffers...\n"); ASIODisposeBuffers(); bufInfos_.clear(); }
+        if (loaded_) { printf("[ASIO] Exit...\n"); ASIOExit(); loaded_ = false; }   // 内部 removeCurrentDriver
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        printf("[ASIO] shutdown 期间驱动异常（设备掉线），已安全跳过清理\n");
+        started_ = false;
+        loaded_ = false;
+        bufInfos_.clear();
+    }
 }
 
 void AsioRender::bufferSwitchCB(long doubleBufferIndex, ASIOBool directProcess) {
