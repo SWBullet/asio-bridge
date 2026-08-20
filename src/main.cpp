@@ -922,6 +922,7 @@ int wmain(int argc, wchar_t** argv) {
         std::atomic<bool> priming{false};
         uint64_t lastCapQpc = 0;
         ULONGLONG primeBegin = 0;   // prime 开始时刻（超时放弃用）
+        size_t lastFloorMult = 0;   // 检测水位下限变化（即时重置目标倍数）
         std::string oerr;
         uint16_t capCh = 2;
         auto onData = [&](const float* d, uint32_t frames) {
@@ -1020,6 +1021,7 @@ int wmain(int argc, wchar_t** argv) {
         //   回落：连续 6 窗口波谷 > 90% 目标 → -4（下限由控制台可调）
         //   启动 10 秒宽限期内不动作（排除启动瞬态）
         wMult.store(floorMult.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        lastFloorMult = floorMult.load(std::memory_order_relaxed);
         rs.reset();
         rateLock.reset();
         wmAvg = 0.0;
@@ -1180,6 +1182,18 @@ int wmain(int argc, wchar_t** argv) {
                     safeWindows = 0;
                     printf("[重置] 统计参数全部归零，水位目标回落下限 %zu 采样\n",
                            floorMult.load(std::memory_order_relaxed) * neededPerBuf);
+                }
+                // 水位下限切换 → 立即重置目标倍数（无需等自适应回落窗口）
+                {
+                    size_t fm = floorMult.load(std::memory_order_relaxed);
+                    if (fm != lastFloorMult) {
+                        printf("[自适应] 水位下限 %zu× → %zu×，目标立即重置为 %zu 采样\n",
+                               lastFloorMult, fm, fm * neededPerBuf);
+                        lastFloorMult = fm;
+                        wMult.store(fm, std::memory_order_relaxed);
+                        wmMin = rb.available();
+                        safeWindows = 0;
+                    }
                 }
                 // ASIO 停滞看门狗：消费量 4 秒不增而采集仍在写入。
                 // 不立即重建——对停滞中的 RME 驱动调用 DisposeBuffers 实测会崩溃；
