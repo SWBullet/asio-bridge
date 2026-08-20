@@ -1078,7 +1078,9 @@ int wmain(int argc, wchar_t** argv) {
         stampWrite.store(0, std::memory_order_relaxed);   // 清空上一会话时间戳
         // 恢复重新 prime：静默→有声跃迁后先持稳输出，等缓冲回填再继续
         std::atomic<bool> priming{false};
-        uint64_t lastCapQpc = 0;
+        // 最近一次采集包的 QPC 时间戳（onData 写、ASIO 拉取回调读：跨线程，需原子）。
+        // 用于区分「换歌间隙(采集停摆)」与「真时钟漂移欠载(采集在投递却供不上)」。
+        std::atomic<uint64_t> lastCapQpc{0};
         ULONGLONG primeBegin = 0;   // prime 开始时刻（超时放弃用）
         size_t lastFloorMult = 0;   // 检测水位下限变化（即时重置目标倍数）
         std::string oerr;
@@ -1089,9 +1091,10 @@ int wmain(int argc, wchar_t** argv) {
                     LARGE_INTEGER q;
                     QueryPerformanceCounter(&q);
                     uint64_t nowQ = (uint64_t)q.QuadPart;
-                    if (lastCapQpc && nowQ - lastCapQpc > (uint64_t)(qpcFreq * 0.5))
+                    uint64_t lp = lastCapQpc.load(std::memory_order_relaxed);
+                    if (lp && nowQ - lp > (uint64_t)(qpcFreq * 0.5))
                         priming.store(true, std::memory_order_relaxed);
-                    lastCapQpc = nowQ;
+                    lastCapQpc.store(nowQ, std::memory_order_relaxed);
                 }
                 size_t n = (size_t)frames * capCh;
                 size_t got = rb.write(d, n);
@@ -1235,16 +1238,25 @@ int wmain(int argc, wchar_t** argv) {
                 }
             }
             const size_t avail = rb.available();
-            if (want > 0 && avail == 0) {
-                memset(dst, 0, frames * ch * sizeof(float));
-                underruns++;
-                return frames;
+            // 区分「换歌间隙」与「真时钟漂移欠载」：采集 >40ms 无包 = 停摆(间隙)，
+            // 此刻环空输出静音是合法行为(曲间本就无声)，不计欠载；
+            // 只有采集仍在投递(包间 ~10ms)却供不上，才是有害的真欠载(时钟漂移)。
+            {
+                LARGE_INTEGER qg;
+                QueryPerformanceCounter(&qg);
+                uint64_t lpq = lastCapQpc.load(std::memory_order_relaxed);
+                bool cq = !lpq || ((uint64_t)qg.QuadPart - lpq) > (uint64_t)(qpcFreq * 0.04);
+                if (want > 0 && avail == 0) {
+                    memset(dst, 0, frames * ch * sizeof(float));
+                    if (!cq) underruns++;
+                    return frames;
+                }
+                if (rsIn_.size() < wantS) rsIn_.resize(wantS);
+                size_t gotS = rb.read(rsIn_.data(), avail < wantS ? avail : wantS);
+                if (gotS < wantS && !cq) underruns++;
+                rs.process(rsIn_.data(), gotS / 2, dst, frames);
+                consumed += gotS;
             }
-            if (rsIn_.size() < wantS) rsIn_.resize(wantS);
-            size_t gotS = rb.read(rsIn_.data(), avail < wantS ? avail : wantS);
-            if (gotS < wantS) underruns++;
-            rs.process(rsIn_.data(), gotS / 2, dst, frames);
-            consumed += gotS;
             // 会话启动淡入（无咔嗒切换）：重建/换目标后前 ~23ms 线性爬升
             if (fadePos < kFadeSamples) {
                 for (size_t i = 0; i < frames * ch; ++i) {
@@ -1315,6 +1327,7 @@ int wmain(int argc, wchar_t** argv) {
         size_t wmMin = rb.available();
         unsigned safeWindows = 0;
         unsigned windowCount = 0;
+        bool windowHadGap = false;   // 本窗口内出现过采集停摆(换歌间隙)——预判据此跳过
         ULONGLONG windowStart = GetTickCount64();
         ULONGLONG graceUntil = GetTickCount64() + 10000;
         // 漂移表（懒初始化：跳过启动瞬态，宽限期结束后再起测）
@@ -1394,6 +1407,15 @@ int wmain(int argc, wchar_t** argv) {
                 // ---- 自适应 v2：以窗口最低水位为控制信号 ----
                 size_t wm = rb.available();
                 if (wm < wmMin) wmMin = wm;
+                // 采集停摆检测（换歌间隙）：>40ms 无采集包。窗口内出现过间隙则预判跳过，
+                // 避免把「曲间合法静音导致的波谷」误判成「时钟漂移趋势」而 ratchet 上调目标
+                {
+                    LARGE_INTEGER qg;
+                    QueryPerformanceCounter(&qg);
+                    uint64_t lpq = lastCapQpc.load(std::memory_order_relaxed);
+                    if (!lpq || ((uint64_t)qg.QuadPart - lpq) > (uint64_t)(qpcFreq * 0.04))
+                        windowHadGap = true;
+                }
 
                 // 快排事件上报（一次丢弃打印一行）
                 {
@@ -1420,7 +1442,10 @@ int wmain(int argc, wchar_t** argv) {
                     size_t m = wMult.load(std::memory_order_relaxed);
                     size_t target = m * neededPerBuf;
                     if (now >= graceUntil) {
-                        if (wmMin < target / 2) {
+                        if (windowHadGap) {
+                            // 本窗口出现过换歌间隙：波谷被污染，不据此上调/回落
+                            safeWindows = 0;
+                        } else if (wmMin < target / 2) {
                             // 波谷低于半目标 → 预判性加固（还没欠载就升）
                             if (m < 32) {
                                 wMult.store(m + 4, std::memory_order_relaxed);
@@ -1449,6 +1474,7 @@ int wmain(int argc, wchar_t** argv) {
                     }
                     wmMin = wm;
                     windowStart = now;
+                    windowHadGap = false;
                 }
 
                 // 控制台 A/B 切换：直通 ↔ 重采样（实时生效，无需重建链路）
