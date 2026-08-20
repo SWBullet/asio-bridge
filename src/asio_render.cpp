@@ -152,10 +152,12 @@ bool AsioRender::init(const std::string& driverName, double sampleRate, std::str
 }
 
 void AsioRender::shutdown() {
+    // 先切断回调路由：ASIOStop/DisposeBuffers 期间若仍有在途回调命中
+    // render()，会访问正被释放的缓冲导致 use-after-free 崩溃
+    g_self = nullptr;
     if (started_) { printf("[ASIO] Stop...\n"); ASIOStop(); started_ = false; }
     if (!bufInfos_.empty()) { printf("[ASIO] DisposeBuffers...\n"); ASIODisposeBuffers(); bufInfos_.clear(); }
     if (loaded_) { printf("[ASIO] Exit...\n"); ASIOExit(); loaded_ = false; }   // 内部 removeCurrentDriver
-    g_self = nullptr;
 }
 
 void AsioRender::bufferSwitchCB(long doubleBufferIndex, ASIOBool directProcess) {

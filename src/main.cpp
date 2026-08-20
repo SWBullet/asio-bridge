@@ -852,6 +852,7 @@ int wmain(int argc, wchar_t** argv) {
     std::atomic<DWORD> discoveredPid{0};    // 发现线程输出：当前最响渲染进程
     std::atomic<float> discoveredPeak{0.0f};// 对应峰值
     ULONGLONG lastTargetSwitchAt = 0;       // 上次目标切换时刻（20 秒冷却防抖）
+    ULONGLONG lastWatchdogRebuild = 0;      // 上次看门狗重建时刻（20 秒退避）
     std::vector<EndpointMuteEntry> endpointMutes;  // 已静音端点（主线程独占，重建/退出时恢复）
     wchar_t procPref[64] = L"";             // 优先进程名子串（主线程独占读写）
 
@@ -920,6 +921,7 @@ int wmain(int argc, wchar_t** argv) {
         // 恢复重新 prime：静默→有声跃迁后先持稳输出，等缓冲回填再继续
         std::atomic<bool> priming{false};
         uint64_t lastCapQpc = 0;
+        ULONGLONG primeBegin = 0;   // prime 开始时刻（超时放弃用）
         std::string oerr;
         uint16_t capCh = 2;
         auto onData = [&](const float* d, uint32_t frames) {
@@ -1032,13 +1034,22 @@ int wmain(int argc, wchar_t** argv) {
         // ASIO 设备输出延迟（帧→毫秒，ASIOGetLatencies 上报，端到端延迟表用）
         double asioLatMs = 0.0;
         asio.setPullCallback([&](float* dst, size_t frames, size_t ch) -> size_t {
-            // 恢复重新 prime：暂停→恢复后先持稳输出静音，等缓冲回填到 4×ASIO 缓冲
+            // 恢复重新 prime：暂停→恢复后先持稳输出，等缓冲回填到 4×ASIO 缓冲。
+            // 3 秒超时放弃（目标音频断续时缓冲迟迟不满，避免一直持稳误触看门狗）
             if (priming.load(std::memory_order_relaxed)) {
                 if (rb.available() < frames * capCh * 4) {
-                    memset(dst, 0, frames * ch * sizeof(float));
-                    return frames;
+                    if (primeBegin == 0) primeBegin = GetTickCount64();
+                    if (GetTickCount64() - primeBegin > 3000) {
+                        priming.store(false, std::memory_order_relaxed);
+                        primeBegin = 0;
+                    } else {
+                        memset(dst, 0, frames * ch * sizeof(float));
+                        return frames;
+                    }
+                } else {
+                    priming.store(false, std::memory_order_relaxed);
+                    primeBegin = 0;
                 }
-                priming.store(false, std::memory_order_relaxed);
             }
             if (rs.carry.size() < (frames + 16) * 2) rs.setup(frames);
             // 重采样质量档切换（实时生效，切换时复位重采样器状态避免跨档 carry 混用）
@@ -1132,6 +1143,7 @@ int wmain(int argc, wchar_t** argv) {
         ULONGLONG lastStats = GetTickCount64();
         uint64_t lastConsumedW = consumed.load();
         ULONGLONG lastConsumedAt = GetTickCount64();
+        ULONGLONG stallLogAt = 0;   // 停滞日志节流
         uint64_t lastUnderW = underruns.load();
         // 自适应 v2 状态：窗口波谷跟踪 + 安全窗口计数 + 启动宽限
         size_t wmMin = rb.available();
@@ -1169,14 +1181,26 @@ int wmain(int argc, wchar_t** argv) {
                     printf("[重置] 统计参数全部归零，水位目标回落下限 %zu 采样\n",
                            floorMult.load(std::memory_order_relaxed) * neededPerBuf);
                 }
-                // ASIO 停滞看门狗：消费量 4 秒不增而采集仍在写入 → 回调被饿死
-                // （如目标进程异常导致 ASIO 回调被饿死时），自动重建链路
+                // ASIO 停滞看门狗：消费量 4 秒不增而采集仍在写入。
+                // 不立即重建——对停滞中的 RME 驱动调用 DisposeBuffers 实测会崩溃；
+                // 改为等待设备/驱动自恢复，仅「设备事件」（即插即用通知）或
+                // 超长停滞（120 秒）才重建。瞬态停滞（几秒）可自行恢复，零重建零崩溃
                 uint64_t c = consumed.load();
-                if (c != lastConsumedW) { lastConsumedW = c; lastConsumedAt = now; }
+                if (priming.load(std::memory_order_relaxed)) {
+                    // prime 持稳期 consumed 不增长属正常，跳过停滞判定
+                    lastConsumedW = c;
+                    lastConsumedAt = now;
+                } else if (c != lastConsumedW) { lastConsumedW = c; lastConsumedAt = now; }
                 else if (now - lastConsumedAt > 4000 && written.load() > c) {
-                    printf("[自适应] ASIO 回调停滞 4 秒（采集仍在写入），重建链路...\n");
-                    needRestart.store(true);
-                    break;
+                    if (now - lastConsumedAt > 120000) {
+                        printf("[自适应] ASIO 停滞 120 秒未恢复，强制重建...\n");
+                        needRestart.store(true);
+                        break;
+                    } else if (now - stallLogAt > 10000) {
+                        stallLogAt = now;
+                        printf("[自适应] ASIO 回调停滞 %llu 秒，等待设备恢复（不重建，避免驱动崩溃）...\n",
+                               (now - lastConsumedAt) / 1000);
+                    }
                 }
                 // ---- 自适应 v2：以窗口最低水位为控制信号 ----
                 size_t wm = rb.available();
