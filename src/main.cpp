@@ -24,6 +24,61 @@
 
 static std::atomic<bool> g_stop{false};
 
+// 设备事件监听（Core Audio 属性监听模型）：渲染设备增删/状态变化/默认设备
+// 变化 → 触发链路重建。回调在 MTA 线程池线程上执行，只写原子量、零 COM。
+class DeviceNotifier : public IMMNotificationClient {
+public:
+    DeviceNotifier(std::atomic<bool>* restart, std::atomic<bool>* stop)
+        : ref_(1), restart_(restart), stop_(stop) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (riid == __uuidof(IMMNotificationClient) || riid == __uuidof(IUnknown)) {
+            *ppv = static_cast<IMMNotificationClient*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref_); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG r = InterlockedDecrement(&ref_);
+        if (r == 0) delete this;
+        return r;
+    }
+    HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR id, DWORD state) override {
+        (void)id; (void)state;
+        bump();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR id) override {
+        (void)id;
+        bump();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR id) override {
+        (void)id;
+        bump();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow flow, ERole role, LPCWSTR id) override {
+        (void)id;
+        if (flow == eRender && role == eConsole) bump();
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(LPCWSTR id, const PROPERTYKEY key) override {
+        (void)id; (void)key;
+        return S_OK;
+    }
+private:
+    void bump() {
+        if (!stop_->load(std::memory_order_relaxed))
+            restart_->store(true, std::memory_order_relaxed);
+    }
+    LONG ref_;
+    std::atomic<bool>* restart_;
+    std::atomic<bool>* stop_;
+};
+
 static BOOL WINAPI ctrlHandler(DWORD type) {
     if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
         g_stop.store(true);
@@ -731,6 +786,15 @@ int wmain(int argc, wchar_t** argv) {
     std::atomic<float> peak{0.0f};
     std::atomic<bool> needRestart{false};
 
+    // 桥内延迟实测（Core Audio AudioTimeStamp 模型）：
+    // 采集线程把「已写采样数 → QPC」时间戳发布到环；ASIO 回调按消费前沿
+    // 反查写入时刻，差值即环形缓冲驻留时间（≈ 桥内真实延迟）
+    struct WriteStamp { uint64_t qpc; uint64_t written; };
+    static constexpr size_t kStampCap = 4096;
+    std::vector<WriteStamp> stampBuf(kStampCap);
+    std::atomic<uint64_t> stampWrite{0};
+    std::atomic<int> bridgeLatencyMs{0};   // 控制台显示（毫秒）
+
     // 控制台共享状态（HTTP 线程只读写这些原子量，零 COM 接触）
     std::atomic<size_t> wMult{8};          // 当前水位目标倍数
     std::atomic<size_t> floorMult{8};      // 下限倍数（控制台可调）
@@ -782,6 +846,7 @@ int wmain(int argc, wchar_t** argv) {
         &written, &consumed, &underruns, &dropped, &peak,
         &wMult, &floorMult, &driftPpm, &needRestart, &ditherReq, &ditherOn, &resetReq,
         &g_stop, &asioRate, &asioBuffer, &asioType, &capRate, &wmNow,
+        &bridgeLatencyMs,
         &histBuf, &histWrite, &ratioBase, &inRate, &outRate, &passthrough, &passthroughReq,
         &targetPid, &targetActive
     };
@@ -789,14 +854,37 @@ int wmain(int argc, wchar_t** argv) {
 
     // 目标发现线程（独立 MTA）：每 10 秒重新扫描「最响渲染进程」，
     // 结果经原子量异步发布，绝不阻塞 ASIO STA 主线程（阻塞实测会饿死回调）。
+    // 同时注册设备事件监听（Core Audio 属性监听模型）：渲染设备增删/状态变化/
+    // 默认设备变化即时触发重建，取代纯轮询的迟钝响应。
+    // 防抖：候选进程需连续两次扫描胜出才发布，单次瞬态不触发切换。
     std::thread discoveryThread([&] {
+        HRESULT hrc = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        if (FAILED(hrc)) return;
+        IMMDeviceEnumerator* devEnum = nullptr;
+        DeviceNotifier* notifier = new DeviceNotifier(&needRestart, &g_stop);
+        bool registered = false;
+        if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                       __uuidof(IMMDeviceEnumerator), (void**)&devEnum)) && devEnum &&
+            SUCCEEDED(devEnum->RegisterEndpointNotificationCallback(notifier))) {
+            registered = true;
+            printf("[Bridge] 设备事件监听已注册（设备/默认端点变化即时重建）\n");
+        }
+        DWORD prevPid = 0xFFFFFFFF;   // 上一次扫描结果（防抖：连续两次一致才发布）
         while (!g_stop.load()) {
             float pk = 0.0f;
             DWORD pid = FindActiveAudioPid(procPref, &pk);
-            discoveredPid.store(pid, std::memory_order_relaxed);
-            discoveredPeak.store(pk, std::memory_order_relaxed);
+            if (pid == prevPid) {
+                // 连续两次同一候选 → 确认发布
+                discoveredPid.store(pid, std::memory_order_relaxed);
+                discoveredPeak.store(pk, std::memory_order_relaxed);
+            }
+            prevPid = pid;
             for (int i = 0; i < 100 && !g_stop.load(); ++i) Sleep(100);
         }
+        if (registered && devEnum) devEnum->UnregisterEndpointNotificationCallback(notifier);
+        if (devEnum) devEnum->Release();
+        notifier->Release();
+        CoUninitialize();
     });
 
     bool first = true;
@@ -811,6 +899,10 @@ int wmain(int argc, wchar_t** argv) {
         }
         // 速率锁采样计数（本会话，每次重建归零；比率基值跨会话保留）
         uint64_t capCb = 0, asioCb = 0, inTotS = 0, outTotS = 0;
+        // 会话内环形缓冲写入计数（延迟实测用：环内前沿 → 写入时刻映射，
+        // 与累计计数解耦，避免历史丢弃量污染映射）
+        std::atomic<uint64_t> ringW{0};
+        stampWrite.store(0, std::memory_order_relaxed);   // 清空上一会话时间戳
         std::string oerr;
         uint16_t capCh = 2;
         auto onData = [&](const float* d, uint32_t frames) {
@@ -822,6 +914,16 @@ int wmain(int argc, wchar_t** argv) {
                 for (size_t i = 0; i < n; ++i) { float a = fabsf(d[i]); if (a > m) m = a; }
                 float cur = peak.load(std::memory_order_relaxed);
                 while (m > cur && !peak.compare_exchange_weak(cur, m, std::memory_order_relaxed)) {}
+                // 时间戳环（每包发布写入前沿 → ASIO 侧实测桥内延迟）
+                {
+                    LARGE_INTEGER q;
+                    QueryPerformanceCounter(&q);
+                    ringW.fetch_add(got, std::memory_order_relaxed);
+                    uint64_t si = stampWrite.load(std::memory_order_relaxed);
+                    stampBuf[si % kStampCap] = { (uint64_t)q.QuadPart,
+                                                 ringW.load(std::memory_order_relaxed) };
+                    stampWrite.store(si + 1, std::memory_order_release);
+                }
                 // 速率锁采样：每 25 个采集块记录 (QPC, 累计投递采样)
                 inTotS += n;
                 if ((++capCb) % 25 == 0) {
@@ -898,6 +1000,9 @@ int wmain(int argc, wchar_t** argv) {
         asio.setDither(ditherFlag || ditherReq.load(std::memory_order_relaxed));
         ditherOn.store(ditherFlag || ditherReq.load(std::memory_order_relaxed),
                        std::memory_order_relaxed);
+        // 会话启动淡入（无咔嗒切换）：每次重建后输出从 0 线性爬升
+        const size_t kFadeSamples = 2048;   // ≈23ms @88.2k 采样/秒
+        size_t fadePos = 0;
         asio.setPullCallback([&](float* dst, size_t frames, size_t ch) -> size_t {
             if (rs.carry.size() < (frames + 16) * 2) rs.setup(frames);
             rs.ratio = ratio.load(std::memory_order_relaxed);
@@ -928,6 +1033,32 @@ int wmain(int argc, wchar_t** argv) {
             if (gotS < wantS) underruns++;
             rs.process(rsIn_.data(), gotS / 2, dst, frames);
             consumed += gotS;
+            // 会话启动淡入（无咔嗒切换）：重建/换目标后前 ~23ms 线性爬升
+            if (fadePos < kFadeSamples) {
+                for (size_t i = 0; i < frames * ch; ++i) {
+                    if (fadePos >= kFadeSamples) break;
+                    dst[i] *= (float)(fadePos + 1) / (float)kFadeSamples;
+                    ++fadePos;
+                }
+            }
+            // 桥内延迟实测：环内消费前沿对应的采集写入时刻 → 驻留时间
+            {
+                uint64_t sw = stampWrite.load(std::memory_order_acquire);
+                if (sw > 1) {
+                    uint64_t frontier = ringW.load(std::memory_order_relaxed) - rb.available();
+                    for (uint64_t k = sw - 1; sw - k <= 64; --k) {
+                        const WriteStamp& st = stampBuf[k % kStampCap];
+                        if (st.written <= frontier) {
+                            LARGE_INTEGER qn;
+                            QueryPerformanceCounter(&qn);
+                            double ms = (double)(qn.QuadPart - (LONGLONG)st.qpc) * 1000.0 / qpcFreq;
+                            bridgeLatencyMs.store((int)ms, std::memory_order_relaxed);
+                            break;
+                        }
+                        if (k == 0) break;
+                    }
+                }
+            }
             // 速率锁采样：每 25 个 ASIO 回调记录 (QPC, 累计输出采样)
             outTotS += frames * ch;
             if ((++asioCb) % 25 == 0) {

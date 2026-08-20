@@ -215,7 +215,9 @@ async function pollStatus(){
       mtr('欠载',fmt(s.underruns),'累计',s.underruns>0?'warn':'')+
       mtr('峰值',s.peak.toFixed(3),'FS',s.peak>0.999?'bad':'')+
       mtr('采集',s.capRate+' Hz','Bridge')+
-      mtr('ASIO',s.asioRate+' Hz',s.asioBuffer+' 帧')+
+      mtr('链路延迟',s.latencyMs>0?s.latencyMs+' ms':'—','实测驻留',s.latencyMs>500?'bad':(s.latencyMs>200?'warn':''))+
+      mtr('ASIO',s.asioRate+' Hz','采样率')+
+      mtr('缓冲',s.asioBuffer+' 帧','ASIO')+
       mtr('运行',upTxt,'')+
       mtr('实测输入',s.inRate?s.inRate.toFixed(1)+' Hz':'—','')+
       mtr('实测输出',s.outRate?s.outRate.toFixed(1)+' Hz':'—','')+
@@ -379,6 +381,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             "\"written\":%llu,\"consumed\":%llu,"
             "\"asioRate\":%ld,\"asioBuffer\":%ld,\"asioType\":%ld,\"capRate\":%u,\"uptime\":%llu,"
             "\"dither\":%d,"
+            "\"latencyMs\":%d,"
             "\"ratioBase\":%.7f,\"inRate\":%.1f,\"outRate\":%.1f,\"passthrough\":%d,"
             "\"targetPid\":%u,\"targetActive\":%d}",
             wm, target, (unsigned long long)floorM, (unsigned long long)wmMult,
@@ -389,6 +392,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             (unsigned)g_p.capRate->load(std::memory_order_relaxed),
             (unsigned long long)(GetTickCount64() - g_startTick),
             g_p.ditherOn->load(std::memory_order_relaxed) ? 1 : 0,
+            (int)g_p.latencyMs->load(std::memory_order_relaxed),
             (double)g_p.ratioBase->load(std::memory_order_relaxed),
             (double)g_p.inRate->load(std::memory_order_relaxed),
             (double)g_p.outRate->load(std::memory_order_relaxed),

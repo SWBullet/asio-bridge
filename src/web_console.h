@@ -30,6 +30,7 @@ struct BridgeStatsPtrs {
     std::atomic<long>* asioType;
     std::atomic<uint32_t>* capRate;
     std::atomic<uint64_t>* wmNow;        // 实时水位（统计循环直写）
+    std::atomic<int>* latencyMs;         // 桥内延迟实测（毫秒，采集→ASIO 驻留时间）
     std::vector<HistPoint>* histBuf;       // 历史环形缓冲（容量 kHistCap）
     std::atomic<uint64_t>* histWrite;      // 已写入条数（发布语义）
     std::atomic<double>* ratioBase;        // 时钟速率锁基值（inHz/outHz）
