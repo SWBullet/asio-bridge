@@ -1,0 +1,1211 @@
+// Bridge: 目标应用渲染流 → (进程回环按 PID 旁路取流) → RME MADIface ASIO → ADI-2 Pro
+// 免虚拟声卡、免引擎混音/APO；自动静音目标端点消除双重声。
+#include "asio_render.h"
+#include "rate_lock.h"
+#include "resampler.h"
+#include "ring_buffer.h"
+#include "wasapi_process_capture.h"
+#include "util.h"
+#include "web_console.h"
+#include <windows.h>
+#include <mmdeviceapi.h>
+#include <endpointvolume.h>
+#include <propsys.h>
+#include <tlhelp32.h>
+#include <fcntl.h>
+#include <io.h>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <thread>
+
+static std::atomic<bool> g_stop{false};
+
+static BOOL WINAPI ctrlHandler(DWORD type) {
+    if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT || type == CTRL_CLOSE_EVENT) {
+        g_stop.store(true);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void usage() {
+    printf(
+        "ASIO Bridge - 应用 PCM 直通 RME MADIface ASIO\n"
+        "用法:\n"
+        "  asio_bridge                    默认: Bridge 进程回环采集 -> ASIO MADIface USB\n"
+        "  asio_bridge --list             列出 ASIO 驱动\n"
+        "  asio_bridge --tone             1kHz 正弦测试: 直接经 ASIO 输出(验证 ASIO 链路)\n"
+        "  asio_bridge --driver <名字>    指定 ASIO 驱动 (默认 ASIO MADIface USB)\n"
+        "  asio_bridge --rate <Hz>        --tone 模式的采样率 (默认 44100)\n"
+        "  asio_bridge --buffer <帧数>    ASIO 缓冲帧数 (默认驱动值, 低延迟可试 128/64)\n"
+        "  asio_bridge --log <文件>      输出追加写入日志文件（后台/自启运行用）\n"
+        "  asio_bridge --no-dither      关闭 TPDF 抖动（默认开启）\n"
+        "  asio_bridge --passthrough    直通模式：停用重采样（ratio 恒 1.0，逐位直通），\n"
+        "                              两时钟漂移由环形缓冲吸收，极限时才动作一次\n"
+        "  asio_bridge --resampler-test  重采样器正弦离线自检（数值验证）\n"
+        "  asio_bridge --pll-test        速率锁+水位闭环联合仿真自检（数值验证）\n"
+        "  asio_bridge --capture-test    Bridge 采集正弦自检（渲染→按 PID 回环自采比对）\n"
+        "Ctrl+C 停止\n");
+}
+
+// 分数重采样器离线自检：正弦信号下验证直通精确性、速率偏移失真与饥饿行为。
+// 与真链路共用同一 FractionalResampler 实现——数值过关才允许上线。
+static int resamplerSelfTest() {
+    const double Fs = 44100.0;
+    const double f = 1000.0;
+    const size_t need = 256;                    // 帧/回调（典型 ASIO 缓冲）
+    const size_t outFrames = 441000;            // 10 秒输出
+    const size_t inFrames = (size_t)((double)outFrames * 1.002) + need;
+    std::vector<float> in(inFrames * 2);
+    for (size_t i = 0; i < inFrames; ++i) {
+        float v = 0.5f * (float)sin(2.0 * 3.14159265358979323846 * f * (double)i / Fs);
+        in[i * 2] = v; in[i * 2 + 1] = v;
+    }
+    std::vector<float> out(need * 2);
+    FractionalResampler rs;
+    rs.setup(need);
+    bool allPass = true;
+
+    // 测试 1：ratio=1.0 直通——wantIn 投喂后逐采样精确
+    {
+        rs.reset(); rs.ratio = 1.0;
+        size_t ip = 0;
+        double maxE = 0.0, sumSq = 0.0; size_t n = 0;
+        while (ip < inFrames) {
+            size_t want = rs.wantIn(need);
+            if (ip + want > inFrames) break;
+            rs.process(&in[ip * 2], want, out.data(), need);
+            for (size_t j = 0; j < need * 2; ++j) {
+                double e = fabs((double)out[j] - (double)in[ip * 2 + j]);
+                if (e > maxE) maxE = e;
+                sumSq += e * e; ++n;
+            }
+            ip += want;
+        }
+        double rms = sqrt(sumSq / n);
+        bool pass = maxE < 1e-7;
+        printf("[自检1] ratio=1.0 直通: 最大误差 %.2e, RMS %.2e, %zu 采样 => %s\n",
+               maxE, rms, n, pass ? "PASS" : "FAIL");
+        allPass &= pass;
+    }
+
+    // 测试 2：ratio=1.0002 与理想 1000.2Hz 正弦对比（输出帧 m ↔ 输入帧位 m×ratio）
+    {
+        rs.reset(); rs.ratio = 1.0002;
+        size_t ip = 0, om = 0;   // ip=输入帧指针, om=全局输出帧索引
+        double maxE = 0.0, sumSq = 0.0; size_t n = 0;
+        while (ip < inFrames) {
+            size_t want = rs.wantIn(need);
+            if (ip + want > inFrames) break;
+            rs.process(&in[ip * 2], want, out.data(), need);
+            for (size_t j = 0; j < need; ++j) {
+                double ref = 0.5 * sin(2.0 * 3.14159265358979323846 * f * 1.0002
+                                       * (double)(om + j) / Fs);
+                double e0 = fabs((double)out[j * 2] - ref);
+                double e1 = fabs((double)out[j * 2 + 1] - ref);
+                if (e0 > maxE) maxE = e0;
+                if (e1 > maxE) maxE = e1;
+                sumSq += e0 * e0 + e1 * e1; n += 2;
+            }
+            om += need; ip += want;
+        }
+        double rms = sqrt(sumSq / n);
+        bool pass = rms < 1e-3 && maxE < 5e-3;
+        printf("[自检2] ratio=1.0002 理想对比: 最大误差 %.2e, RMS %.2e, %zu 采样 => %s\n",
+               maxE, rms, n, pass ? "PASS" : "FAIL");
+        allPass &= pass;
+    }
+
+    // 测试 3：比率摆动（模拟控制器行为）——输出有界、无 NaN
+    {
+        rs.reset();
+        size_t ip = 0;
+        bool bounded = true;
+        for (size_t k = 0; k < 5000; ++k) {
+            rs.ratio = ((k / 1000) % 2 == 0) ? 1.0003 : 0.9997;
+            size_t want = rs.wantIn(need);
+            if (ip + want > inFrames) ip = 0;
+            rs.process(&in[ip * 2], want, out.data(), need);
+            for (size_t j = 0; j < need * 2; ++j)
+                if (fabsf(out[j]) > 0.51f || out[j] != out[j]) bounded = false;
+            ip += want;
+        }
+        printf("[自检3] 比率摆动 0.9997~1.0003: %s\n", bounded ? "PASS" : "FAIL");
+        allPass &= bounded;
+    }
+
+    // 测试 4：饥饿钳制（输入 5 帧 / 需求 256 帧）——保持无 NaN、有界
+    {
+        rs.reset(); rs.ratio = 1.0;
+        float tiny[10];
+        for (int i = 0; i < 10; ++i) tiny[i] = 0.1f;
+        bool ok = true;
+        for (size_t k = 0; k < 100; ++k) {
+            rs.process(tiny, 5, out.data(), need);
+            for (size_t j = 0; j < need * 2; ++j)
+                if (fabsf(out[j]) > 0.11f || out[j] != out[j]) ok = false;
+        }
+        printf("[自检4] 饥饿输入(5/256帧): %s\n", ok ? "PASS" : "FAIL");
+        allPass &= ok;
+    }
+
+    printf(allPass ? "== 重采样器自检全部通过 ==\n" : "== 自检存在失败项 ==\n");
+    return allPass ? 0 : 1;
+}
+
+// 速率锁 + 水位闭环联合仿真（--pll-test）：
+// 用真实的 FractionalResampler + RateLock 与主循环相同的闭环公式，
+// 模拟采集时钟 44100×(1+25ppm) 投递、ASIO 时钟 44100×(1-15ppm) 消费，
+// 运行 1200 秒；验证 ratio 收敛到理论时钟比、水位有界、稳态零欠载。
+static int pllSelfTest() {
+    const double rc = 44100.0 * (1.0 + 25e-6);   // 采集时钟
+    const double ra = 44100.0 * (1.0 - 15e-6);   // ASIO 时钟
+    const double truth = rc / ra;                 // 理论 ratio ≈ 1.00004
+    const size_t need = 256;                      // 帧/回调
+    const double qpcFreq = 1e7;                   // 仿真 QPC 10MHz
+
+    FractionalResampler rs;
+    rs.setup(need);
+    RateLock lock;
+
+    const size_t chunk = 441 * 2;                       // 采集块采样数（~10ms×2ch）
+    const double capPeriod = (double)(chunk / 2) / rc;   // 采集块间隔（秒）
+    const double asioPeriod = (double)need / ra;         // ASIO 回调间隔（秒）
+
+    double simT = 0.0;
+    double nextCap = 0.0, nextAsio = 0.0, nextTick = 0.0;
+    uint64_t inTot = 0, outTot = 0, capCb = 0, asioCb = 0;
+    double ring = 4096.0;      // 采样（初始预填充 = 8×512 目标水位）
+    const double setpoint = 4096.0;
+    double wmAvg = 4096.0;
+    double ratio = 1.0, ratioBase = 1.0;
+    uint64_t underruns = 0;
+    double minRing = ring, maxRing = ring;
+    double sumWarm = 0.0; uint64_t nWarm = 0, tickCount = 0;
+    uint64_t capEvents = 0, asioEvents = 0, conSum = 0, wantSum = 0;
+
+    std::vector<float> feed(need * 2, 0.5f);
+    std::vector<float> dst(need * 2);
+
+    // 均匀随机抖动（LCG，零均值无偏）。关键：抖动加在固定设备时钟栅格上
+    // （t = n×P + εn，εn 独立同分布），而非累加在周期上——真实设备的
+    // 事件围绕晶体时钟栅格抖动，相位不会随机游走（累加式抖动会让
+    // 300 秒窗口端点漂移 ±20ms，把速率测量噪声放大到 ±70ppm）。
+    uint32_t lcg = 12345u;
+    auto rnd01 = [&]() { lcg = lcg * 1664525u + 1013904223u; return (double)(lcg >> 8) / 16777216.0; };
+    double capGrid = 0.0, asioGrid = 0.0;
+    // 事件驱动仿真（时间精确，无步进量化偏差——步进式会引入
+    // 每事件 +0.05ms 的系统性时延，把实测速率压低约 0.5%）
+    while (simT < 1200.0) {
+        double next = nextCap < nextAsio ? nextCap : nextAsio;
+        if (nextTick < next) next = nextTick;
+        if (next >= 1200.0) break;
+        simT = next;
+        // 采集投递（±1ms 均匀随机抖动模拟 WASAPI 周期抖动）
+        if (simT >= nextCap) {
+            ring += (double)chunk;
+            inTot += chunk;
+            capEvents++;
+            if ((++capCb) % 25 == 0)
+                lock.pushIn((uint64_t)(simT * qpcFreq), inTot);
+            nextCap = capGrid + (rnd01() * 2.0 - 1.0) * 0.001;
+            capGrid += capPeriod;
+        }
+        // ASIO 消费（±0.5ms 均匀随机抖动）
+        if (simT >= nextAsio) {
+            rs.ratio = ratio;
+            size_t want = rs.wantIn(need);
+            size_t wantS = want * 2;
+            size_t avail = ring >= (double)wantS ? wantS : (size_t)ring;
+            if (avail < wantS) underruns++;
+            ring -= (double)avail;
+            conSum += avail;
+            wantSum += want;
+            asioEvents++;
+            rs.process(feed.data(), avail / 2, dst.data(), need);
+            outTot += (uint64_t)need * 2;
+            if ((++asioCb) % 25 == 0)
+                lock.pushOut((uint64_t)(simT * qpcFreq), outTot);
+            nextAsio = asioGrid + (rnd01() * 2.0 - 1.0) * 0.0005;
+            asioGrid += asioPeriod;
+        }
+        // 控制节拍（2 秒，与主循环相同公式）
+        if (simT >= nextTick) {
+            tickCount++;
+            wmAvg += (ring - wmAvg) * 0.1;
+            double ih = 0.0, oh = 0.0;
+            if (lock.update(qpcFreq, &ih, &oh) && ih > 1000.0 && oh > 1000.0) {
+                double b = ih / oh;
+                if (tickCount <= 4 || tickCount % 150 == 0)
+                    printf("[调试]   锁: in=%.2f out=%.2f base=%.7f err=%.0f\n",
+                           ih, oh, b, wmAvg - setpoint);
+                if (b < 0.999) b = 0.999;
+                if (b > 1.001) b = 1.001;
+                ratioBase = b;
+            }
+            double err = wmAvg - setpoint;
+            double cap = (err > 1024.0 || err < -1024.0) ? 0.001 : 0.0003;
+            double r = ratioBase + err * 5e-7;
+            if (r > ratioBase + cap) r = ratioBase + cap;
+            if (r < ratioBase - cap) r = ratioBase - cap;
+            ratio = r;
+            nextTick += 2.0;
+        }
+        if (ring > maxRing) maxRing = ring;
+        if (ring < minRing) minRing = ring;
+        if (simT >= 600.0) { sumWarm += ratio; nWarm++; }
+    }
+
+    bool pass = true;
+    double avgWarm = nWarm ? sumWarm / (double)nWarm : 1.0;
+    printf("[速率锁] 理论 ratio = %.7f (采集 +25ppm / ASIO -15ppm)\n", truth);
+    printf("[速率锁] 600~1200 秒平均 ratio = %.7f (误差 %+.2f ppm)\n",
+           avgWarm, (avgWarm - truth) * 1e6);
+    if (fabs(avgWarm - truth) * 1e6 > 20.0) { printf("[速率锁] 收敛超差 => FAIL\n"); pass = false; }
+    printf("[速率锁] 水位范围 %.0f ~ %.0f (目标 %.0f), 欠载 %llu, 节拍 %llu\n",
+           minRing, maxRing, setpoint, underruns, tickCount);
+    printf("[速率锁] 采集事件 %llu × %zu = %llu 采样, ASIO 事件 %llu, 消费 %llu 采样, 平均 want %.2f\n",
+           capEvents, chunk, capEvents * (uint64_t)chunk, asioEvents, conSum,
+           asioEvents ? (double)wantSum / (double)asioEvents : 0.0);
+    if (minRing < 1000.0 || maxRing > 20000.0) { printf("[速率锁] 水位越界 => FAIL\n"); pass = false; }
+    if (underruns != 0) { printf("[速率锁] 稳态存在欠载 => FAIL\n"); pass = false; }
+    printf(pass ? "== 速率锁仿真自检通过 ==\n" : "== 速率锁仿真自检失败 ==\n");
+    return pass ? 0 : 1;
+}
+
+// 进程回环采集数值自检（--capture-test）：
+//   本进程渲染 997Hz 正弦（优先送入 CABLE Input 静默端点，不打扰耳朵；
+//   无则用默认设备并降幅）→ 按自身 PID 进程回环采集 → 幅度/频率比对。
+static int captureSelfTest() {
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr)) { printf("[Bridge 自检] CoInitializeEx 失败 0x%08lX\n", (unsigned)hr); return 1; }
+
+    IMMDeviceEnumerator* en = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                __uuidof(IMMDeviceEnumerator), (void**)&en))) {
+        printf("[Bridge 自检] 创建 MMDeviceEnumerator 失败\n"); CoUninitialize(); return 1;
+    }
+
+    // 0) 诊断基线：用同一异步激活机制激活默认渲染设备（默认参数）
+    {
+        class DiagHandler : public IActivateAudioInterfaceCompletionHandler, public IAgileObject {
+        public:
+            DiagHandler() : ref_(1), event_(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {}
+            ~DiagHandler() { if (event_) CloseHandle(event_); }
+            HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+                if (riid == __uuidof(IActivateAudioInterfaceCompletionHandler) ||
+                    riid == __uuidof(IAgileObject) || riid == __uuidof(IUnknown)) {
+                    *ppv = static_cast<IActivateAudioInterfaceCompletionHandler*>(this); AddRef(); return S_OK;
+                }
+                *ppv = nullptr; return E_NOINTERFACE;
+            }
+            ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&ref_); }
+            ULONG STDMETHODCALLTYPE Release() override {
+                ULONG r = InterlockedDecrement(&ref_);
+                if (r == 0) delete this;
+                return r;
+            }
+            HRESULT STDMETHODCALLTYPE ActivateCompleted(IActivateAudioInterfaceAsyncOperation* op) override {
+                IUnknown* unk = nullptr;
+                HRESULT r = E_UNEXPECTED;
+                if (SUCCEEDED(op->GetActivateResult(&r, &unk))) { hr_ = r; if (unk) unk->Release(); }
+                else hr_ = r;
+                SetEvent(event_);
+                return S_OK;
+            }
+            HRESULT Wait(DWORD ms) { WaitForSingleObject(event_, ms); return hr_; }
+            LONG ref_ = 1;
+            HANDLE event_;
+            HRESULT hr_ = E_UNEXPECTED;
+        };
+        IMMDevice* defDev = nullptr;
+        LPWSTR devId = nullptr;
+        if (SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eConsole, &defDev)) &&
+            SUCCEEDED(defDev->GetId(&devId))) {
+            PROPVARIANT empty;
+            PropVariantInit(&empty);   // VT_EMPTY = 默认激活
+            DiagHandler* dh = new DiagHandler();
+            IActivateAudioInterfaceAsyncOperation* dop = nullptr;
+            HRESULT dhAct = ActivateAudioInterfaceAsync(devId, __uuidof(IAudioClient), &empty, dh, &dop);
+            HRESULT dhRes = dh->Wait(5000);
+            printf("[Bridge 自检] 基线(异步激活默认设备): 同步 0x%08lX / 完成 0x%08lX\n",
+                   (unsigned long)dhAct, (unsigned long)dhRes);
+            if (dop) dop->Release();
+            dh->Release();
+            CoTaskMemFree(devId);
+            defDev->Release();
+        } else {
+            printf("[Bridge 自检] 基线激活: 无法获取默认设备 ID\n");
+        }
+    }
+
+    // 1) 选渲染端点：优先 CABLE Input（静默目标），失败则逐个尝试其余
+    //    活动渲染端点（低音量）——回环自采只关心本进程音频，不挑设备
+    IMMDevice* renderDev = nullptr;
+    std::vector<IMMDevice*> candidates;
+    IMMDeviceCollection* coll = nullptr;
+    if (SUCCEEDED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &coll)) && coll) {
+        UINT count = 0; coll->GetCount(&count);
+        for (UINT i = 0; i < count; ++i) {
+            IMMDevice* dev = nullptr;
+            if (FAILED(coll->Item(i, &dev))) continue;
+            IPropertyStore* store = nullptr;
+            std::wstring name;
+            if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &store))) {
+                PROPVARIANT v; PropVariantInit(&v);
+                static const PROPERTYKEY kName = {{0xa45c254e,0xdf1c,0x4efd,{0x80,0x20,0x67,0xd1,0x46,0xa8,0x50,0xe0}}, 14};
+                if (SUCCEEDED(store->GetValue(kName, &v)) && v.vt == VT_LPWSTR) name = v.pwszVal;
+                PropVariantClear(&v); store->Release();
+            }
+            if (wcsstr(name.c_str(), L"CABLE Input")) candidates.insert(candidates.begin(), dev);
+            else candidates.push_back(dev);
+        }
+        coll->Release();
+    }
+    bool silentTarget = false;
+    IAudioClient* rc = nullptr;
+    uint32_t mixRate = 44100;
+    size_t candIdx = 0;
+    for (; candIdx < candidates.size(); ++candIdx) {
+        renderDev = candidates[candIdx];
+        rc = nullptr;
+        if (FAILED(renderDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&rc))) continue;
+        WAVEFORMATEX* mf = nullptr;
+        if (SUCCEEDED(rc->GetMixFormat(&mf)) && mf) {
+            hr = rc->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0, 0, mf, nullptr);
+            mixRate = mf->nSamplesPerSec;
+            CoTaskMemFree(mf);
+        } else {
+            hr = E_FAIL;
+        }
+        if (SUCCEEDED(hr)) break;
+        rc->Release();
+        rc = nullptr;
+    }
+    for (size_t i = 0; i < candidates.size(); ++i)
+        if (candidates[i] != renderDev) candidates[i]->Release();
+    if (!rc || !renderDev) {
+        printf("[Bridge 自检] 没有任何可用的渲染端点（音频服务/设备状态异常？）\n");
+        en->Release(); CoUninitialize(); return 1;
+    }
+    silentTarget = (candIdx == 0);
+    {
+        IPropertyStore* store = nullptr;
+        std::wstring devName = L"?";
+        if (SUCCEEDED(renderDev->OpenPropertyStore(STGM_READ, &store))) {
+            PROPVARIANT v; PropVariantInit(&v);
+            static const PROPERTYKEY kName = {{0xa45c254e,0xdf1c,0x4efd,{0x80,0x20,0x67,0xd1,0x46,0xa8,0x50,0xe0}}, 14};
+            if (SUCCEEDED(store->GetValue(kName, &v)) && v.vt == VT_LPWSTR) devName = v.pwszVal;
+            PropVariantClear(&v); store->Release();
+        }
+        printf("[Bridge 自检] 渲染端点: %ls\n", devName.c_str());
+    }
+    IAudioRenderClient* rr = nullptr;
+    rc->GetService(__uuidof(IAudioRenderClient), (void**)&rr);
+    HANDLE rEvt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    rc->SetEventHandle(rEvt);
+
+    const double fTest = 997.0;
+    const double amp = silentTarget ? 0.5 : 0.08;
+    printf("[Bridge 自检] 渲染 %g Hz 正弦 @ %u Hz (振幅 %.2f, %s) → 按 PID 回环自采\n",
+           fTest, mixRate, amp, silentTarget ? "静默目标 CABLE Input" : "默认设备(低音量)");
+
+    std::atomic<bool> renderRun{true};
+    std::thread renderThread([&] {
+        UINT32 bufFrames = 0; rc->GetBufferSize(&bufFrames);
+        double phase = 0.0;
+        rc->Start();
+        while (renderRun.load()) {
+            if (WaitForSingleObject(rEvt, 100) != WAIT_OBJECT_0) continue;
+            UINT32 pad = 0; rc->GetCurrentPadding(&pad);
+            UINT32 avail = bufFrames - pad;
+            if (avail == 0) continue;
+            BYTE* p = nullptr;
+            if (SUCCEEDED(rr->GetBuffer(avail, &p))) {
+                float* fp = (float*)p;
+                for (UINT32 i = 0; i < avail; ++i) {
+                    float s = (float)(amp * sin(phase));
+                    phase += 2.0 * 3.14159265358979323846 * fTest / mixRate;
+                    if (phase > 2.0 * 3.14159265358979323846) phase -= 2.0 * 3.14159265358979323846;
+                    fp[i * 2] = s; fp[i * 2 + 1] = s;
+                }
+                rr->ReleaseBuffer(avail, 0);
+            }
+        }
+        rc->Stop();
+    });
+    Sleep(400);
+
+    // 2) 进程回环采集本进程（激活失败则多 PID 诊断：本进程 / explorer / audiodg）
+    std::vector<float> capBuf;
+    WasapiProcessCapture pc;
+    std::string err;
+    DWORD diagPids[3] = { GetCurrentProcessId(), 0, 0 };
+    {
+        // 找 explorer / audiodg 的 PID 作对照
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe; pe.dwSize = sizeof(pe);
+            if (Process32FirstW(snap, &pe)) {
+                do {
+                    if (_wcsicmp(pe.szExeFile, L"explorer.exe") == 0 && !diagPids[1]) diagPids[1] = pe.th32ProcessID;
+                    if (_wcsicmp(pe.szExeFile, L"audiodg.exe") == 0 && !diagPids[2]) diagPids[2] = pe.th32ProcessID;
+                } while (Process32NextW(snap, &pe));
+            }
+            CloseHandle(snap);
+        }
+    }
+    bool opened = false;
+    for (int di = 0; di < 3 && !opened; ++di) {
+        if (!diagPids[di]) continue;
+        opened = pc.open(diagPids[di], [&](const float* d, uint32_t frames) {
+                capBuf.insert(capBuf.end(), d, d + (size_t)frames * 2);
+            }, err);
+        if (!opened && di == 0) {
+            printf("[Bridge 自检] 本进程激活失败(%s)，多 PID 诊断...\n", err.c_str());
+            opened = false;
+        }
+    }
+    if (!opened) {
+        printf("[Bridge 自检] 全部 PID 激活失败: %s（音频服务状态异常？建议重启系统）\n", err.c_str());
+        renderRun.store(false); renderThread.join();
+        CloseHandle(rEvt); rc->Release(); renderDev->Release(); en->Release(); CoUninitialize();
+        return 1;
+    }
+    const uint32_t capRate = pc.format().sampleRate;
+    Sleep(3000);
+    pc.close();
+    renderRun.store(false);
+    renderThread.join();
+
+    {
+        FILE* f = nullptr;
+        if (fopen_s(&f, "captest.raw", "wb") == 0 && f) {
+            fwrite(capBuf.data(), sizeof(float), capBuf.size(), f);
+            fclose(f);
+            printf("[Bridge 自检] 已转储 %zu 采样 -> captest.raw（当前目录）\n", capBuf.size());
+        }
+    }
+
+    // 3) 分析：RMS / 峰值 / 零交叉频率（只用左声道，步长 2）
+    //    跳过前 0.5s：回环流启动时引擎有 ~30ms 预卷静音，±1LSB 量化闪烁
+    //    会产生假过零，污染频率估计
+    double sumSq = 0.0, mx = 0.0;
+    size_t zc = 0, nCh = 0;
+    size_t start = (size_t)capRate / 2 * 2;   // 0.5s
+    for (size_t i = start; i + 1 < capBuf.size(); i += 2) {
+        double v = capBuf[i];
+        sumSq += v * v;
+        if (fabs(v) > mx) mx = fabs(v);
+        if (i >= 2) {
+            double prev = capBuf[i - 2];
+            if (prev < 0.0 && v >= 0.0) ++zc;
+        }
+        ++nCh;
+    }
+    double rms = nCh ? sqrt(sumSq / nCh) : 0.0;
+    double freq = nCh ? (double)zc * (double)capRate / (double)nCh : 0.0;
+    const double expectRms = amp / 1.41421356237;
+    printf("[Bridge 自检] 采集 %u Hz / %u 通道, %zu 采样: RMS %.4f (期望 %.4f), 峰值 %.3f, 频率 %.2f Hz (期望 %.1f)\n",
+           capRate, pc.format().channels, nCh, rms, expectRms, mx, freq, fTest);
+
+    bool pass = true;
+    if (capRate != mixRate) { printf("[Bridge 自检] 速率不一致 => FAIL\n"); pass = false; }
+    if (rms < expectRms * 0.8 || rms > expectRms * 1.2) { printf("[Bridge 自检] 幅度超差 => FAIL\n"); pass = false; }
+    if (mx < amp * 0.85) { printf("[Bridge 自检] 峰值过低 => FAIL\n"); pass = false; }
+    if (fabs(freq - fTest) > 5.0) { printf("[Bridge 自检] 频率超差 => FAIL\n"); pass = false; }
+
+    // 4) 端点静音语义验证（tap→redirect 机制）：数值实验已证明回环取点在
+    //    「会话静音之后、终点主音量之前」——会话级静音会哑掉捕获（不可用），
+    //    终点主音量静音既消除双重声又完全不影响捕获。此阶段验证：
+    //    MuteTargetEndpoints 静音 → 回环捕获 RMS 不变 → RestoreEndpointMutes 恢复。
+    {
+        printf("[Bridge 自检] 阶段4：静音目标端点后回环捕获必须不受影响...\n");
+        std::atomic<bool> run2{true};
+        std::thread render2([&] {
+            UINT32 bf = 0; rc->GetBufferSize(&bf);
+            double phase = 0.0;
+            rc->Start();
+            while (run2.load()) {
+                if (WaitForSingleObject(rEvt, 100) != WAIT_OBJECT_0) continue;
+                UINT32 pad = 0; rc->GetCurrentPadding(&pad);
+                UINT32 avail = bf - pad;
+                if (avail == 0) continue;
+                BYTE* p = nullptr;
+                if (SUCCEEDED(rr->GetBuffer(avail, &p))) {
+                    float* fp = (float*)p;
+                    for (UINT32 i = 0; i < avail; ++i) {
+                        float s = (float)(amp * sin(phase));
+                        phase += 2.0 * 3.14159265358979323846 * fTest / mixRate;
+                        if (phase > 2.0 * 3.14159265358979323846) phase -= 2.0 * 3.14159265358979323846;
+                        fp[i * 2] = s; fp[i * 2 + 1] = s;
+                    }
+                    rr->ReleaseBuffer(avail, 0);
+                }
+            }
+            rc->Stop();
+        });
+        Sleep(400);
+        // 先读起点静音态：端点若已被外部静音（如用户混音器操作），
+        // MuteTargetEndpoints 会正确地不做任何事（0 新增）——不算失败，
+        // 恢复断言也应以「保持外部静音态」为准
+        bool wasMutedBefore = false;
+        {
+            IAudioEndpointVolume* ev = nullptr;
+            if (SUCCEEDED(renderDev->Activate(__uuidof(IAudioEndpointVolume),
+                                              CLSCTX_ALL, nullptr, (void**)&ev)) && ev) {
+                BOOL m = FALSE;
+                ev->GetMute(&m);
+                wasMutedBefore = m != FALSE;
+                ev->Release();
+            }
+        }
+        std::vector<EndpointMuteEntry> mutes = MuteTargetEndpoints(GetCurrentProcessId());
+        printf("[Bridge 自检] 已静音目标端点 %zu 个（外部预静音态: %s）\n",
+               mutes.size(), wasMutedBefore ? "是" : "否");
+        bool ok4 = true;
+        if (!wasMutedBefore && mutes.empty()) {
+            printf("[Bridge 自检] 端点未静音却也静不到 => FAIL\n");
+            ok4 = false;
+        }
+        {
+            IAudioEndpointVolume* ev = nullptr;
+            if (SUCCEEDED(renderDev->Activate(__uuidof(IAudioEndpointVolume),
+                                              CLSCTX_ALL, nullptr, (void**)&ev)) && ev) {
+                BOOL m = FALSE;
+                ev->GetMute(&m);
+                printf("[Bridge 自检] 终点静音态检查: %s（期望 TRUE）%s\n",
+                       m ? "TRUE" : "FALSE", m ? "✓" : "✗");
+                if (!m) ok4 = false;
+                ev->Release();
+            }
+        }
+
+        std::vector<float> cap2;
+        WasapiProcessCapture pc2;
+        std::string err2;
+        if (!pc2.open(GetCurrentProcessId(), [&](const float* d, uint32_t frames) {
+                cap2.insert(cap2.end(), d, d + (size_t)frames * 2);
+            }, err2)) {
+            printf("[Bridge 自检] 阶段4捕获打开失败: %s => FAIL\n", err2.c_str());
+            ok4 = false;
+        } else {
+            Sleep(1500);
+            pc2.close();
+            double sumSq2 = 0.0;
+            size_t n2 = 0;
+            size_t start2 = (size_t)pc2.format().sampleRate / 2 * 2;
+            for (size_t i = start2; i + 1 < cap2.size(); i += 2) {
+                double v = cap2[i];
+                sumSq2 += v * v;
+                ++n2;
+            }
+            double rms2 = n2 ? sqrt(sumSq2 / n2) : 0.0;
+            bool inRange2 = rms2 > expectRms * 0.8 && rms2 < expectRms * 1.2;
+            printf("[Bridge 自检] 终点静音后捕获 RMS %.4f（期望 %.4f）%s\n",
+                   rms2, expectRms,
+                   inRange2 ? "=> 回环取点在终点主音量之前 ✓（redirect 机制成立）"
+                            : "=> 回环取点在终点主音量之后 ✗");
+            if (!inRange2) ok4 = false;
+        }
+
+        RestoreEndpointMutes(mutes);
+        {
+            IAudioEndpointVolume* ev = nullptr;
+            if (SUCCEEDED(renderDev->Activate(__uuidof(IAudioEndpointVolume),
+                                              CLSCTX_ALL, nullptr, (void**)&ev)) && ev) {
+                BOOL m = TRUE;
+                ev->GetMute(&m);
+                bool expectAfter = wasMutedBefore;   // 我们没动过的外部静音应保持
+                printf("[Bridge 自检] 恢复后终点静音态: %s（期望 %s）%s\n",
+                       m ? "TRUE" : "FALSE", expectAfter ? "TRUE" : "FALSE",
+                       ((m != FALSE) == expectAfter) ? "✓" : "✗");
+                if ((m != FALSE) != expectAfter) ok4 = false;
+                ev->Release();
+            }
+        }
+
+        run2.store(false);
+        render2.join();
+        if (!ok4) pass = false;
+    }
+
+    CloseHandle(rEvt);
+    rc->Release();
+    renderDev->Release();
+    en->Release();
+    CoUninitialize();
+    printf(pass ? "== 进程回环采集自检通过 ==\n" : "== 进程回环采集自检失败 ==\n");
+    return pass ? 0 : 1;
+}
+
+int wmain(int argc, wchar_t** argv) {
+    SetConsoleOutputCP(65001);
+    setvbuf(stdout, nullptr, _IONBF, 0);   // 无缓冲，崩溃时也能看到输出
+    SetConsoleCtrlHandler(ctrlHandler, TRUE);
+
+    bool list = false, tone = false;
+    std::string driver = "ASIO MADIface USB";
+    double toneRate = 44100.0;
+    long reqBuffer = 0;
+    bool ditherFlag = true;   // TPDF 抖动默认开启，--no-dither 关闭
+    bool passthroughArg = false;   // 直通模式：停用重采样
+
+    for (int i = 1; i < argc; ++i) {
+        std::wstring a = argv[i];
+        if (a == L"--list") list = true;
+        else if (a == L"--tone") tone = true;
+        else if (a == L"--driver" && i + 1 < argc) driver = ws2s(argv[++i]);
+        else if (a == L"--rate" && i + 1 < argc) toneRate = _wtof(argv[++i]);
+        else if (a == L"--buffer" && i + 1 < argc) reqBuffer = _wtol(argv[++i]);
+        else if (a == L"--dither") ditherFlag = true;
+        else if (a == L"--no-dither") ditherFlag = false;
+        else if (a == L"--passthrough") passthroughArg = true;
+        else if (a == L"--resampler-test") { return resamplerSelfTest(); }
+        else if (a == L"--pll-test") { return pllSelfTest(); }
+        else if (a == L"--capture-test") { return captureSelfTest(); }
+        else if (a == L"--log" && i + 1 < argc) {
+            // 共享读写打开日志（允许外部实时查看），重定向 stdout
+            HANDLE h = CreateFileW(argv[++i], FILE_APPEND_DATA,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                   OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h != INVALID_HANDLE_VALUE) {
+                int fd = _open_osfhandle((intptr_t)h, _O_APPEND | _O_TEXT);
+                if (fd != -1) {
+                    _dup2(fd, _fileno(stdout));
+                    setvbuf(stdout, nullptr, _IONBF, 0);
+                }
+            }
+        }
+        else if (a == L"--help" || a == L"-h") { usage(); return 0; }
+    }
+
+    // 必须 STA：RME MADIface ASIO 的 COM 对象(ThreadingModel=Apartment)
+    // 仅在 STA 公寓中暴露其 ASIO 接口（MTA 下返回 E_NOINTERFACE）。
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr)) { printf("CoInitializeEx 失败\n"); return 1; }
+
+    if (list) {
+        // 注意顺序：AsioDrivers 局部实例析构时会无条件 CoUninitialize()
+        //（SDK 老代码 bug），放在最后避免影响 COM。
+        printf("ASIO 驱动:\n%s", AsioRender::listDrivers().c_str());
+        CoUninitialize();
+        return 0;
+    }
+
+    std::string err;
+
+    if (tone) {
+        // 测试模式: 1kHz 正弦直接进 ASIO，验证 ADI-2 Pro 链路与采样率
+        printf("== ASIO 测试模式: 1kHz 正弦 @ %g Hz ==\n", toneRate);
+        double phase = 0.0;
+        AsioRender asio;
+        asio.setDither(ditherFlag);
+        asio.setPullCallback([&](float* dst, size_t frames, size_t ch) -> size_t {
+            for (size_t f = 0; f < frames; ++f) {
+                float s = 0.25f * (float)sin(phase);
+                phase += 2.0 * 3.14159265358979323846 * 1000.0 / toneRate;
+                if (phase > 2.0 * 3.14159265358979323846) phase -= 2.0 * 3.14159265358979323846;
+                for (size_t c = 0; c < ch; ++c) dst[f * ch + c] = s;
+            }
+            return frames;
+        });
+        if (!asio.init(driver, toneRate, err, reqBuffer)) { printf("ASIO 初始化失败: %s\n", err.c_str()); CoUninitialize(); return 1; }
+        printf("正在播放 1kHz 测试音，ADI-2 Pro 屏幕应显示 %g kHz。Ctrl+C 停止。\n", asio.sampleRate() / 1000.0);
+        while (!g_stop.load()) Sleep(100);
+        asio.shutdown();
+        CoUninitialize();
+        return 0;
+    }
+
+    // ===== 正式桥接模式（含端点速率变更自适应）=====
+    RingBuffer rb;
+    rb.init(1 << 17);   // 131072 采样 ≈ 3s @44.1k
+
+    std::atomic<uint64_t> written{0}, consumed{0}, underruns{0}, dropped{0};
+    std::atomic<uint64_t> drainEvent{0};   // 快排丢弃量（监视线程消费打印后清零）
+    std::atomic<float> peak{0.0f};
+    std::atomic<bool> needRestart{false};
+
+    // 控制台共享状态（HTTP 线程只读写这些原子量，零 COM 接触）
+    std::atomic<size_t> wMult{8};          // 当前水位目标倍数
+    std::atomic<size_t> floorMult{8};      // 下限倍数（控制台可调）
+    std::atomic<double> driftPpm{0.0};     // 最近一次漂移读数
+    std::atomic<bool> ditherReq{false};    // 抖动开关请求（重建后生效）
+    std::atomic<bool> ditherOn{false};     // 实际生效状态（供控制台显示）
+    std::atomic<bool> resetReq{false};     // 重置统计请求（控制台触发）
+    // 分数重采样器状态（桥作用域，每次重建复位）
+    std::atomic<double> ratio{1.0};
+    std::atomic<bool> passthrough{passthroughArg};   // 直通模式：ratio 恒 1.0，逐位直通
+    std::atomic<int> passthroughReq{0};              // 控制台切换请求：0=无 1=开 2=关
+    FractionalResampler rs;
+    std::vector<float> rsIn_;
+    double wmAvg = 0.0;                    // 平滑水位（主线程独占，约 20s 时间常数）
+    // 时钟速率锁（双环前馈）：实测输入/输出设备速率 → ratio 基值
+    RateLock rateLock;
+    std::atomic<double> ratioBase{1.0};    // 速率锁基值（跨重建保留）
+    std::atomic<double> inRate{0.0};       // 实测输入速率 Hz（控制台显示）
+    std::atomic<double> outRate{0.0};      // 实测输出速率 Hz（控制台显示）
+    LARGE_INTEGER qpcFreqLI;
+    QueryPerformanceFrequency(&qpcFreqLI);
+    const double qpcFreq = (double)qpcFreqLI.QuadPart;
+    std::atomic<long> asioRate{0}, asioBuffer{0}, asioType{0};
+    std::atomic<uint32_t> capRate{0};
+    std::atomic<uint64_t> wmNow{0};          // 实时水位（控制台直读，勿用计数器推算）
+    std::atomic<uint64_t> rebuildCount{0};   // 重建计数（漂移窗口去污染用）
+    std::atomic<bool> sessionActive{false};  // 会话运行中标志（重建期屏蔽失效回调）
+    // 历史水位环形缓冲（2 秒一采样，容量 2 小时）
+    std::vector<HistPoint> histBuf(kHistCap);
+    std::atomic<uint64_t> histWrite{0};
+
+    // Bridge 采集（Win11 进程回环）：按 PID 旁路监听目标进程的渲染流，
+    // 目标进程退出/静音由失效回调触发重建
+    WasapiProcessCapture pcap;
+    pcap.setErrorCallback([&] {
+        if (sessionActive.load(std::memory_order_acquire))
+            needRestart.store(true);
+    });
+    std::atomic<DWORD> targetPid{0};        // 采集目标进程（控制台显示）
+    std::atomic<bool> targetActive{false};  // 目标进程是否在产出音频
+    std::atomic<DWORD> discoveredPid{0};    // 发现线程输出：当前最响渲染进程
+    std::atomic<float> discoveredPeak{0.0f};// 对应峰值
+    ULONGLONG lastTargetSwitchAt = 0;       // 上次目标切换时刻（20 秒冷却防抖）
+    std::vector<EndpointMuteEntry> endpointMutes;  // 已静音端点（主线程独占，重建/退出时恢复）
+    wchar_t procPref[64] = L"";             // 优先进程名子串（主线程独占读写）
+
+    // 内嵌 Web 控制台（纯 socket 线程，零 COM）
+    BridgeStatsPtrs web = {
+        &written, &consumed, &underruns, &dropped, &peak,
+        &wMult, &floorMult, &driftPpm, &needRestart, &ditherReq, &ditherOn, &resetReq,
+        &g_stop, &asioRate, &asioBuffer, &asioType, &capRate, &wmNow,
+        &histBuf, &histWrite, &ratioBase, &inRate, &outRate, &passthrough, &passthroughReq,
+        &targetPid, &targetActive
+    };
+    startWebConsole(web);
+
+    // 目标发现线程（独立 MTA）：每 10 秒重新扫描「最响渲染进程」，
+    // 结果经原子量异步发布，绝不阻塞 ASIO STA 主线程（阻塞实测会饿死回调）。
+    std::thread discoveryThread([&] {
+        while (!g_stop.load()) {
+            float pk = 0.0f;
+            DWORD pid = FindActiveAudioPid(procPref, &pk);
+            discoveredPid.store(pid, std::memory_order_relaxed);
+            discoveredPeak.store(pk, std::memory_order_relaxed);
+            for (int i = 0; i < 100 && !g_stop.load(); ++i) Sleep(100);
+        }
+    });
+
+    bool first = true;
+    while (!g_stop.load()) {
+        needRestart.store(false);
+        // 恢复上一会话静音的目标端点（模式切换/重建/失败重试前必须先还原，
+        // 否则目标端点会一直被静音）
+        if (!endpointMutes.empty()) {
+            size_t n = endpointMutes.size();
+            RestoreEndpointMutes(endpointMutes);
+            printf("[静音] 已恢复 %zu 个端点的原音量\n", n);
+        }
+        // 速率锁采样计数（本会话，每次重建归零；比率基值跨会话保留）
+        uint64_t capCb = 0, asioCb = 0, inTotS = 0, outTotS = 0;
+        std::string oerr;
+        uint16_t capCh = 2;
+        auto onData = [&](const float* d, uint32_t frames) {
+                size_t n = (size_t)frames * capCh;
+                size_t got = rb.write(d, n);
+                written += got;
+                if (got < n) dropped += n - got;
+                float m = 0.0f;
+                for (size_t i = 0; i < n; ++i) { float a = fabsf(d[i]); if (a > m) m = a; }
+                float cur = peak.load(std::memory_order_relaxed);
+                while (m > cur && !peak.compare_exchange_weak(cur, m, std::memory_order_relaxed)) {}
+                // 速率锁采样：每 25 个采集块记录 (QPC, 累计投递采样)
+                inTotS += n;
+                if ((++capCb) % 25 == 0) {
+                    LARGE_INTEGER q;
+                    QueryPerformanceCounter(&q);
+                    rateLock.pushIn((uint64_t)q.QuadPart, inTotS);
+                }
+            };
+        bool capOk = false;
+        // Bridge 采集：优先沿用上次目标；失效/首次启动时自动发现正在播放的进程
+        {
+            DWORD pid = targetPid.load(std::memory_order_relaxed);
+            if (!pid) pid = FindActiveAudioPid(procPref);
+            if (!pid) {
+                // 无活跃渲染进程：静默等待（不打开采集——进程回环不触发
+                // Windows 麦克风使用标记，也无需任何虚拟设备）
+                static int quietStreak = 0;
+                if ((quietStreak++ % 15) == 0)
+                    printf("[Bridge] 未发现活跃渲染进程，静默等待中…\n");
+                Sleep(2000);
+                continue;
+            }
+            capOk = pcap.open(pid, onData, oerr);
+            if (capOk) {
+                targetPid.store(pid, std::memory_order_relaxed);
+                capCh = pcap.format().channels;
+                // tap→redirect：静音目标所在渲染端点的终点主音量，消除双重声。
+                // 数值自检证明回环取点在终点主音量之前、会话静音之后：
+                // 终点静音不影响捕获（ASIO 不走 WDM 终点音量，同样不受影响）
+                endpointMutes = MuteTargetEndpoints(pid);
+                if (!endpointMutes.empty())
+                    printf("[静音] 已静音目标进程 %lu 所在 %zu 个端点——消除双重声"
+                           "（重建/退出时自动恢复；该端点其他 WDM 声音也会静音）\n",
+                           (unsigned long)pid, endpointMutes.size());
+                else
+                    printf("[静音] 目标进程 %lu 所在端点：无新增静音"
+                           "（可能已处于静音态，或获取终点音量失败）\n",
+                           (unsigned long)pid);
+            }
+        }
+        if (!capOk) {
+            if (first) { printf("采集打开失败: %s\n", oerr.c_str()); break; }
+            printf("[自适应] 采集重开失败: %s（2 秒后重试）\n", oerr.c_str());
+            targetPid.store(0, std::memory_order_relaxed);
+            Sleep(2000);
+            continue;
+        }
+        first = false;
+        sessionActive.store(true, std::memory_order_release);
+
+        uint32_t capSr = pcap.format().sampleRate;
+        uint16_t capBits = pcap.format().bitsPerSample;
+        bool capFloat = pcap.format().isFloat;
+        capRate.store(capSr, std::memory_order_relaxed);
+        printf("[采集] %u Hz / %u 通道 / %u bit (%s)  模式: Bridge 进程回环\n",
+               capSr, capCh, capBits, capFloat ? "float32" : "PCM");
+
+        // 预填充：重采样模式 ~46ms（够 ASIO 启动初期即可）；
+        // 直通模式加大到 ~186ms，由缓冲吸收两时钟漂移（±1.1 采样/秒 ≈ 4 小时余量）
+        const size_t prefill = passthrough.load(std::memory_order_relaxed) ? 16384 : 2048;
+        while (rb.available() < prefill && !g_stop.load() && !needRestart.load()) Sleep(10);
+
+        // 自适应水位目标倍数（v2 预判式，声明于桥作用域；每次重建重置为下限）：
+        //   硬触发：新欠载 → 立即 +4（上限 32 倍）
+        //   预判：每 10 秒窗口波谷 < 半目标 → +4（未欠载也提前加固）
+        //   回落：连续 6 窗口波谷 > 90% 目标 → -4（下限由控制台可调）
+        //   启动 10 秒宽限期内不动作（排除启动瞬态）
+        wMult.store(floorMult.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        rs.reset();
+        rateLock.reset();
+        wmAvg = 0.0;
+
+        AsioRender asio;
+        asio.setDither(ditherFlag || ditherReq.load(std::memory_order_relaxed));
+        ditherOn.store(ditherFlag || ditherReq.load(std::memory_order_relaxed),
+                       std::memory_order_relaxed);
+        asio.setPullCallback([&](float* dst, size_t frames, size_t ch) -> size_t {
+            if (rs.carry.size() < (frames + 16) * 2) rs.setup(frames);
+            rs.ratio = ratio.load(std::memory_order_relaxed);
+            const size_t want = rs.wantIn(frames);   // 帧
+            const size_t wantS = want * 2;           // 采样
+            // 快排：水位 > 2.5× 目标（重建后引擎预滚突发、设备重枚举等）
+            // 直接丢弃陈旧历史帧至 1.5× 目标。启动/重建时丢弃的是预滚陈旧音频；
+            // 稳态水位在目标 ±1× 内摆动，不会触发。计入 dropped 以保持漂移算式正确
+            {
+                size_t setpointS = wMult.load(std::memory_order_relaxed) * frames * capCh;
+                size_t hi = setpointS * 5 / 2;
+                size_t a0 = rb.available();
+                if (a0 > hi) {
+                    size_t excess = a0 - setpointS * 3 / 2;
+                    rb.discard(excess);
+                    dropped.fetch_add(excess, std::memory_order_relaxed);
+                    drainEvent.fetch_add(excess, std::memory_order_relaxed);
+                }
+            }
+            const size_t avail = rb.available();
+            if (want > 0 && avail == 0) {
+                memset(dst, 0, frames * ch * sizeof(float));
+                underruns++;
+                return frames;
+            }
+            if (rsIn_.size() < wantS) rsIn_.resize(wantS);
+            size_t gotS = rb.read(rsIn_.data(), avail < wantS ? avail : wantS);
+            if (gotS < wantS) underruns++;
+            rs.process(rsIn_.data(), gotS / 2, dst, frames);
+            consumed += gotS;
+            // 速率锁采样：每 25 个 ASIO 回调记录 (QPC, 累计输出采样)
+            outTotS += frames * ch;
+            if ((++asioCb) % 25 == 0) {
+                LARGE_INTEGER q;
+                QueryPerformanceCounter(&q);
+                rateLock.pushOut((uint64_t)q.QuadPart, outTotS);
+            }
+            return frames;
+        });
+
+        if (!asio.init(driver, (double)capSr, err, reqBuffer)) {
+            printf("ASIO 初始化失败: %s（2 秒后重试）\n", err.c_str());
+            pcap.close();
+            if (g_stop.load()) break;
+            Sleep(2000);
+            continue;
+        }
+
+        // 控制台快照
+        asioRate.store((long)asio.sampleRate(), std::memory_order_relaxed);
+        asioBuffer.store(asio.bufferSize(), std::memory_order_relaxed);
+        asioType.store(asio.sampleType(), std::memory_order_relaxed);
+
+        printf("== 桥接运行中: Bridge(目标 PID 显示于控制台) -> MADIface ASIO -> ADI-2 Pro @ %g Hz (%s) ==\n",
+               asio.sampleRate(),
+               passthrough.load(std::memory_order_relaxed) ? "直通, 重采样停用" : "分数重采样");
+        const size_t neededPerBuf = (size_t)asio.bufferSize() * capCh;
+
+        // 主线程（ASIO 的 STA）绝不做阻塞式 COM 调用——实测会饿死 MADIface
+        // 的 STA 回调机制导致进程崩溃。
+        ULONGLONG lastStats = GetTickCount64();
+        uint64_t lastConsumedW = consumed.load();
+        ULONGLONG lastConsumedAt = GetTickCount64();
+        uint64_t lastUnderW = underruns.load();
+        // 自适应 v2 状态：窗口波谷跟踪 + 安全窗口计数 + 启动宽限
+        size_t wmMin = rb.available();
+        unsigned safeWindows = 0;
+        unsigned windowCount = 0;
+        ULONGLONG windowStart = GetTickCount64();
+        ULONGLONG graceUntil = GetTickCount64() + 10000;
+        // 漂移表（懒初始化：跳过启动瞬态，宽限期结束后再起测）
+        // 用计数器差值而非瞬时水位——瞬时水位含 ±441 突发振荡，噪声达 ±16ppm
+        bool driftInit = false;
+        uint64_t driftWStart = 0, driftCStart = 0, driftDStart = 0;
+        uint64_t driftRStart = 0;   // 窗口起始时的重建计数
+        ULONGLONG driftStartAt = 0;
+        while (!g_stop.load() && !needRestart.load()) {
+            ULONGLONG now = GetTickCount64();
+            if (now - lastStats >= 2000) {
+                lastStats = now;
+                // 控制台重置请求：全部计数归零 + 历史清空 + 目标回落下限
+                if (resetReq.exchange(false)) {
+                    written.store(0, std::memory_order_relaxed);
+                    consumed.store(0, std::memory_order_relaxed);
+                    underruns.store(0, std::memory_order_relaxed);
+                    dropped.store(0, std::memory_order_relaxed);
+                    peak.store(0.0f, std::memory_order_relaxed);
+                    driftPpm.store(0.0, std::memory_order_relaxed);
+                    histWrite.store(0, std::memory_order_relaxed);
+                    wMult.store(floorMult.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
+                    lastUnderW = 0;
+                    lastConsumedW = 0;
+                    lastConsumedAt = now;
+                    driftInit = false;
+                    wmMin = rb.available();
+                    safeWindows = 0;
+                    printf("[重置] 统计参数全部归零，水位目标回落下限 %zu 采样\n",
+                           floorMult.load(std::memory_order_relaxed) * neededPerBuf);
+                }
+                // ASIO 停滞看门狗：消费量 4 秒不增而采集仍在写入 → 回调被饿死
+                // （如目标进程异常导致 ASIO 回调被饿死时），自动重建链路
+                uint64_t c = consumed.load();
+                if (c != lastConsumedW) { lastConsumedW = c; lastConsumedAt = now; }
+                else if (now - lastConsumedAt > 4000 && written.load() > c) {
+                    printf("[自适应] ASIO 回调停滞 4 秒（采集仍在写入），重建链路...\n");
+                    needRestart.store(true);
+                    break;
+                }
+                // ---- 自适应 v2：以窗口最低水位为控制信号 ----
+                size_t wm = rb.available();
+                if (wm < wmMin) wmMin = wm;
+
+                // 快排事件上报（一次丢弃打印一行）
+                {
+                    uint64_t de = drainEvent.exchange(0, std::memory_order_relaxed);
+                    if (de) printf("[快排] 水位超 2.5× 目标，丢弃陈旧采样 %llu（水位立即回落）\n", de);
+                }
+
+                // 硬触发：新欠载 → 立即上调（宽限期内不动作）
+                uint64_t u = underruns.load();
+                if (u != lastUnderW) {
+                    lastUnderW = u;
+                    if (now >= graceUntil) {
+                        size_t m = wMult.load(std::memory_order_relaxed);
+                        if (m < 32) {
+                            wMult.store(m + 4, std::memory_order_relaxed);
+                            printf("[自适应] 新欠载(累计 %llu)，水位目标上调至 %zu 采样\n",
+                                   u, (m + 4) * neededPerBuf);
+                        }
+                    }
+                }
+
+                // 每 10 秒窗口评估一次
+                if (now - windowStart >= 10000) {
+                    size_t m = wMult.load(std::memory_order_relaxed);
+                    size_t target = m * neededPerBuf;
+                    if (now >= graceUntil) {
+                        if (wmMin < target / 2) {
+                            // 波谷低于半目标 → 预判性加固（还没欠载就升）
+                            if (m < 32) {
+                                wMult.store(m + 4, std::memory_order_relaxed);
+                                printf("[自适应] 波谷 %zu < 半目标 %zu，预判上调至 %zu 采样\n",
+                                       wmMin, target / 2, (m + 4) * neededPerBuf);
+                            }
+                            safeWindows = 0;
+                        } else if (wmMin > target * 9 / 10) {
+                            // 波谷始终高于 90% 目标 → 余量过剩，累计安全窗口
+                            safeWindows++;
+                            if (safeWindows >= 6 &&
+                                m > floorMult.load(std::memory_order_relaxed)) {
+                                wMult.store(m - 4, std::memory_order_relaxed);
+                                printf("[自适应] 连续 6 窗口波谷充裕，水位目标回落至 %zu 采样\n",
+                                       (m - 4) * neededPerBuf);
+                                safeWindows = 0;
+                            }
+                        } else {
+                            safeWindows = 0;
+                        }
+                    }
+                    windowCount++;
+                    if (windowCount % 6 == 0) {
+                        printf("[自适应] 状态: 目标=%zu 采样, 本窗口波谷=%zu, 欠载累计=%llu\n",
+                               wMult.load(std::memory_order_relaxed) * neededPerBuf, wmMin, u);
+                    }
+                    wmMin = wm;
+                    windowStart = now;
+                }
+
+                // 控制台 A/B 切换：直通 ↔ 重采样（实时生效，无需重建链路）
+                {
+                    int pr = passthroughReq.exchange(0, std::memory_order_relaxed);
+                    if (pr == 1) {
+                        passthrough.store(true, std::memory_order_relaxed);
+                        printf("[直通] 控制台切换: 直通模式（重采样停用，逐位直通）\n");
+                    } else if (pr == 2) {
+                        passthrough.store(false, std::memory_order_relaxed);
+                        wmAvg = (double)rb.available();   // 回切时重置平滑水位，避免陈旧值
+                        printf("[直通] 控制台切换: 分数重采样（速率锁+水位闭环）\n");
+                    }
+                }
+                // 时钟速率锁（前馈基值）：实测输入/输出设备速率比。
+                // 直通模式下仍持续测量（控制台可见两时钟漂移量），但不作用于 ratio
+                {
+                    double ih = 0.0, oh = 0.0;
+                    // Bridge 采集交付易受暂停/恢复突发污染：
+                    // 60 秒短窗 + 500ms 断档截断 + 15 秒清洁段
+                    if (rateLock.update(qpcFreq, &ih, &oh, 60.0, 0.5) &&
+                        ih > 1000.0 && oh > 1000.0) {
+                        double b = ih / oh;
+                        if (b < 0.999) b = 0.999;
+                        if (b > 1.001) b = 1.001;
+                        ratioBase.store(b, std::memory_order_relaxed);
+                        inRate.store(ih, std::memory_order_relaxed);
+                        outRate.store(oh, std::memory_order_relaxed);
+                    }
+                }
+                if (passthrough.load(std::memory_order_relaxed)) {
+                    // 直通模式：ratio 恒 1.0（重采样器逐位直通，自检 1 已证 0 误差），
+                    // 漂移交给环形缓冲，欠载/溢出时才由既有守护机制动作一次
+                    ratio.store(1.0, std::memory_order_relaxed);
+                } else {
+                    // 平滑水位（约 20 秒时间常数）：水位闭环只在基值上做微调
+                    if (wmAvg <= 0.0) wmAvg = (double)wm;
+                    else wmAvg += ((double)wm - wmAvg) * 0.1;
+                    {
+                        int64_t setpoint = (int64_t)(wMult.load(std::memory_order_relaxed) * neededPerBuf);
+                        double err = wmAvg - (double)setpoint;
+                        double base = ratioBase.load(std::memory_order_relaxed);
+                        // 误差分档限幅：稳态微调 0.0003；中等偏差 0.001；
+                        // 大偏差（快排阈值以下残留 + 突发回流）0.004 —— 恢复提速
+                        // 但不会超过 0.4%（听感不可察，且只出现在恢复瞬态）
+                        double ea = fabs(err);
+                        double cap = ea > 2048.0 ? 0.004 : (ea > 1024.0 ? 0.001 : 0.0003);
+                        double r = base + err * 5e-7;
+                        if (r > base + cap) r = base + cap;
+                        if (r < base - cap) r = base - cap;
+                        ratio.store(r, std::memory_order_relaxed);
+                    }
+                }
+
+                // 历史水位采样（发布到环形缓冲，供 Web 控制台回看）
+                wmNow.store(wm, std::memory_order_relaxed);
+                {
+                    uint64_t hi = histWrite.load(std::memory_order_relaxed);
+                    histBuf[hi % kHistCap] = {
+                        (uint32_t)(now / 1000),
+                        (uint32_t)wm,
+                        (uint32_t)(wMult.load(std::memory_order_relaxed) * neededPerBuf)
+                    };
+                    histWrite.store(hi + 1, std::memory_order_release);
+                }
+                SYSTEMTIME st;
+                GetLocalTime(&st);
+                float peakVal = peak.exchange(0.0f);
+                targetActive.store(peakVal > 0.005f, std::memory_order_relaxed);
+                // 目标自动切换：发现到「明显更响」的进程时重建锁定。
+                // 冷却 20 秒防抖；候选需比当前目标响 ≥1.5 倍才切换
+                {
+                    DWORD dp = discoveredPid.load(std::memory_order_relaxed);
+                    float dpeak = discoveredPeak.load(std::memory_order_relaxed);
+                    DWORD cur = targetPid.load(std::memory_order_relaxed);
+                    if (dp && dp != cur && dpeak > 0.02f && peakVal < dpeak * 0.66f &&
+                        now - lastTargetSwitchAt > 20000) {
+                        printf("[Bridge] 目标切换: PID %lu(近峰值 %.3f) -> PID %lu(峰值 %.3f)\n",
+                               (unsigned long)cur, peakVal, (unsigned long)dp, dpeak);
+                        targetPid.store(dp, std::memory_order_relaxed);
+                        lastTargetSwitchAt = now;
+                        needRestart.store(true);
+                    }
+                }
+                printf("[%02u:%02u:%02u] 水位=%zu 欠载=%llu 丢弃=%llu 峰值=%.3f 写=%llu 读=%llu 目标=%zu\n",
+                       st.wHour, st.wMinute, st.wSecond,
+                       rb.available(), underruns.load(), dropped.load(), peakVal,
+                       written.load(), consumed.load(),
+                       wMult.load(std::memory_order_relaxed) * neededPerBuf);
+
+                // 漂移表：每 300 秒报告两时钟相对偏差（长窗口压制 ±441 突发振荡噪声：
+                // 60 秒窗口噪声 ±16ppm，300 秒窗口 ±3ppm）
+                if (!driftInit && now >= graceUntil) {
+                    driftInit = true;
+                    driftWStart = written.load();
+                    driftCStart = consumed.load();
+                    driftDStart = dropped.load();
+                    driftRStart = rebuildCount.load(std::memory_order_relaxed);
+                    driftStartAt = now;
+                }
+                if (driftInit && now - driftStartAt >= 300000) {
+                    uint64_t dW = written.load() - driftWStart;
+                    uint64_t dC = consumed.load() - driftCStart;
+                    uint64_t dD = dropped.load() - driftDStart;
+                    if (rebuildCount.load(std::memory_order_relaxed) != driftRStart) {
+                        printf("[漂移] 窗口内含重建事件，跳过本次测量\n");
+                    } else if (dC > 0) {
+                        double ppm = (double)((int64_t)dW - (int64_t)dC - (int64_t)dD) * 1e6 / (double)dC;
+                        driftPpm.store(ppm, std::memory_order_relaxed);
+                        printf("[漂移] 300秒窗口: %+.2f ppm（%s）\n", ppm,
+                               ppm > 0.0 ? "采集时钟快于 ASIO 时钟" : "ASIO 时钟快于采集时钟");
+                    }
+                    driftWStart = written.load();
+                    driftCStart = consumed.load();
+                    driftDStart = dropped.load();
+                    driftRStart = rebuildCount.load(std::memory_order_relaxed);
+                    driftStartAt = now;
+                }
+            }
+            Sleep(50);
+        }
+        sessionActive.store(false, std::memory_order_release);
+        rebuildCount.fetch_add(1, std::memory_order_relaxed);
+        printf("[自适应] 关闭采集端...\n");
+        pcap.close();
+        printf("[自适应] 关闭 ASIO 端...\n");
+        asio.shutdown();
+        rb.reset();   // 换速率后清空缓冲，避免旧速率采样残留
+        if (!g_stop.load())
+            printf("[自适应] 链路重建...\n");
+    }
+
+    // 退出前恢复所有被静音的目标端点（防止桥崩溃/退出后目标端点哑掉）
+    if (!endpointMutes.empty()) {
+        RestoreEndpointMutes(endpointMutes);
+        printf("[静音] 退出：已恢复全部目标端点音量\n");
+    }
+    pcap.close();
+    if (discoveryThread.joinable()) discoveryThread.join();
+    stopWebConsole();
+    CoUninitialize();
+    printf("已退出。\n");
+    return 0;
+}

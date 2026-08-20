@@ -1,0 +1,29 @@
+flowchart TD
+  ROOT[ASIO 桥成功之路] --> G1[目标]
+  ROOT --> G2[架构三要素]
+  ROOT --> G3[五大关键突破]
+  ROOT --> G4[验证结果]
+  ROOT --> G5[沉淀资产]
+
+  G1 --> G1a[第三方应用 PCM 直通 RME<br/>绕过系统混音/重采样/APO]
+  G1 --> G1b[bit-perfect 播放]
+
+  G2 --> G2a[VB-CABLE 虚拟声卡<br/>截流端点]
+  G2 --> G2b[WASAPI 采集 +<br/>环形缓冲桥接]
+  G2 --> G2c[MADIface ASIO<br/>直出硬件]
+
+  G3 --> G3a[STA 公寓发现<br/>RME COM 只在 STA 暴露接口]
+  G3 --> G3b[SDK 老代码修复<br/>/FIwindows.h + 去 LEAN 宏]
+  G3 --> G3c[崩溃根因定位<br/>STA 主线程禁阻塞式 COM<br/>读=0 计数器立功]
+  G3 --> G3d[握手架构<br/>命名事件释放设备<br/>SEH 兜底野指针]
+  G3 --> G3e[速率真相<br/>VB-CABLE 固定 44.1k<br/>不读注册表]
+
+  G4 --> G4a[1kHz tone 经 ADI-2 Pro<br/>44.1kHz 播放通过]
+  G4 --> G4b[全链路峰值 0.98<br/>真实音频穿过]
+  G4 --> G4c[长时间稳定运行<br/>水位账目分毫不差]
+
+  G5 --> G5a[asio_bridge.exe + 源码]
+  G5 --> G5b[set_cable_rate.ps1]
+  G5 --> G5c[test_render.ps1]
+  G5 --> G5d[install_autostart.ps1<br/>开机自启]
+  G5 --> G5e[详细介绍.txt / 原理图]

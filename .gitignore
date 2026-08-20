@@ -1,0 +1,11 @@
+build/
+.vs/
+CMakeFiles/
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.log
+*.cfg
+*.raw
+__pycache__/

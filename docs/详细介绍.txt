@@ -1,0 +1,198 @@
+================================================================================
+                    ASIO 桥 项目详细介绍
+   应用 PCM → 虚拟声卡截流 → asio_bridge → RME MADIface ASIO → ADI-2 Pro
+================================================================================
+版本: v1.0   日期: 2026-08-17   平台: Windows 11 x64 + VS2022 + ASIO SDK 2.3
+
+--------------------------------------------------------------------------------
+一、项目目标
+--------------------------------------------------------------------------------
+让第三方现成应用（Apple Music、浏览器、播放器等）的 PCM 音频绕过 Windows
+音频引擎的混音、重采样与 APO 音效处理，直接进入 RME MADIface ASIO 驱动，
+输出到 ADI-2 Pro 解码器，实现 bit-perfect 播放。
+
+为什么需要桥：第三方应用只支持 WASAPI 共享模式输出；Windows 引擎会对所有
+共享流做混音/重采样/音效；而 RME ADI-2 Pro 的 WDM 端点又只有 16bit/44.1kHz
+（多通道模式固定格式），Hi-Res 能力只有 MADIface ASIO 驱动才完整提供。
+
+--------------------------------------------------------------------------------
+二、总体架构与数据流
+--------------------------------------------------------------------------------
+ASCII 示意:
+
+  Apple Music ──PCM──▶ [CABLE Input 端点] ──▶ VB-CABLE 内核驱动(固定44.1k)
+                                                        │
+                                                        ▼
+                                               [CABLE Output 端点]
+                                                        │ WASAPI 共享采集(float32)
+                                                        ▼
+   ┌─────────────────────────── asio_bridge.exe ───────────────────────────┐
+   │  采集线程(独立, MTA, SEH防护)  ──float32──▶  环形缓冲(SPSC 无锁)        │
+   │                                                      │               │
+   │  主线程(STA: ASIO 会话管理) ◀── 水位/欠载/峰值统计  │               │
+   │                                                      ▼               │
+   │                                    ASIO 回调 bufferSwitchTimeInfo     │
+   │                                        │ 转 Int32LSB 写驱动缓冲        │
+   └────────────────────────────────────────┼───────────────────────────────┘
+                                            ▼
+                          MADIface ASIO 驱动 (madiface_asio_amd.dll)
+                                            │
+                                            ▼
+                                   ADI-2 Pro DAC ──▶ 耳机/音箱
+
+被绕过的部分: 系统音频引擎 audiodg（混音/重采样/APO）不参与本链路。
+
+--------------------------------------------------------------------------------
+三、系统组成详解
+--------------------------------------------------------------------------------
+3.1 VB-CABLE 虚拟声卡（VB-Audio Software, 免费捐赠版）
+    - 内核驱动 VBAudioVACMME (vbaudio_cable64_win7.sys)，设备节点 ROOT\MEDIA\*。
+    - 一对端点: CABLE Input(渲染) 与 CABLE Output(采集)，内部直通(虚拟电缆)。
+    - 应用把输出设备选为 CABLE Input，桥从 CABLE Output 采集。
+    - 【重要实测结论】驱动内部采样率固定 44100Hz：不读取注册表
+      VBAudioCableWDM_SR（该值仅是 GUI 控制面板的记录），速率只能由
+      VBCABLE_ControlPanel.exe 通过私有 IOCTL 在线修改。
+    - 不支持独占采集，桥使用共享模式(引擎 10ms 周期)，采集格式 float32/44.1k/2ch。
+
+3.2 采集端 WasapiCapture (src/wasapi_capture.*)
+    - 独立采集线程自行 CoInitializeEx(MTA)，所有 COM 对象在线程内创建/释放。
+    - 优先独占、失败回退共享（VB-CABLE 回退共享）。
+    - 事件驱动 GetNextPacketSize/GetBuffer 循环，200ms 超时轮询兼作失效检测。
+    - 任意 PCM/float 格式统一转换 float32（16/24/32bit、float32 全覆盖）。
+    - SEH 兜底：设备重启期间引擎可能释放 COM 对象导致野指针访问违例，
+      __try/__except 捕获后视作端点失效，保证进程存活。
+    - 端点失效( AUDCLNT_E_DEVICE_INVALIDATED )→ 错误回调 → 主线程重建链路。
+
+3.3 环形缓冲 RingBuffer (src/ring_buffer.h)
+    - 单生产者(采集线程)/单消费者(ASIO 回调)无锁环形缓冲，容量 131072 采样(≈3s)。
+    - 生产者溢出自动截断；消费者水位过高时丢弃多余采样(两时钟漂移校正)。
+
+3.4 输出端 AsioRender (src/asio_render.*)
+    - 集成 Steinberg ASIO SDK 2.3（common/asio.cpp + host/asiodrivers.cpp +
+      host/pc/asiolist.cpp，vendored 于 third_party/）。
+    - 流程: loadAsioDriver → ASIOInit → ASIOGetChannels → ASIOSetSampleRate
+            → ASIOGetBufferSize → ASIOCreateBuffers → ASIOStart。
+    - 采样率跟随采集端协商速率（当前 44100Hz）；RME 设备时钟随之切换。
+    - 回调 bufferSwitchTimeInfo 从环形缓冲拉取，float32 → 驱动原生类型
+      （Int32LSB/Int24LSB/Int16LSB/Float32/64 均已实现）。
+
+3.5 握手与自适应机制
+    - 命名事件对（本会话命名空间）:
+        Local\AsioBridge_ReleaseDevice  脚本 → 桥：请求释放设备
+        Local\AsioBridge_Released       桥 → 脚本：已释放完毕
+    - set_cable_rate.ps1 通过握手让桥优雅关闭采集+ASIO 流，避免设备重启期间
+      崩溃，随后桥按重试循环(2s)自动以新协商速率重建链路。
+    - 端点失效检测(捕获线程) + SEH 兜底作为第二条自适应路径。
+
+--------------------------------------------------------------------------------
+四、关键技术问题与解决（攻关实录）
+--------------------------------------------------------------------------------
+4.1 ASIO SDK 2.3 编译失败
+    现象: asiodrivers.cpp 中 IASIO(IUnknown 派生)未声明；asiolist.cpp 中
+          CLSIDFromString/CoCreateInstance 未声明。
+    根因: 工程定义了 WIN32_LEAN_AND_MEAN 使 windows.h 不再附带 ole2.h/objbase.h；
+          asiodrivers.cpp 使用 IASIO 前未包含 windows.h。
+    解决: 去掉 LEAN 宏；CMake 对 asiodrivers.cpp 强制 /FIwindows.h 前置包含。
+
+4.2 MADIface ASIO 加载失败 E_NOINTERFACE (0x80004002)
+    现象: CoCreateInstance(CLSID, ..., riid=CLSID) 返回 E_NOINTERFACE，
+          而 PowerShell 中 Activator(riid=IUnknown) 创建成功。
+    定位: 显式 STA/MTA 对照实验——RME 的 COM 对象
+          (ThreadingModel=Apartment) 只在 STA 公寓暴露其 ASIO 接口。
+    解决: 主线程 CoInitializeEx(COINIT_APARTMENTTHREADED)；
+          采集 COM 全部移入独立采集线程自管，避免跨公寓调用。
+
+4.3 桥进程运行数秒即崩溃（0xC0000005，BEX64）
+    现象: 引入速率轮询后，桥在启动 4~5 秒必崩；事件日志 AV、栈哈希。
+    定位: 新增的 写/读 计数器显示 ASIO 消费量(读)在首次轮询时刻完全停止——
+          主 STA 线程上的阻塞式 COM 调用(GetMixFormat RPC)饿死了 MADIface
+          的 STA 回调机制，随后驱动内部崩溃带走进程。
+    解决: 撤销主线程轮询；速率变更检测改为命名事件握手 + 采集线程失效检测；
+          主 STA 线程只做 Sleep/事件等待/统计打印，绝不做阻塞式 COM 调用。
+
+4.4 设备重启期间野指针崩溃
+    现象: 桥存活期间 pnputil 重启设备，采集线程访问被引擎释放的 COM 对象。
+    解决: 双保险——握手机制让桥先释放流(脚本路径)；SEH 兜底捕获访问违例
+          (手动 GUI 切换等外部路径)。
+
+4.5 速率切换失效之谜（最终真相）
+    现象: 注册表 VBAudioCableWDM_SR 改为 48000 并重启设备/引擎，采集速率始终 44100。
+    排查链: 待重启标志锁死 PnP → 卸载重装解锁 → DeviceFormat
+            (PKEY_AudioEngine_DeviceFormat) 持久化理论 → 经 IPropertyStore
+            写入 + Audiosrv 完整重建 → 仍然 44100 → 移除设备+重装强制驱动重载
+            （注册表 96000 下全新驱动仍协商 44100）→ 铁证。
+    结论: VB-CABLE 内核驱动内部速率固定 44100Hz，不读取注册表；注册表值仅由
+          GUI 控制面板(私有 IOCTL)使用。程序化切换不可行。
+    影响: 44.1k 系内容(16/44.1、24/44.1 等)全程 bit-perfect；48k 系内容
+          (24/96、24/192、视频)由引擎重采样到 44.1k(高质量, 非 bit-perfect)。
+    后续: 如需程序化速率切换，可换用支持动态格式的虚拟声卡(VAC)或自研驱动；
+          桥的格式写入器(setCableEndpointsFormat)与握手机制已为后者备好。
+
+--------------------------------------------------------------------------------
+五、使用指南
+--------------------------------------------------------------------------------
+5.1 构建（需要 VS2022 + CMake）
+    cmake -B build -S .
+    cmake --build build --config Release
+    产物: build\Release\asio_bridge.exe
+
+5.2 运行
+    asio_bridge                         桥接模式(CABLE Output → MADIface ASIO)
+    asio_bridge --list                  列出 ASIO 驱动与音频端点
+    asio_bridge --tone [--rate 44100]   1kHz 正弦测试(验证 ASIO 链路)
+    asio_bridge --log <文件>            输出追加到日志(后台/自启用)
+    Ctrl+C 停止
+
+5.3 开机自启
+    pwsh -File tools\install_autostart.ps1          安装计划任务
+    pwsh -File tools\install_autostart.ps1 -Remove  卸载
+    任务名 "ASIO Bridge": 用户登录时触发、隐藏窗口、最高权限、
+    失败自动重启 3 次(间隔 1 分钟)、防重复实例。
+    日志: C:\Users\Administrator\asio_bridge.log
+
+5.4 日常使用流程
+    1) 开机后桥自动运行(或手动启动)。
+    2) 将 Apple Music/浏览器的输出设备设为 "CABLE Input (VB-Audio Virtual Cable)"。
+    3) 播放：声音经 ADI-2 Pro 直出(屏幕显示 44.1 kHz)。
+    4) 想切换速率: 打开 VBCABLE_ControlPanel.exe 改内部速率(在线生效)后重启桥。
+
+--------------------------------------------------------------------------------
+六、性能与限制
+--------------------------------------------------------------------------------
+- 链路延迟 ≈ 引擎采集周期(~10ms) + 环形预填(~100ms) + ASIO 缓冲(256帧≈5.8ms)。
+- 时钟漂移: 虚拟声卡时钟与 RME 硬件时钟独立，ppm 级漂移由水位丢弃策略校正
+  (每数秒~数分钟一次单采样滑移，44.1k 下通常不可闻)。
+- 桥只输出前 2 通道(1+2)；ASIO 驱动被 DAW 等独占时桥无法启动(自动重试)。
+- bit-perfect 前提: 内容 44.1k 系 + 应用音量 100% + CABLE 端点无 APO。
+
+--------------------------------------------------------------------------------
+七、文件清单
+--------------------------------------------------------------------------------
+src\main.cpp                 主流程: 参数/握手/统计/重建循环
+src\wasapi_capture.*         WASAPI 采集(线程自管 COM/SEH/格式转换/失效检测)
+src\asio_render.*            ASIO 输出(SDK 集成/采样率/缓冲/类型转换)
+src\ring_buffer.h            无锁环形缓冲
+src\util.h                   字符串/HRESULT 工具
+third_party\ASIOSDK2.3      Steinberg ASIO SDK 2.3 (vendored, 含编译修复)
+tools\set_cable_rate.ps1     速率记录 + 桥握手重启
+tools\test_render.ps1        440Hz 测试渲染器(灌入 CABLE Input)
+tools\install_autostart.ps1  开机自启安装/卸载
+docs\思维导图.mmd            成功过程思维导图(Mermaid)
+docs\原理图.mmd              系统原理图(Mermaid)
+docs\详细介绍.txt            本文件
+
+--------------------------------------------------------------------------------
+八、附录：关键错误码与名词速查
+--------------------------------------------------------------------------------
+0x80004002  E_NOINTERFACE        COM 对象不暴露所查询接口(RME 需 STA)
+0x8889000A  AUDCLNT_E_DEVICE_IN_USE      端点被独占占用
+0x8889000D  AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED  策略禁止独占
+0x88890016  AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED      独占缓冲未对齐
+0x88890004  AUDCLNT_E_DEVICE_INVALIDATED           端点失效(需重建)
+0xC0000005  访问违例(本项目中=野指针 COM 调用)
+STA / MTA   单线程公寓 / 多线程公寓(COM 线程模型)
+PKEY_AudioEngine_DeviceFormat   {f19f064d-082c-4e27-bc73-6882a1bb8e4c},0
+                                引擎每端点持久化的默认格式
+MADIface ASIO 驱动名            "ASIO MADIface USB" (内部名 hdspfire)
+VB-CABLE 驱动服务               VBAudioVACMME
+================================================================================
