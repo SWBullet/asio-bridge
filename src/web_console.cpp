@@ -230,7 +230,7 @@ function gTick(o,i){
   var v=o.min+(o.max-o.min)*i/5;
   if(o===gPeak)return v.toFixed(1);
   if(o===gLat)return Math.round(v);
-  return v>=1000?(v/1000)+'k':Math.round(v);
+  return Math.round(v);   // 水位刻度：整数表示（不用小数/小数 k）
 }
 // 分区色界：峰值 0–0.85 绿 / 0.85–1 红；延迟 0–100 绿 / 100–200 琥珀 / 200–300 红；
 // 水位 低于危险值红 / 危险值–目标绿 / 高于目标琥珀
