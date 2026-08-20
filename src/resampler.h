@@ -8,9 +8,9 @@
 //   帧位置游标按 ratio 推进（ratio>1 快排、<1 补足），±数百 ppm 级。
 //
 // 质量档（taps）：
-//   0 = 线性（2 点，低延迟，默认）；
+//   0 = 线性（2 点，低延迟，仅直通/调试用）；
 //   32 = 32-tap 汉宁窗 sinc（高精度，分数延迟 FIR，时钟漂移级重采样下
-//        THD 比线性低约两个数量级）。
+//        THD 比线性低约两个数量级）——默认档。
 //
 // 设计要点（吸取历次失败教训）：
 //   · 按「帧」插值——L 只在 L 样本间、R 只在 R 样本间插值；
@@ -26,7 +26,7 @@ struct FractionalResampler {
     size_t carryFrames = 0;
     double pos = 0.0;              // 帧位置游标：整数部分=已消耗帧，分数=插值相位
     double ratio = 1.0;
-    int taps = 0;                  // 0=线性，32=sinc
+    int taps = 32;                 // 0=线性，32=sinc（默认 sinc，避免 ppm 级分数延迟下线性插值的顶端八度颤音）
 
     // 预计算 sinc 系数表（256 档 frac × 32 tap，归一化）——热循环零超越函数
     static const double (*sincTable())[32] {
@@ -51,7 +51,13 @@ struct FractionalResampler {
         return tbl;
     }
 
-    void setup(size_t needFrames) { carry.resize((needFrames + kTaps + 8) * 2); }
+    // 本环节固有延迟（帧）：线性 0；sinc 有 kHalf-1 帧群延迟/前瞻（≈0.34ms@44.1k）
+    size_t latencyFrames() const { return (taps > 0) ? (size_t)(kHalf - 1) : 0; }
+
+    void setup(size_t needFrames) {
+        carry.resize((needFrames + kTaps + 8) * 2);
+        (void)sincTable();   // 在非回调线程预热系数表，避免首个 ASIO 回调内算 8192 组 sin/cos 超时爆音
+    }
 
     void reset() { carryFrames = 0; pos = 0.0; ratio = 1.0; }
 
@@ -92,19 +98,37 @@ struct FractionalResampler {
                 // sinc：前瞻需满足 ip + kHalf-1 < carryFrames
                 if (ip + (size_t)(kHalf - 1) < carryFrames) {
                     if (ip < (size_t)kHalf) {
-                        // 启动过渡：回看不足（前 16 帧），最近邻取数并推进游标
-                        o[0] = carry[ip * 2];
-                        o[1] = carry[ip * 2 + 1];
+                        // 启动过渡：回看不足（前 16 帧），退化为线性插值（优于最近邻）
+                        size_t ip1 = ip + 1;
+                        if (ip1 < carryFrames) {
+                            const double frac = p - (double)ip;
+                            const double w1 = 1.0 - frac;
+                            const float* c0 = carry.data() + ip * 2;
+                            const float* c1 = carry.data() + ip1 * 2;
+                            o[0] = (float)((double)c0[0] * w1 + (double)c1[0] * frac);
+                            o[1] = (float)((double)c0[1] * w1 + (double)c1[1] * frac);
+                        } else {
+                            o[0] = carry[ip * 2];
+                            o[1] = carry[ip * 2 + 1];
+                        }
                         p += ratio;
                     } else {
                         const double frac = p - (double)ip;
-                        size_t fi = (size_t)(frac * 256.0);
+                        // 相位行间线性插值：把 256 档量化残差从约 -51dBc 降到 -100dBc 以下
+                        const double fq = frac * 256.0;
+                        size_t fi = (size_t)fq;
                         if (fi >= 256) fi = 255;
-                        const double* hh = sincTable()[fi];
+                        size_t fi1 = fi + 1;
+                        if (fi1 >= 256) fi1 = fi;   // 尾行 h1==h0，fw 自动退化
+                        const double fw = fq - (double)fi;
+                        const double(*tbl)[32] = sincTable();
+                        const double* h0 = tbl[fi];
+                        const double* h1 = tbl[fi1];
                         double yl = 0.0, yr = 0.0;
                         for (int k = -kHalf; k < kHalf; ++k) {
                             const float* c = carry.data() + (ip + k) * 2;
-                            const double w = hh[k + kHalf];
+                            const double w = h0[k + kHalf] +
+                                             (h1[k + kHalf] - h0[k + kHalf]) * fw;
                             yl += (double)c[0] * w;
                             yr += (double)c[1] * w;
                         }

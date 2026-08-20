@@ -8,6 +8,7 @@
 #include "util.h"
 #include "web_console.h"
 #include <windows.h>
+#include <wrl/client.h>   // Microsoft::WRL::ComPtr：RAII COM 指针，消灭手写 Release
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #include <propsys.h>
@@ -711,6 +712,161 @@ static int captureSelfTest() {
     return pass ? 0 : 1;
 }
 
+// CAudioLimiter 位置实测（--limiter-test）：
+//   渲染幅度 1.5（超过满刻度 1.0）的 50Hz 正弦 → 进程回环自采 → 看采集峰值。
+//   峰值≈1.5 → 取点在限幅器之前（桥绕过端点限幅器）
+//   峰值被压到≈1.0 → 取点在限幅器之后（桥继承端点限幅）
+//   渲染端点在测试期间静音，不打扰耳朵。
+static int limiterSelfTest() {
+    using Microsoft::WRL::ComPtr;
+    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    if (FAILED(hr)) { printf("[限幅器测试] CoInitializeEx 失败 0x%08lX\n", (unsigned)hr); return 1; }
+
+    ComPtr<IMMDeviceEnumerator> en;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                __uuidof(IMMDeviceEnumerator), (void**)en.GetAddressOf()))) {
+        printf("[限幅器测试] 创建 MMDeviceEnumerator 失败\n"); CoUninitialize(); return 1;
+    }
+
+    // 1) 选第一个活动渲染端点
+    ComPtr<IMMDevice> renderDev;
+    {
+        ComPtr<IMMDeviceCollection> coll;
+        if (FAILED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, coll.GetAddressOf())) || !coll) {
+            printf("[限幅器测试] 无活动渲染端点\n"); CoUninitialize(); return 1;
+        }
+        UINT count = 0;
+        coll->GetCount(&count);
+        if (count == 0) { printf("[限幅器测试] 无活动渲染端点\n"); CoUninitialize(); return 1; }
+        coll->Item(0, renderDev.GetAddressOf());
+    }
+
+    // 2) 静音该端点（避免 1.5 幅度大信号炸耳朵）
+    ComPtr<IAudioEndpointVolume> ev;
+    BOOL prevMute = FALSE;
+    if (SUCCEEDED(renderDev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
+                                      nullptr, (void**)ev.GetAddressOf())) && ev) {
+        ev->GetMute(&prevMute);
+        ev->SetMute(TRUE, nullptr);
+        printf("[限幅器测试] 已静音测试端点\n");
+    }
+    auto restoreMute = [&] { if (ev) ev->SetMute(prevMute, nullptr); };
+
+    // 3) 渲染客户端（共享模式，需 float32 才能写 >1.0）
+    ComPtr<IAudioClient> rc;
+    WAVEFORMATEX* mf = nullptr;
+    bool isFloat = false;
+    if (SUCCEEDED(renderDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)rc.GetAddressOf())) &&
+        SUCCEEDED(rc->GetMixFormat(&mf)) && mf) {
+        if (mf->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+            isFloat = true;
+        } else if (mf->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+            const WAVEFORMATEXTENSIBLE* wfe = (const WAVEFORMATEXTENSIBLE*)mf;
+            static const GUID kFloatSub = {0x00000003,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
+            isFloat = IsEqualGUID(wfe->SubFormat, kFloatSub);
+        }
+    }
+    if (!isFloat) {
+        printf("[限幅器测试] 渲染端点混音格式非 float32（tag=%u），无法渲染 >1.0 信号\n",
+               mf ? mf->wFormatTag : 0);
+        if (mf) CoTaskMemFree(mf);
+        restoreMute(); CoUninitialize();
+        return 1;
+    }
+    const uint32_t rate = mf->nSamplesPerSec;
+    const uint16_t ch = mf->nChannels;
+    hr = rc->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                        0, 0, mf, nullptr);
+    CoTaskMemFree(mf);
+    if (FAILED(hr)) {
+        printf("[限幅器测试] 渲染 Initialize 失败 0x%08lX\n", (unsigned)hr);
+        restoreMute(); CoUninitialize();
+        return 1;
+    }
+    ComPtr<IAudioRenderClient> rr;
+    rc->GetService(__uuidof(IAudioRenderClient), (void**)rr.GetAddressOf());
+    HANDLE rEvt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    rc->SetEventHandle(rEvt);
+    UINT32 bufFrames = 0;
+    rc->GetBufferSize(&bufFrames);
+    printf("[限幅器测试] 渲染 %u Hz / %u 通道 / float32，幅度 1.5 的 50Hz 正弦 → 按 PID 回环自采\n",
+           rate, ch);
+
+    const double amp = 1.5;
+    const double f = 50.0;
+    std::atomic<bool> run{true};
+    std::thread renderThread([&] {
+        double phase = 0.0;
+        rc->Start();
+        while (run.load()) {
+            if (WaitForSingleObject(rEvt, 100) != WAIT_OBJECT_0) continue;
+            UINT32 pad = 0;
+            rc->GetCurrentPadding(&pad);
+            UINT32 avail = bufFrames - pad;
+            if (avail == 0) continue;
+            BYTE* p = nullptr;
+            if (SUCCEEDED(rr->GetBuffer(avail, &p))) {
+                float* fp = (float*)p;
+                for (UINT32 i = 0; i < avail; ++i) {
+                    float s = (float)(amp * sin(phase));
+                    phase += 2.0 * 3.14159265358979323846 * f / rate;
+                    if (phase > 2.0 * 3.14159265358979323846) phase -= 2.0 * 3.14159265358979323846;
+                    for (uint16_t c = 0; c < ch; ++c) fp[i * ch + c] = s;
+                }
+                rr->ReleaseBuffer(avail, 0);
+            }
+        }
+        rc->Stop();
+    });
+    Sleep(400);
+
+    // 4) 进程回环采集自身
+    std::vector<float> capBuf;
+    WasapiProcessCapture pc;
+    std::string err;
+    if (!pc.open(GetCurrentProcessId(), [&](const float* d, uint32_t frames) {
+            capBuf.insert(capBuf.end(), d, d + (size_t)frames * pc.format().channels);
+        }, err)) {
+        printf("[限幅器测试] 回环采集打开失败: %s\n", err.c_str());
+        run.store(false); renderThread.join();
+        CloseHandle(rEvt);
+        restoreMute(); CoUninitialize();
+        return 1;
+    }
+    const uint32_t capRate = pc.format().sampleRate;
+    const uint16_t capCh = pc.format().channels;
+    Sleep(2000);
+    pc.close();
+    run.store(false);
+    renderThread.join();
+
+    // 5) 分析峰值（跳过前 0.5s 预滚）
+    double peak = 0.0, sumSq = 0.0;
+    size_t n = 0;
+    size_t start = (size_t)capRate / 2 * capCh;
+    for (size_t i = start; i < capBuf.size(); ++i) {
+        double v = fabs((double)capBuf[i]);
+        if (v > peak) peak = v;
+        sumSq += (double)capBuf[i] * (double)capBuf[i];
+        ++n;
+    }
+    double rms = n ? sqrt(sumSq / n) : 0.0;
+    printf("[限幅器测试] 采集 %u Hz / %u 通道，%zu 采样：峰值 %.4f，RMS %.4f（渲染幅度 1.5，RMS 期望 %.4f）\n",
+           capRate, capCh, n, peak, rms, amp / 1.41421356237);
+    if (peak > 1.3) {
+        printf("=> 结论：取点在端点限幅器之前——桥绕过 Windows 端点限幅器（大信号不被压限）\n");
+    } else if (peak < 1.05) {
+        printf("=> 结论：取点在端点限幅器之后——桥继承端点限幅（大信号被压到 ≈1.0）\n");
+    } else {
+        printf("=> 结论：中间态（峰值 %.4f），需复核\n", peak);
+    }
+
+    restoreMute();
+    CloseHandle(rEvt);
+    CoUninitialize();
+    return 0;
+}
+
 int wmain(int argc, wchar_t** argv) {
     SetConsoleOutputCP(65001);
     setvbuf(stdout, nullptr, _IONBF, 0);   // 无缓冲，崩溃时也能看到输出
@@ -736,6 +892,8 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--resampler-test") { return resamplerSelfTest(); }
         else if (a == L"--pll-test") { return pllSelfTest(); }
         else if (a == L"--capture-test") { return captureSelfTest(); }
+        else if (a == L"--limiter-test") { return limiterSelfTest(); }
+        else if (a == L"--conv-test") { return asioConversionSelfTest(); }
         else if (a == L"--log" && i + 1 < argc) {
             // 共享读写打开日志（允许外部实时查看），重定向 stdout
             HANDLE h = CreateFileW(argv[++i], FILE_APPEND_DATA,
@@ -817,7 +975,7 @@ int wmain(int argc, wchar_t** argv) {
     std::atomic<bool> resetReq{false};     // 重置统计请求（控制台触发）
     // 分数重采样器状态（桥作用域，每次重建复位）
     std::atomic<double> ratio{1.0};
-    std::atomic<int> srcTaps{0};     // 重采样质量档：0=线性（低延迟）32=sinc（高精度）
+    std::atomic<int> srcTaps{32};    // 重采样质量档：0=线性（低延迟）32=sinc（高精度，默认）
     std::atomic<bool> passthrough{passthroughArg};   // 直通模式：ratio 恒 1.0，逐位直通
     std::atomic<int> passthroughReq{0};              // 控制台切换请求：0=无 1=开 2=关
     FractionalResampler rs;
@@ -1035,6 +1193,8 @@ int wmain(int argc, wchar_t** argv) {
         size_t fadePos = 0;
         // ASIO 设备输出延迟（帧→毫秒，ASIOGetLatencies 上报，端到端延迟表用）
         double asioLatMs = 0.0;
+        // 采集包周期（WASAPI 事件驱动引擎默认 ~10ms 周期）：命名常量替代魔法数
+        const double kCapturePeriodMs = 10.0;
         asio.setPullCallback([&](float* dst, size_t frames, size_t ch) -> size_t {
             // 恢复重新 prime：暂停→恢复后先持稳输出，等缓冲回填到 4×ASIO 缓冲。
             // 3 秒超时放弃（目标音频断续时缓冲迟迟不满，避免一直持稳误触看门狗）
@@ -1104,7 +1264,10 @@ int wmain(int argc, wchar_t** argv) {
                             LARGE_INTEGER qn;
                             QueryPerformanceCounter(&qn);
                             double ms = (double)(qn.QuadPart - (LONGLONG)st.qpc) * 1000.0 / qpcFreq;
-                            totalLatencyMs.store((int)(ms + asioLatMs + 10.0), std::memory_order_relaxed);
+                            // 重采样器固有延迟（sinc 15 帧≈0.34ms，线性 0）——端到端延迟补全
+                            double resamplerLatMs = (double)rs.latencyFrames() * 1000.0 / asio.sampleRate();
+                            totalLatencyMs.store((int)(ms + asioLatMs + kCapturePeriodMs + resamplerLatMs),
+                                                 std::memory_order_relaxed);
                             break;
                         }
                         if (k == 0) break;
@@ -1146,6 +1309,7 @@ int wmain(int argc, wchar_t** argv) {
         uint64_t lastConsumedW = consumed.load();
         ULONGLONG lastConsumedAt = GetTickCount64();
         ULONGLONG stallLogAt = 0;   // 停滞日志节流
+        ULONGLONG crashAt = 0;      // 数据回调 SEH 捕获异常的起始时间（0=未发生）
         uint64_t lastUnderW = underruns.load();
         // 自适应 v2 状态：窗口波谷跟踪 + 安全窗口计数 + 启动宽限
         size_t wmMin = rb.available();
@@ -1214,6 +1378,17 @@ int wmain(int argc, wchar_t** argv) {
                         stallLogAt = now;
                         printf("[自适应] ASIO 回调停滞 %llu 秒，等待设备恢复（不重建，避免驱动崩溃）...\n",
                                (now - lastConsumedAt) / 1000);
+                    }
+                }
+                // 数据回调 SEH 捕获（设备掉线波及回调路径）→ 与停滞同策略：等 120 秒自恢复再重建
+                if (asio.callbackCrashed()) {
+                    if (crashAt == 0) {
+                        crashAt = now;
+                        printf("[自适应] ASIO 数据回调捕获异常（设备掉线？），等待自恢复...\n");
+                    } else if (now - crashAt > 120000) {
+                        printf("[自适应] 回调异常 120 秒未恢复，强制重建...\n");
+                        needRestart.store(true);
+                        break;
                     }
                 }
                 // ---- 自适应 v2：以窗口最低水位为控制信号 ----

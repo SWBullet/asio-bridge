@@ -5,12 +5,16 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <xmmintrin.h>   // _mm_getcsr/_mm_setcsr：x64 FTZ/DAZ 防 denormal 卡顿
 
 // 由 asiodrivers.cpp / asio.cpp 提供的全局
 extern AsioDrivers* asioDrivers;
 bool loadAsioDriver(char* name);
 
 static AsioRender* g_self = nullptr;
+
+// 崩溃面包屑：每个 SEH 保护区进入前更新，供日志/异常过滤器定位「在哪一步炸的」
+static volatile const char* g_crashContext = "idle";
 
 // 纯 POD 的驱动加载+初始化（SEH 可安全包裹：设备掉线会清空驱动函数指针表，
 // 调用会 AV）。返回 true 表示 loadAsioDriver 成功（驱动已加载），*ae 存 ASIOInit 结果
@@ -55,6 +59,36 @@ long AsioRender::typeBytes(long type) {
         case ASIOSTFloat64LSB: case ASIOSTFloat64MSB:                  return 8;
         default:                                                        return 4;
     }
+}
+
+static inline uint32_t xorshift32(uint32_t& s) {
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    return s;
+}
+
+// 统一 float→有符号整数转换核：double 域 TPDF 抖动 + 2^(bits-1) 对称缩放 + 整数域夹取。
+// 返回已夹取到 [-2^(bits-1), 2^(bits-1)-1] 的 int32。
+// 关键：抖动与缩放必须在 double 域进行——float32 在 |x|∈[0.5,1) 的间距是 2^-24，
+// 而 32-bit 整数 1 LSB 是 2^-31，若在 float32 域加抖动会被浮点网格完全吞掉（恒 no-op）。
+// 缩放必须用 2^(bits-1) 而非 2^(bits-1)-1：前者让 -1.0 映射到精确满刻度负值，
+// 且正满刻度在夹取后落到 +max（避免 2147483647.0f 在 float32 里被舍入成 2^31 导致 lrint 越界翻转）。
+static inline int32_t quantizeSigned(float x, int bits, bool dither, uint32_t& rng) {
+    const double scale = (bits >= 32) ? 2147483648.0
+                                      : (double)(int64_t(1) << (bits - 1));
+    double v = (double)x * scale;
+    if (dither) {
+        // TPDF：两个 [0,1) 均匀随机之和减 1 → 三角分布 [-1,+1]，即 ±1 LSB
+        const double u1 = (double)(xorshift32(rng) >> 8) * (1.0 / 16777216.0);
+        const double u2 = (double)(xorshift32(rng) >> 8) * (1.0 / 16777216.0);
+        v += u1 + u2 - 1.0;
+    }
+    const double lo = -scale;
+    const double hi = scale - 1.0;
+    if (v < lo) v = lo;
+    else if (v > hi) v = hi;
+    return (int32_t)llrint(v);
 }
 
 bool AsioRender::init(const std::string& driverName, double sampleRate, std::string& err, long bufferFrames) {
@@ -216,6 +250,14 @@ long AsioRender::asioMessageCB(long selector, long value, void* message, double*
 }
 
 void AsioRender::render(long idx) {
+    // x64 默认 FTZ/DAZ 关闭：sinc 尾部小系数在静音段会生成 denormal，单次运算可耗上百周期。
+    // 在驱动回调线程打开 FTZ(0x8000)+DAZ(0x0040)，消除 denormal 卡顿（per-thread MXCSR，安全）。
+    _mm_setcsr(_mm_getcsr() | 0x8040);
+
+    // 数据回调路径此前完全裸奔：RME 掉线时若 AV 发生在这里（而非 init/stop），进程直接死。
+    // 用 SEH 兜底整个回调体——本函数无局部 C++ 对象（全 POD），不会触发 C2712。
+    g_crashContext = "render";
+    __try {
     const size_t frames = (size_t)bufferSize_;
     size_t got = pull_ ? pull_(scratch_.data(), frames, channels_) : 0;
     const size_t histLen = frames;
@@ -263,34 +305,41 @@ void AsioRender::render(long idx) {
                 for (size_t f = 0; f < frames; ++f) d[f] = (double)src[f * channels_];
                 break;
             }
-            case ASIOSTInt32LSB:
-            case ASIOSTInt32LSB16:
-            case ASIOSTInt32LSB18:
-            case ASIOSTInt32LSB20:
+            case ASIOSTInt32LSB: {
+                int32_t* d = (int32_t*)dst;
+                for (size_t f = 0; f < frames; ++f)
+                    d[f] = quantizeSigned(src[f * channels_], 32, dither_, rngState_);
+                break;
+            }
+            // 32-bit 容器、N-bit 数据 LSB 对齐（有效位在低 N 位，范围 ±2^(N-1)）
+            case ASIOSTInt32LSB16: {
+                int32_t* d = (int32_t*)dst;
+                for (size_t f = 0; f < frames; ++f)
+                    d[f] = quantizeSigned(src[f * channels_], 16, dither_, rngState_);
+                break;
+            }
+            case ASIOSTInt32LSB18: {
+                int32_t* d = (int32_t*)dst;
+                for (size_t f = 0; f < frames; ++f)
+                    d[f] = quantizeSigned(src[f * channels_], 18, dither_, rngState_);
+                break;
+            }
+            case ASIOSTInt32LSB20: {
+                int32_t* d = (int32_t*)dst;
+                for (size_t f = 0; f < frames; ++f)
+                    d[f] = quantizeSigned(src[f * channels_], 20, dither_, rngState_);
+                break;
+            }
             case ASIOSTInt32LSB24: {
                 int32_t* d = (int32_t*)dst;
-                for (size_t f = 0; f < frames; ++f) {
-                    float x = src[f * channels_];
-                    if (x > 1.0f) x = 1.0f; else if (x < -1.0f) x = -1.0f;
-                    if (dither_) {
-                        // TPDF：两个均匀随机之和（三角分布），±1 个 Int32 LSB
-                        const double dlsb = (nextRand01() - 0.5) + (nextRand01() - 0.5);
-                        x += (float)(dlsb * (1.0 / 2147483648.0));
-                    }
-                    d[f] = (int32_t)lrintf(x * 2147483647.0f);
-                }
+                for (size_t f = 0; f < frames; ++f)
+                    d[f] = quantizeSigned(src[f * channels_], 24, dither_, rngState_);
                 break;
             }
             case ASIOSTInt24LSB: {
                 BYTE* d = (BYTE*)dst;
                 for (size_t f = 0; f < frames; ++f) {
-                    float x = src[f * channels_];
-                    if (x > 1.0f) x = 1.0f; else if (x < -1.0f) x = -1.0f;
-                    if (dither_) {
-                        const double dlsb = (nextRand01() - 0.5) + (nextRand01() - 0.5);
-                        x += (float)(dlsb * (1.0 / 8388608.0));
-                    }
-                    int32_t v = (int32_t)lrintf(x * 8388607.0f);
+                    int32_t v = quantizeSigned(src[f * channels_], 24, dither_, rngState_);
                     d[f * 3 + 0] = (BYTE)(v & 0xFF);
                     d[f * 3 + 1] = (BYTE)((v >> 8) & 0xFF);
                     d[f * 3 + 2] = (BYTE)((v >> 16) & 0xFF);
@@ -299,15 +348,8 @@ void AsioRender::render(long idx) {
             }
             case ASIOSTInt16LSB: {
                 int16_t* d = (int16_t*)dst;
-                for (size_t f = 0; f < frames; ++f) {
-                    float x = src[f * channels_];
-                    if (x > 1.0f) x = 1.0f; else if (x < -1.0f) x = -1.0f;
-                    if (dither_) {
-                        const double dlsb = (nextRand01() - 0.5) + (nextRand01() - 0.5);
-                        x += (float)(dlsb * (1.0 / 32768.0));
-                    }
-                    d[f] = (int16_t)lrintf(x * 32767.0f);
-                }
+                for (size_t f = 0; f < frames; ++f)
+                    d[f] = (int16_t)quantizeSigned(src[f * channels_], 16, dither_, rngState_);
                 break;
             }
             default:
@@ -316,6 +358,17 @@ void AsioRender::render(long idx) {
         }
     }
     ASIOOutputReady();
+    g_crashContext = "render:done";
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_crashContext = "render:SEH";
+        callbackCrashed_.store(true, std::memory_order_relaxed);
+        // 静音本包所有通道缓冲（半包数据会爆音）；不再做任何驱动调用，避免二次 AV
+        const long bytes = typeBytes(sampleType_);
+        for (size_t c = 0; c < channels_; ++c) {
+            void* buf = bufInfos_[c].buffers ? bufInfos_[c].buffers[idx] : nullptr;
+            if (buf) memset(buf, 0, (size_t)bufferSize_ * (size_t)bytes);
+        }
+    }
 }
 
 std::string AsioRender::listDrivers() {
@@ -330,13 +383,60 @@ std::string AsioRender::listDrivers() {
     return s.empty() ? "  (无)\n" : s;
 }
 
-static inline uint32_t xorshift32(uint32_t& s) {
-    s ^= s << 13;
-    s ^= s >> 17;
-    s ^= s << 5;
-    return s;
-}
-
 double AsioRender::nextRand01() {
     return (double)(xorshift32(rngState_) >> 8) * (1.0 / 16777216.0);
+}
+
+// 转换核自检：验证 float→int 满刻度不翻转（P0-1）、2^(b-1) 对称缩放（P0-2）、
+// 以及抖动在 double 域确实有效（旧 float32 域对 int32 恒 no-op）。
+int asioConversionSelfTest() {
+    int fails = 0;
+    uint32_t rng = 0x9E3779B9u;
+
+    auto expect = [&](const char* name, int32_t got, int32_t want) {
+        if (got != want) {
+            printf("[转换自检] %s: 期望 %d(0x%08X) 实得 %d(0x%08X) => FAIL\n",
+                   name, want, (unsigned)want, got, (unsigned)got);
+            ++fails;
+        }
+    };
+
+    // P0-1：满刻度正负不翻转（旧代码 +1.0 → INT32_MIN 满幅负脉冲爆音）
+    expect("int32 +1.0", quantizeSigned(1.0f, 32, false, rng), INT32_MAX);
+    expect("int32 -1.0", quantizeSigned(-1.0f, 32, false, rng), INT32_MIN);
+    expect("int32  0.0", quantizeSigned(0.0f, 32, false, rng), 0);
+    expect("int32 +0.5", quantizeSigned(0.5f, 32, false, rng), 1073741824);
+    expect("int32 -0.5", quantizeSigned(-0.5f, 32, false, rng), -1073741824);
+    // 超幅夹取
+    expect("int32 +1.5 夹取", quantizeSigned(1.5f, 32, false, rng), INT32_MAX);
+    expect("int32 -1.5 夹取", quantizeSigned(-1.5f, 32, false, rng), INT32_MIN);
+
+    // P0-2：各 N-bit LSB 对齐类型用 2^(N-1) 对称缩放
+    expect("int24 +1.0", quantizeSigned(1.0f, 24, false, rng), 8388607);
+    expect("int24 -1.0", quantizeSigned(-1.0f, 24, false, rng), -8388608);
+    expect("int16 +1.0", quantizeSigned(1.0f, 16, false, rng), 32767);
+    expect("int16 -1.0", quantizeSigned(-1.0f, 16, false, rng), -32768);
+    expect("lsb18 +1.0", quantizeSigned(1.0f, 18, false, rng), 131071);
+    expect("lsb18 -1.0", quantizeSigned(-1.0f, 18, false, rng), -131072);
+    expect("lsb20 +1.0", quantizeSigned(1.0f, 20, false, rng), 524287);
+    expect("lsb20 -1.0", quantizeSigned(-1.0f, 20, false, rng), -524288);
+
+    // 抖动有效性：int16 的 0.5 LSB 处（x=2^-16 在 float32 精确可表示）。
+    // 无抖动 llrint(0.5)=0（round-half-even），有抖动应能偏离到 ±1。
+    {
+        uint32_t r1 = 0x12345678u, r2 = 0x12345678u;
+        const float half = 1.0f / 65536.0f;   // = 2^-16
+        int32_t a = quantizeSigned(half, 16, false, r1);
+        int changed = 0;
+        for (int i = 0; i < 256; ++i) {
+            int32_t b = quantizeSigned(half, 16, true, r2);
+            if (b != a) ++changed;
+        }
+        printf("[转换自检] 抖动有效性(int16 0.5LSB): 无抖动=%d, 有抖动 256 次中 %d 次偏离 %s\n",
+               a, changed, changed > 0 ? "PASS" : "FAIL(抖动仍被吞)");
+        if (changed == 0) ++fails;
+    }
+
+    printf(fails == 0 ? "== 转换核自检通过 ==\n" : "== 转换核自检存在 %d 项失败 ==\n", fails);
+    return fails;
 }

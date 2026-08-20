@@ -45,6 +45,7 @@ bool WasapiProcessCapture::open(DWORD pid, DataCallback cb, std::string& err) {
     active_.store(false);
     pid_ = pid;
     cb_ = std::move(cb);
+    cbValid_.store(true, std::memory_order_release);
     event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     readyEvent_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     running_.store(true);
@@ -71,6 +72,9 @@ bool WasapiProcessCapture::open(DWORD pid, DataCallback cb, std::string& err) {
 }
 
 void WasapiProcessCapture::close() {
+    // 先切断回调（原子门）：此后采集线程即便仍存活（异常挂死在 COM 调用中），
+    // 也不会再触碰 cb_/onError_——而 cb_ 捕获的 per-session 局部变量可能已被主循环析构。
+    cbValid_.store(false, std::memory_order_release);
     running_.store(false);
     if (event_) SetEvent(event_);
     if (thread_) {
@@ -78,7 +82,13 @@ void WasapiProcessCapture::close() {
         if (r == WAIT_OBJECT_0) { CloseHandle(thread_); thread_ = nullptr; }
         else {
             printf("[Bridge] 警告: 采集线程 15 秒未退出\n");
+            // 线程仍存活：泄漏 event_/readyEvent_ 句柄（置空但不 CloseHandle）。
+            // 若关闭，活线程正在 WaitForSingleObject 的句柄会变 use-after-close。
+            // 异常挂死极罕见，代价只是泄漏两把句柄（进程退出时回收）。
             thread_ = nullptr;
+            event_ = nullptr;
+            readyEvent_ = nullptr;
+            return;
         }
     }
     if (event_) { CloseHandle(event_); event_ = nullptr; }
@@ -298,7 +308,7 @@ void WasapiProcessCapture::drainInner() {
         hr = capture_->GetBuffer(&data, &frames, &flags, nullptr, nullptr);
         if (hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_SERVICE_NOT_RUNNING) {
             failed_.store(true);
-            if (onError_) onError_();
+            if (cbValid_.load(std::memory_order_acquire) && onError_) onError_();
             return;
         }
         if (SUCCEEDED(hr) && frames > 0) {
@@ -309,7 +319,7 @@ void WasapiProcessCapture::drainInner() {
                 convert(data, frames, conv_.data());
             if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT))
                 active_.store(true, std::memory_order_release);
-            cb_(conv_.data(), frames);
+            if (cbValid_.load(std::memory_order_acquire)) cb_(conv_.data(), frames);
         }
         if (SUCCEEDED(hr))
             capture_->ReleaseBuffer(frames);
@@ -323,7 +333,7 @@ void WasapiProcessCapture::drain() {
         drainInner();
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         failed_.store(true);
-        if (onError_) onError_();
+        if (cbValid_.load(std::memory_order_acquire) && onError_) onError_();
     }
 }
 
@@ -681,6 +691,11 @@ void RestoreEndpointMutes(std::vector<EndpointMuteEntry>& entries) {
         }
         return true;
     });
+    // 兜底：RunComOnMta 若因 CoInitializeEx/CreateEventW 失败未执行 lambda，
+    // 此处 Release 所有残留 ev，避免整批 IAudioEndpointVolume* 泄漏。
+    for (auto& e : entries) {
+        if (e.ev) { e.ev->Release(); e.ev = nullptr; }
+    }
     entries.clear();
 }
 

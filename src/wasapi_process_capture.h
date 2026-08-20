@@ -47,6 +47,7 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> failed_{false};
     std::atomic<bool> active_{false};
+    std::atomic<bool> cbValid_{true};   // 关闭时先置 false：阻止采集线程再触碰 cb_/onError_（悬垂引用 UAF）
     HANDLE thread_ = nullptr;
     HANDLE event_ = nullptr;        // 数据到达事件
     HANDLE readyEvent_ = nullptr;   // 初始化完成信号

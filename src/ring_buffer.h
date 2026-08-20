@@ -69,6 +69,8 @@ private:
     float* buf_ = nullptr;
     size_t size_ = 0;
     size_t mask_ = 0;
-    std::atomic<size_t> writePos_{0};
-    std::atomic<size_t> readPos_{0};
+    // 写入/读取下标分占独立 cache line（alignas(64)），避免生产者/消费者
+    // 在相邻同 cache line 上互相伪共享导致每次写入都无效化对方缓存行
+    alignas(64) std::atomic<size_t> writePos_{0};
+    alignas(64) std::atomic<size_t> readPos_{0};
 };

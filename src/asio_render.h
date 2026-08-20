@@ -2,6 +2,7 @@
 // asiosys.h 必须先于 asio.h：定义平台宏与 IEEE754_64FLOAT（ASIOSampleRate=double）
 #include "asiosys.h"
 #include "asio.h"
+#include <atomic>
 #include <cstddef>
 #include <functional>
 #include <string>
@@ -26,6 +27,8 @@ public:
     long bufferSize() const { return bufferSize_; }
     long sampleType() const { return sampleType_; }
     size_t channels() const { return channels_; }
+    // ASIO 数据回调内发生过 SEH 捕获的 AV（设备掉线波及）→ 主循环应据此触发重建
+    bool callbackCrashed() const { return callbackCrashed_.load(std::memory_order_relaxed); }
     // ASIOGetLatencies：驱动上报的输入/输出延迟（帧）
     long inputLatency() const { return inputLatency_; }
     long outputLatency() const { return outputLatency_; }
@@ -55,7 +58,11 @@ private:
     size_t fadeInFrames_ = 32;                     // 恢复包淡入长度
     bool dither_ = false;                          // TPDF 抖动开关
     uint32_t rngState_ = 0x9E3779B9;               // xorshift32 状态
+    std::atomic<bool> callbackCrashed_{false};     // 数据回调内 SEH 捕获到 AV 标志
     std::vector<std::vector<float>> hist_;         // 每通道最近波形历史（镜像填充用）
     std::vector<ASIOBufferInfo> bufInfos_;
     std::vector<float> scratch_;
 };
+
+// 转换核自检（独立于实例，验证 quantizeSigned 的满刻度对称性与 double 域抖动）
+int asioConversionSelfTest();

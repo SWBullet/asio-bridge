@@ -369,7 +369,7 @@ async function pollStatus(){
     setLed(document.getElementById('l-chain'),s.capRate===s.asioRate);
     setLed(document.getElementById('l-lock'),s.inRate>0);
     setLed(document.getElementById('l-under'),s.underruns===0);
-    setLed(document.getElementById('l-clip'),s.peak<0.999);
+    setLed(document.getElementById('l-clip'),s.peak<=1.0);
     setLed(document.getElementById('l-active'),s.targetActive);
     if(firstInit){
       firstInit=false;
