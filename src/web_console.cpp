@@ -52,9 +52,16 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
   padding:7px 12px 8px;box-shadow:inset 0 2px 6px rgba(0,0,0,.7)}
 .meter .l{font-size:10px;letter-spacing:2px;color:#9aa1aa}
 .meter .v{font-family:Consolas,monospace;font-size:19px;color:#ffd27f;text-shadow:0 0 9px rgba(255,190,80,.3);
-  font-variant-numeric:tabular-nums;margin-top:3px;line-height:1.25}
+  font-variant-numeric:tabular-nums;margin-top:3px;line-height:1.25;white-space:nowrap;overflow:hidden}
 .meter .s{font-size:10px;color:#6d747d;margin-top:1px}
 .meter .v.warn{color:#ff8a5c}.meter .v.bad{color:#ff5c54}
+/* ===== 复古正圆指针表头（2 列 × 2 排） ===== */
+.gauge2{grid-column:span 2;grid-row:span 2;position:relative;display:flex;align-items:center;justify-content:center;padding:4px}
+.gauge2 canvas{width:100%;height:auto;aspect-ratio:1/1;display:block}
+/* 副栏：其余 9 项以细条小块展示 */
+.substrip{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:10px;padding:6px 4px;border-top:1px solid #3a4048}
+.substrip .chip{font-family:Consolas,monospace;font-size:11px;color:#9aa1aa;white-space:nowrap}
+.substrip .chip b{color:#ffd27f;font-weight:600;text-shadow:0 0 5px rgba(255,190,80,.25)}
 
 /* ===== LED 状态条 ===== */
 .ledrow{display:flex;gap:24px;flex-wrap:wrap;align-items:center}
@@ -89,7 +96,7 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
 .led.a{background:#ffb84a;box-shadow:0 0 8px rgba(255,184,74,.85)}
 
 /* ===== 示波窗 ===== */
-canvas{background:#06080a;border:2px solid #5b626a;border-radius:8px;width:100%;height:220px;display:block;
+#spark{background:#06080a;border:2px solid #5b626a;border-radius:8px;width:100%;height:220px;display:block;
   box-shadow:inset 0 3px 8px rgba(0,0,0,.85)}
 #tip{position:absolute;background:rgba(20,22,26,.95);border:1px solid #565c64;border-radius:6px;padding:6px 10px;
   font-size:12px;display:none;pointer-events:none;z-index:5;line-height:1.7;font-family:Consolas,monospace}
@@ -141,7 +148,12 @@ canvas{background:#06080a;border:2px solid #5b626a;border-radius:8px;width:100%;
 
 <div class="panel">
   <div class="mtitle">TELEMETRY</div>
-  <div class="grid" id="meters"></div>
+  <div class="grid" id="meters">
+    <div class="gauge2"><canvas id="g-peak"></canvas></div>
+    <div class="gauge2"><canvas id="g-wm"></canvas></div>
+    <div class="gauge2"><canvas id="g-lat"></canvas></div>
+  </div>
+  <div class="substrip" id="substrip"></div>
 </div>
 
 <div class="panel">
@@ -169,6 +181,13 @@ canvas{background:#06080a;border:2px solid #5b626a;border-radius:8px;width:100%;
     <label class="switch"><input type="checkbox" id="dither"><span class="track"><span class="knob"></span></span><span class="led"></span></label>
     <span class="lbl" style="margin-left:14px">直通模式</span>
     <label class="switch"><input type="checkbox" id="passthrough"><span class="track"><span class="knob"></span></span><span class="led"></span></label>
+  </div>
+  <div class="ctlrow">
+    <span class="lbl">重采样质量</span>
+    <span id="bank-src">
+      <button class="btn" data-v="0">线性低延迟</button>
+      <button class="btn" data-v="32">sinc 高精度</button>
+    </span>
   </div>
   <div class="ctlrow">
     <span class="lbl">观察窗口</span>
@@ -200,35 +219,150 @@ var range=600, scale=0;
 function fmt(n){return n.toLocaleString()}
 function setLed(el,on,amber){el.className='tube '+(on?(amber?'on dim':'on'):'bad')}
 function tubeSpan(id){return '<span class="tube" id="'+id+'"><span class="glass"></span><span class="getter"></span><span class="fil f1"></span><span class="fil f2"></span><span class="pin p1"></span><span class="pin p2"></span></span>'}
-function mtr(l,v,s,cls){return '<div class="meter"><div class="l">'+l+'</div><div class="v'+(cls?' '+cls:'')+'">'+v+'</div><div class="s">'+s+'</div></div>'}
+function mtr(l,v,s,cls,id){return '<div class="meter"><div class="l">'+l+'</div><div class="v'+(cls?' '+cls:'')+'"'+(id?' id="'+id+'"':'')+'>'+v+'</div><div class="s">'+s+'</div></div>'}
+function chip(l,v){return '<span class="chip">'+l+' <b>'+v+'</b></span>'}
+/* ===== 三块复古正圆指针表头（麦景图式精工） ===== */
+var gPeak={cur:0,tgt:0,min:0,max:1,danger:0.85};
+var gWm={cur:0,tgt:0,min:0,max:4096,mark:4096,danger:1024};
+var gLat={cur:0,tgt:0,min:0,max:300,danger:200};
+function gAng(v,o){var t=(v-o.min)/(o.max-o.min);t=t<0?0:(t>1?1:t);return Math.PI*0.75+t*Math.PI*1.5}
+function gTick(o,i){
+  var v=o.min+(o.max-o.min)*i/5;
+  if(o===gPeak)return v.toFixed(1);
+  if(o===gLat)return Math.round(v);
+  return v>=1000?(v/1000)+'k':Math.round(v);
+}
+// 分区色界：峰值 0–0.85 绿 / 0.85–1 红；延迟 0–100 绿 / 100–200 琥珀 / 200–300 红；
+// 水位 低于危险值红 / 危险值–目标绿 / 高于目标琥珀
+function zoneBounds(o){
+  if(o===gPeak)return[{to:0.85,c:'#7dd07d'},{to:1,c:'#f85149'}];
+  if(o===gLat)return[{to:100,c:'#7dd07d'},{to:200,c:'#ffb84a'},{to:300,c:'#f85149'}];
+  var b=[];
+  if(o.danger>o.min)b.push({to:o.danger,c:'#f85149'});
+  if(o.mark>o.min&&o.mark>o.danger)b.push({to:o.mark,c:'#7dd07d'});
+  if(o.max>o.mark)b.push({to:o.max,c:'#ffb84a'});
+  return b;
+}
+function zoneColor(o,v){
+  var b=zoneBounds(o);
+  for(var i=0;i<b.length;i++)if(v<=b[i].to)return b[i].c;
+  return b.length?b[b.length-1].c:'#ffd27f';
+}
+)HTML" R"HTML(function drawDial(id,o,label,valText){
+  var cv=document.getElementById(id);if(!cv)return;
+  var ctx=cv.getContext('2d');
+  var dpr=window.devicePixelRatio||1;
+  var w=cv.clientWidth, h=cv.clientHeight;   // 读 CSS 尺寸（无强制回流），缓存于 backing store
+  if(w<50)return;
+  var W=Math.round(w*dpr), H=Math.round(h*dpr);
+  if(cv.width!==W||cv.height!==H){cv.width=W;cv.height=H;}
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  var S=Math.min(w,h), cx=w/2, cy=h/2, R=S/2-5;
+  ctx.clearRect(0,0,w,h);
+  // ===== 金属表圈：亮银拉丝（无黑框） + 滚花圈 + 抛光内圈 =====
+  ctx.beginPath();ctx.arc(cx,cy,R+4,0,6.283);
+  var bez=ctx.createRadialGradient(cx,cy,R*0.7,cx,cy,R+4);
+  bez.addColorStop(0,'#b8bdc2');bez.addColorStop(0.55,'#e8eaec');bez.addColorStop(0.85,'#a6acb2');bez.addColorStop(1,'#6b727a');
+  ctx.fillStyle=bez;ctx.fill();
+  // 滚花（短放射纹模拟机加工滚花，浅色）
+  for(var k=0;k<72;k++){
+    var ka=k/72*6.283, c=Math.cos(ka), s=Math.sin(ka);
+    ctx.beginPath();ctx.moveTo(cx+c*(R-1),cy+s*(R-1));ctx.lineTo(cx+c*(R+2),cy+s*(R+2));
+    ctx.strokeStyle='rgba(80,86,94,.25)';ctx.lineWidth=1;ctx.stroke();
+  }
+  // 抛光内圈
+  ctx.beginPath();ctx.arc(cx,cy,R-2,0,6.283);ctx.strokeStyle='#f2f4f5';ctx.lineWidth=1.5;ctx.stroke();
+  // ===== 镜面暖色表盘（中心亮、边缘暖褐，非黑） =====
+  var face=ctx.createRadialGradient(cx-R*0.3,cy-R*0.35,R*0.05,cx,cy,R);
+  face.addColorStop(0,'#6a4420');face.addColorStop(0.55,'#3a2410');face.addColorStop(1,'#241505');
+  ctx.beginPath();ctx.arc(cx,cy,R-4,0,6.283);ctx.fillStyle=face;ctx.fill();
+  // 顶部高光弧（镜面反射）
+  var sheen=ctx.createRadialGradient(cx-R*0.35,cy-R*0.4,R*0.05,cx-R*0.35,cy-R*0.4,R*0.9);
+  sheen.addColorStop(0,'rgba(255,240,210,.16)');sheen.addColorStop(1,'rgba(255,240,210,0)');
+  ctx.beginPath();ctx.arc(cx,cy,R-4,0,6.283);ctx.fillStyle=sheen;ctx.fill();
+  // ===== 分区色带（不同颜色划分量程区域） =====
+  var zb=zoneBounds(o), prev=o.min;
+  for(var z=0;z<zb.length;z++){
+    var afrom=gAng(prev,o), ato=gAng(zb[z].to,o);
+    ctx.beginPath();ctx.arc(cx,cy,R-9,afrom,ato);
+    ctx.strokeStyle=zb[z].c;ctx.globalAlpha=0.16;ctx.lineWidth=R*0.13;ctx.stroke();
+    ctx.globalAlpha=1;prev=zb[z].to;
+  }
+  // ===== 刻度：按所在区域着色（主刻度 + 细分刻线） =====
+  var fsz=S>150?10:(S>100?8:7);
+  for(var i=0;i<=25;i++){
+    var v=o.min+(o.max-o.min)*i/25;
+    var a=gAng(v,o), major=(i%5===0);
+    var zc=zoneColor(o,v);
+    ctx.beginPath();ctx.moveTo(cx+Math.cos(a)*(R-19),cy+Math.sin(a)*(R-19));
+    ctx.lineTo(cx+Math.cos(a)*(R-(major?10:14)),cy+Math.sin(a)*(R-(major?10:14)));
+    ctx.strokeStyle=zc;ctx.globalAlpha=major?1:0.55;ctx.lineWidth=major?1.6:0.7;ctx.stroke();
+    ctx.globalAlpha=1;
+    if(major){
+      ctx.fillStyle=zc;ctx.font=fsz+'px Consolas,monospace';ctx.textAlign='center';
+      var lx=cx+Math.cos(a)*(R-31), ly=cy+Math.sin(a)*(R-31)+fsz*0.35;
+      ctx.fillText(gTick(o,i/5),lx,ly);
+    }
+  }
+  // ===== 单指针（细长针 + 柔和阴影，阻尼缓动） =====
+  var an=gAng(o.cur,o);
+  var nx=Math.cos(an), ny=Math.sin(an);
+  ctx.save();
+  ctx.shadowColor='rgba(0,0,0,.6)';ctx.shadowBlur=4;ctx.shadowOffsetY=2;
+  ctx.strokeStyle='#ffd27f';ctx.lineWidth=2;ctx.lineCap='round';
+  ctx.beginPath();ctx.moveTo(cx,cy);ctx.lineTo(cx+nx*(R-24),cy+ny*(R-24));   // 单指针：轴心→针尖
+  ctx.stroke();
+  ctx.restore();
+  // 轴心（金属帽 + 内孔，放大 3 倍）
+  ctx.beginPath();ctx.arc(cx,cy,19.5,0,6.283);
+  var hub=ctx.createRadialGradient(cx-4.5,cy-4.5,1.5,cx,cy,19.5);
+  hub.addColorStop(0,'#f0e6d0');hub.addColorStop(0.6,'#c8a86a');hub.addColorStop(1,'#5a4420');
+  ctx.fillStyle=hub;ctx.fill();
+  ctx.beginPath();ctx.arc(cx,cy,6.6,0,6.283);ctx.fillStyle='#241505';ctx.fill();
+  // ===== 表名 + 数字读数 =====
+  ctx.fillStyle='#d8b46a';ctx.font=(S>150?10:(S>100?8:7))+'px Consolas,monospace';ctx.fillText(label,cx,cy+R*0.36);
+  ctx.fillStyle='#ffd27f';ctx.font=(S>150?13:(S>100?11:9))+'px Consolas,monospace';ctx.fillText(valText,cx,cy+R*0.54);
+}
+function stepG(g){var d=g.tgt-g.cur;if(Math.abs(d)<0.0005){g.cur=g.tgt;return}g.cur+=d*0.15}
+setInterval(function(){
+  stepG(gPeak);stepG(gWm);stepG(gLat);
+  drawDial('g-peak',gPeak,'峰值 PEAK',gPeak.cur.toFixed(3));
+  drawDial('g-wm',gWm,'水位 WATERMARK',fmt(Math.round(gWm.cur))+' 采样');
+  drawDial('g-lat',gLat,'链路延迟 LATENCY',Math.round(gLat.cur)+' ms');
+},40);
 async function pollStatus(){
   try{
     var r=await fetch('/api/status');var s=await r.json();
     var upTxt=(s.uptime/60000).toFixed(1)+' 分钟';
-    var rlTxt=s.inRate?(s.ratioBase-1>0?'+':'-')+Math.abs((s.ratioBase-1)*1e6).toFixed(1)+' ppm':'—';
+    // 锁频读数：锁定后显示「采集k→ASIOk ±ppm」，未锁则「测量中…」
+    var rlTxt='测量中…';
+    if(s.inRate>0){
+      var sign=(s.ratioBase-1)>0?'+':'-';
+      var ppm=Math.abs((s.ratioBase-1)*1e6).toFixed(1);
+      rlTxt=(s.capRate/1000).toFixed(1)+'k→'+(s.asioRate/1000).toFixed(1)+'k '+sign+ppm+' ppm';
+    }
     var tgt=s.targetPid?('PID '+s.targetPid+(s.targetActive?' · 活跃':' · 静默')):'发现中…';
-    var wmCls=s.watermark<1024?'bad':(s.watermark>s.target*1.5?'warn':'');
-    document.getElementById('meters').innerHTML=
-      mtr('水位',fmt(s.watermark),'采样',wmCls)+
-      mtr('目标',fmt(s.target),'采样')+
-      mtr('下限',s.floor+'×','倍数')+
-      mtr('欠载',fmt(s.underruns),'累计',s.underruns>0?'warn':'')+
-      mtr('峰值',s.peak.toFixed(3),'FS',s.peak>0.999?'bad':'')+
-      mtr('采集',s.capRate+' Hz','Bridge')+
-      mtr('链路延迟',s.latencyMs>0?s.latencyMs+' ms':'—','实测驻留',s.latencyMs>500?'bad':(s.latencyMs>200?'warn':''))+
-      mtr('ASIO',s.asioRate+' Hz','采样率')+
-      mtr('缓冲',s.asioBuffer+' 帧','ASIO')+
-      mtr('运行',upTxt,'')+
-      mtr('实测输入',s.inRate?s.inRate.toFixed(1)+' Hz':'—','')+
-      mtr('实测输出',s.outRate?s.outRate.toFixed(1)+' Hz':'—','')+
-      mtr('速率锁',rlTxt,'')+
-      mtr('目标进程',tgt,'');
+    document.getElementById('substrip').innerHTML=
+      chip('目标',fmt(s.target))+
+      chip('采集',s.capRate+' Hz')+
+      chip('ASIO',s.asioRate+' Hz')+
+      chip('缓冲',s.asioBuffer+' 帧')+
+      chip('运行',upTxt)+
+      chip('实测输入',s.inRate?s.inRate.toFixed(1)+' Hz':'—')+
+      chip('实测输出',s.outRate?s.outRate.toFixed(1)+' Hz':'—')+
+      chip('锁频',rlTxt)+
+      chip('目标进程',tgt);
+    // 三块指针的目标值
+    gPeak.tgt=Math.min(1,Math.max(0,s.peak));
+    gWm.max=Math.max(2048,s.target*2);
+    gWm.mark=s.target;
+    gWm.tgt=Math.min(gWm.max,Math.max(0,s.watermark));
+    gLat.tgt=s.latencyMs>0?Math.min(300,s.latencyMs):0;
     setLed(document.getElementById('h-asio'),s.asioRate>0);
     setLed(document.getElementById('h-cap'),s.targetActive,s.targetPid&&!s.targetActive);
-    var ledTpl='<div class="leditem"><span class="led" id="ledN"></span>LABEL</div>';
     document.getElementById('leds').innerHTML=
       '<div class="leditem">'+tubeSpan('l-chain')+'采样率链一致</div>'+
-      '<div class="leditem">'+tubeSpan('l-lock')+'速率锁有效</div>'+
+      '<div class="leditem">'+tubeSpan('l-lock')+'锁频锁定</div>'+
       '<div class="leditem">'+tubeSpan('l-under')+'无欠载</div>'+
       '<div class="leditem">'+tubeSpan('l-clip')+'无削波</div>'+
       '<div class="leditem">'+tubeSpan('l-active')+'目标活跃</div>';
@@ -242,6 +376,7 @@ async function pollStatus(){
       document.getElementById('dither').checked=!!s.dither;
       document.getElementById('passthrough').checked=!!s.passthrough;
       setBank('bank-floor',String(s.floor));
+      setBank('bank-src',String(s.srcTaps||0));
       setBank('bank-range',String(range));
       setBank('bank-scale',String(scale));
     }
@@ -264,6 +399,7 @@ function bindBank(id,fn){
   })(b.children[i]);
 }
 bindBank('bank-floor',function(v){ctl('action=floor&value='+v)});
+bindBank('bank-src',function(v){ctl('action=src&value='+v)});
 bindBank('bank-range',function(v){range=v;draw()});
 bindBank('bank-scale',function(v){scale=v;draw()});
 function ctl(body){fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})}
@@ -383,6 +519,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             "\"dither\":%d,"
             "\"latencyMs\":%d,"
             "\"ratioBase\":%.7f,\"inRate\":%.1f,\"outRate\":%.1f,\"passthrough\":%d,"
+            "\"srcTaps\":%d,"
             "\"targetPid\":%u,\"targetActive\":%d}",
             wm, target, (unsigned long long)floorM, (unsigned long long)wmMult,
             u, d, (double)g_p.peak->load(std::memory_order_relaxed),
@@ -397,6 +534,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             (double)g_p.inRate->load(std::memory_order_relaxed),
             (double)g_p.outRate->load(std::memory_order_relaxed),
             g_p.passthrough->load(std::memory_order_relaxed) ? 1 : 0,
+            (int)g_p.srcTaps->load(std::memory_order_relaxed),
             (unsigned)g_p.targetPid->load(std::memory_order_relaxed),
             g_p.targetActive->load(std::memory_order_relaxed) ? 1 : 0);
         sendResponse(s, "200 OK", "application/json; charset=utf-8", body, len);
@@ -415,6 +553,8 @@ static void handleRequest(SOCKET s, char* req, int n) {
                 g_p.needRestart->store(true);   // 重建后生效
             } else if (strstr(body, "action=passthrough")) {
                 g_p.passthroughReq->store(v != 0 ? 1 : 2, std::memory_order_relaxed);
+            } else if (strstr(body, "action=src")) {
+                g_p.srcTaps->store(v == 32 ? 32 : 0, std::memory_order_relaxed);
             } else if (strstr(body, "action=rebuild")) {
                 g_p.needRestart->store(true);
             } else if (strstr(body, "action=reset")) {

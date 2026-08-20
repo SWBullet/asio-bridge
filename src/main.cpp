@@ -125,87 +125,100 @@ static int resamplerSelfTest() {
     rs.setup(need);
     bool allPass = true;
 
-    // 测试 1：ratio=1.0 直通——wantIn 投喂后逐采样精确
-    {
-        rs.reset(); rs.ratio = 1.0;
-        size_t ip = 0;
-        double maxE = 0.0, sumSq = 0.0; size_t n = 0;
-        while (ip < inFrames) {
-            size_t want = rs.wantIn(need);
-            if (ip + want > inFrames) break;
-            rs.process(&in[ip * 2], want, out.data(), need);
-            for (size_t j = 0; j < need * 2; ++j) {
-                double e = fabs((double)out[j] - (double)in[ip * 2 + j]);
-                if (e > maxE) maxE = e;
-                sumSq += e * e; ++n;
+    // 两种质量档都验证：0=线性（低延迟），32=sinc（高精度）
+    for (int mode : {0, 32}) {
+        rs.taps = mode;
+        const char* tag = mode == 0 ? "线性" : "sinc";
+        bool modePass = true;
+
+        // 测试 1：ratio=1.0 直通——与理想正弦对比（sinc 有 15 帧固有群延迟，
+        // 逐位比对会错位，故统一用理想正弦参考）
+        {
+            rs.reset(); rs.ratio = 1.0;
+            size_t ip = 0, om = 0;
+            double maxE = 0.0, sumSq = 0.0; size_t n = 0;
+            while (ip < inFrames) {
+                size_t want = rs.wantIn(need);
+                if (ip + want > inFrames) break;
+                rs.process(&in[ip * 2], want, out.data(), need);
+                for (size_t j = 0; j < need; ++j) {
+                    double ref = 0.5 * sin(2.0 * 3.14159265358979323846 * f * (double)(om + j) / Fs);
+                    double e0 = fabs((double)out[j * 2] - ref);
+                    double e1 = fabs((double)out[j * 2 + 1] - ref);
+                    if (e0 > maxE) maxE = e0;
+                    if (e1 > maxE) maxE = e1;
+                    sumSq += e0 * e0 + e1 * e1; n += 2;
+                }
+                om += need; ip += want;
             }
-            ip += want;
+            double rms = sqrt(sumSq / n);
+            bool pass = rms < 1e-3 && maxE < 5e-3;
+            printf("[自检1-%s] ratio=1.0 直通: 最大误差 %.2e, RMS %.2e, %zu 采样 => %s\n",
+                   tag, maxE, rms, n, pass ? "PASS" : "FAIL");
+            modePass &= pass;
         }
-        double rms = sqrt(sumSq / n);
-        bool pass = maxE < 1e-7;
-        printf("[自检1] ratio=1.0 直通: 最大误差 %.2e, RMS %.2e, %zu 采样 => %s\n",
-               maxE, rms, n, pass ? "PASS" : "FAIL");
-        allPass &= pass;
-    }
 
-    // 测试 2：ratio=1.0002 与理想 1000.2Hz 正弦对比（输出帧 m ↔ 输入帧位 m×ratio）
-    {
-        rs.reset(); rs.ratio = 1.0002;
-        size_t ip = 0, om = 0;   // ip=输入帧指针, om=全局输出帧索引
-        double maxE = 0.0, sumSq = 0.0; size_t n = 0;
-        while (ip < inFrames) {
-            size_t want = rs.wantIn(need);
-            if (ip + want > inFrames) break;
-            rs.process(&in[ip * 2], want, out.data(), need);
-            for (size_t j = 0; j < need; ++j) {
-                double ref = 0.5 * sin(2.0 * 3.14159265358979323846 * f * 1.0002
-                                       * (double)(om + j) / Fs);
-                double e0 = fabs((double)out[j * 2] - ref);
-                double e1 = fabs((double)out[j * 2 + 1] - ref);
-                if (e0 > maxE) maxE = e0;
-                if (e1 > maxE) maxE = e1;
-                sumSq += e0 * e0 + e1 * e1; n += 2;
+        // 测试 2：ratio=1.0002 与理想 1000.2Hz 正弦对比（输出帧 m ↔ 输入帧位 m×ratio）
+        {
+            rs.reset(); rs.ratio = 1.0002;
+            size_t ip = 0, om = 0;
+            double maxE = 0.0, sumSq = 0.0; size_t n = 0;
+            while (ip < inFrames) {
+                size_t want = rs.wantIn(need);
+                if (ip + want > inFrames) break;
+                rs.process(&in[ip * 2], want, out.data(), need);
+                for (size_t j = 0; j < need; ++j) {
+                    double ref = 0.5 * sin(2.0 * 3.14159265358979323846 * f * 1.0002
+                                           * (double)(om + j) / Fs);
+                    double e0 = fabs((double)out[j * 2] - ref);
+                    double e1 = fabs((double)out[j * 2 + 1] - ref);
+                    if (e0 > maxE) maxE = e0;
+                    if (e1 > maxE) maxE = e1;
+                    sumSq += e0 * e0 + e1 * e1; n += 2;
+                }
+                om += need; ip += want;
             }
-            om += need; ip += want;
+            double rms = sqrt(sumSq / n);
+            bool pass = rms < 1e-3 && maxE < 5e-3;
+            printf("[自检2-%s] ratio=1.0002 理想对比: 最大误差 %.2e, RMS %.2e, %zu 采样 => %s\n",
+                   tag, maxE, rms, n, pass ? "PASS" : "FAIL");
+            modePass &= pass;
         }
-        double rms = sqrt(sumSq / n);
-        bool pass = rms < 1e-3 && maxE < 5e-3;
-        printf("[自检2] ratio=1.0002 理想对比: 最大误差 %.2e, RMS %.2e, %zu 采样 => %s\n",
-               maxE, rms, n, pass ? "PASS" : "FAIL");
-        allPass &= pass;
-    }
 
-    // 测试 3：比率摆动（模拟控制器行为）——输出有界、无 NaN
-    {
-        rs.reset();
-        size_t ip = 0;
-        bool bounded = true;
-        for (size_t k = 0; k < 5000; ++k) {
-            rs.ratio = ((k / 1000) % 2 == 0) ? 1.0003 : 0.9997;
-            size_t want = rs.wantIn(need);
-            if (ip + want > inFrames) ip = 0;
-            rs.process(&in[ip * 2], want, out.data(), need);
-            for (size_t j = 0; j < need * 2; ++j)
-                if (fabsf(out[j]) > 0.51f || out[j] != out[j]) bounded = false;
-            ip += want;
+        // 测试 3：比率摆动（模拟控制器行为）——输出有界、无 NaN
+        {
+            rs.reset();
+            size_t ip = 0;
+            bool bounded = true;
+            for (size_t k = 0; k < 5000; ++k) {
+                rs.ratio = ((k / 1000) % 2 == 0) ? 1.0003 : 0.9997;
+                size_t want = rs.wantIn(need);
+                if (ip + want > inFrames) ip = 0;
+                rs.process(&in[ip * 2], want, out.data(), need);
+                for (size_t j = 0; j < need * 2; ++j)
+                    if (fabsf(out[j]) > 0.51f || out[j] != out[j]) bounded = false;
+                ip += want;
+            }
+            printf("[自检3-%s] 比率摆动 0.9997~1.0003: %s\n", tag, bounded ? "PASS" : "FAIL");
+            modePass &= bounded;
         }
-        printf("[自检3] 比率摆动 0.9997~1.0003: %s\n", bounded ? "PASS" : "FAIL");
-        allPass &= bounded;
-    }
 
-    // 测试 4：饥饿钳制（输入 5 帧 / 需求 256 帧）——保持无 NaN、有界
-    {
-        rs.reset(); rs.ratio = 1.0;
-        float tiny[10];
-        for (int i = 0; i < 10; ++i) tiny[i] = 0.1f;
-        bool ok = true;
-        for (size_t k = 0; k < 100; ++k) {
-            rs.process(tiny, 5, out.data(), need);
-            for (size_t j = 0; j < need * 2; ++j)
-                if (fabsf(out[j]) > 0.11f || out[j] != out[j]) ok = false;
+        // 测试 4：饥饿钳制（输入 5 帧 / 需求 256 帧）——保持无 NaN、有界
+        {
+            rs.reset(); rs.ratio = 1.0;
+            float tiny[10];
+            for (int i = 0; i < 10; ++i) tiny[i] = 0.1f;
+            bool ok = true;
+            for (size_t k = 0; k < 100; ++k) {
+                rs.process(tiny, 5, out.data(), need);
+                for (size_t j = 0; j < need * 2; ++j)
+                    if (fabsf(out[j]) > 0.11f || out[j] != out[j]) ok = false;
+            }
+            printf("[自检4-%s] 饥饿输入(5/256帧): %s\n", tag, ok ? "PASS" : "FAIL");
+            modePass &= ok;
         }
-        printf("[自检4] 饥饿输入(5/256帧): %s\n", ok ? "PASS" : "FAIL");
-        allPass &= ok;
+
+        allPass &= modePass;
     }
 
     printf(allPass ? "== 重采样器自检全部通过 ==\n" : "== 自检存在失败项 ==\n");
@@ -793,7 +806,7 @@ int wmain(int argc, wchar_t** argv) {
     static constexpr size_t kStampCap = 4096;
     std::vector<WriteStamp> stampBuf(kStampCap);
     std::atomic<uint64_t> stampWrite{0};
-    std::atomic<int> bridgeLatencyMs{0};   // 控制台显示（毫秒）
+    std::atomic<int> totalLatencyMs{0};   // 端到端延迟（桥内驻留 + ASIO 设备延迟 + 采集包周期）
 
     // 控制台共享状态（HTTP 线程只读写这些原子量，零 COM 接触）
     std::atomic<size_t> wMult{8};          // 当前水位目标倍数
@@ -804,6 +817,7 @@ int wmain(int argc, wchar_t** argv) {
     std::atomic<bool> resetReq{false};     // 重置统计请求（控制台触发）
     // 分数重采样器状态（桥作用域，每次重建复位）
     std::atomic<double> ratio{1.0};
+    std::atomic<int> srcTaps{0};     // 重采样质量档：0=线性（低延迟）32=sinc（高精度）
     std::atomic<bool> passthrough{passthroughArg};   // 直通模式：ratio 恒 1.0，逐位直通
     std::atomic<int> passthroughReq{0};              // 控制台切换请求：0=无 1=开 2=关
     FractionalResampler rs;
@@ -846,9 +860,9 @@ int wmain(int argc, wchar_t** argv) {
         &written, &consumed, &underruns, &dropped, &peak,
         &wMult, &floorMult, &driftPpm, &needRestart, &ditherReq, &ditherOn, &resetReq,
         &g_stop, &asioRate, &asioBuffer, &asioType, &capRate, &wmNow,
-        &bridgeLatencyMs,
+        &totalLatencyMs,
         &histBuf, &histWrite, &ratioBase, &inRate, &outRate, &passthrough, &passthroughReq,
-        &targetPid, &targetActive
+        &srcTaps, &targetPid, &targetActive
     };
     startWebConsole(web);
 
@@ -903,9 +917,21 @@ int wmain(int argc, wchar_t** argv) {
         // 与累计计数解耦，避免历史丢弃量污染映射）
         std::atomic<uint64_t> ringW{0};
         stampWrite.store(0, std::memory_order_relaxed);   // 清空上一会话时间戳
+        // 恢复重新 prime：静默→有声跃迁后先持稳输出，等缓冲回填再继续
+        std::atomic<bool> priming{false};
+        uint64_t lastCapQpc = 0;
         std::string oerr;
         uint16_t capCh = 2;
         auto onData = [&](const float* d, uint32_t frames) {
+                // 静默→有声跃迁检测（>500ms 无采集即视为暂停）：触发重新 prime
+                {
+                    LARGE_INTEGER q;
+                    QueryPerformanceCounter(&q);
+                    uint64_t nowQ = (uint64_t)q.QuadPart;
+                    if (lastCapQpc && nowQ - lastCapQpc > (uint64_t)(qpcFreq * 0.5))
+                        priming.store(true, std::memory_order_relaxed);
+                    lastCapQpc = nowQ;
+                }
                 size_t n = (size_t)frames * capCh;
                 size_t got = rb.write(d, n);
                 written += got;
@@ -1003,8 +1029,21 @@ int wmain(int argc, wchar_t** argv) {
         // 会话启动淡入（无咔嗒切换）：每次重建后输出从 0 线性爬升
         const size_t kFadeSamples = 2048;   // ≈23ms @88.2k 采样/秒
         size_t fadePos = 0;
+        // ASIO 设备输出延迟（帧→毫秒，ASIOGetLatencies 上报，端到端延迟表用）
+        double asioLatMs = 0.0;
         asio.setPullCallback([&](float* dst, size_t frames, size_t ch) -> size_t {
+            // 恢复重新 prime：暂停→恢复后先持稳输出静音，等缓冲回填到 4×ASIO 缓冲
+            if (priming.load(std::memory_order_relaxed)) {
+                if (rb.available() < frames * capCh * 4) {
+                    memset(dst, 0, frames * ch * sizeof(float));
+                    return frames;
+                }
+                priming.store(false, std::memory_order_relaxed);
+            }
             if (rs.carry.size() < (frames + 16) * 2) rs.setup(frames);
+            // 重采样质量档切换（实时生效，切换时复位重采样器状态避免跨档 carry 混用）
+            int wt = srcTaps.load(std::memory_order_relaxed);
+            if (rs.taps != wt) { rs.taps = wt; rs.reset(); }
             rs.ratio = ratio.load(std::memory_order_relaxed);
             const size_t want = rs.wantIn(frames);   // 帧
             const size_t wantS = want * 2;           // 采样
@@ -1041,7 +1080,7 @@ int wmain(int argc, wchar_t** argv) {
                     ++fadePos;
                 }
             }
-            // 桥内延迟实测：环内消费前沿对应的采集写入时刻 → 驻留时间
+            // 端到端延迟实测：环内驻留 + ASIO 设备延迟 + 采集包周期
             {
                 uint64_t sw = stampWrite.load(std::memory_order_acquire);
                 if (sw > 1) {
@@ -1052,7 +1091,7 @@ int wmain(int argc, wchar_t** argv) {
                             LARGE_INTEGER qn;
                             QueryPerformanceCounter(&qn);
                             double ms = (double)(qn.QuadPart - (LONGLONG)st.qpc) * 1000.0 / qpcFreq;
-                            bridgeLatencyMs.store((int)ms, std::memory_order_relaxed);
+                            totalLatencyMs.store((int)(ms + asioLatMs + 10.0), std::memory_order_relaxed);
                             break;
                         }
                         if (k == 0) break;
@@ -1081,6 +1120,7 @@ int wmain(int argc, wchar_t** argv) {
         asioRate.store((long)asio.sampleRate(), std::memory_order_relaxed);
         asioBuffer.store(asio.bufferSize(), std::memory_order_relaxed);
         asioType.store(asio.sampleType(), std::memory_order_relaxed);
+        asioLatMs = (double)asio.outputLatency() * 1000.0 / (double)asio.sampleRate();
 
         printf("== 桥接运行中: Bridge(目标 PID 显示于控制台) -> MADIface ASIO -> ADI-2 Pro @ %g Hz (%s) ==\n",
                asio.sampleRate(),

@@ -136,6 +136,11 @@ bool AsioRender::init(const std::string& driverName, double sampleRate, std::str
     ae = ASIOStart();
     if (ae != ASE_OK) { err = "ASIOStart 失败（错误码 " + std::to_string(ae) + "，驱动可能被其他程序占用）"; shutdown(); return false; }
     started_ = true;
+    // 设备延迟（ASIOGetLatencies）：用于端到端延迟表
+    ASIOGetLatencies(&inputLatency_, &outputLatency_);
+    printf("[ASIO] 延迟 输入=%ld 帧 输出=%ld 帧 @ %g Hz（%.2f ms）\n",
+           inputLatency_, outputLatency_, sampleRate_, (double)outputLatency_ * 1000.0 / sampleRate_);
+    started_ = true;
 
     scratch_.resize((size_t)bufferSize_ * channels_);
     hist_.assign(channels_, std::vector<float>((size_t)bufferSize_, 0.0f));

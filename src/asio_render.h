@@ -26,6 +26,9 @@ public:
     long bufferSize() const { return bufferSize_; }
     long sampleType() const { return sampleType_; }
     size_t channels() const { return channels_; }
+    // ASIOGetLatencies：驱动上报的输入/输出延迟（帧）
+    long inputLatency() const { return inputLatency_; }
+    long outputLatency() const { return outputLatency_; }
 
     static std::string listDrivers();
 
@@ -44,6 +47,8 @@ private:
     long bufferSize_ = 0;
     size_t channels_ = 0;
     long sampleType_ = ASIOSTInt32LSB;
+    long inputLatency_ = 0;                          // ASIOGetLatencies 输入延迟（帧）
+    long outputLatency_ = 0;                         // ASIOGetLatencies 输出延迟（帧）
     bool started_ = false;
     bool loaded_ = false;
     bool prevUnderrun_ = false;                    // 上一包曾欠载 → 本包开头交叉淡化接缝
