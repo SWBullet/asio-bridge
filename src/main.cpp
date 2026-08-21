@@ -26,6 +26,22 @@
 
 static std::atomic<bool> g_stop{false};
 
+// ===== 崩溃线程身份注册表 =====
+// 崩溃过滤器运行于「崩溃线程自身」，把线程 ID 翻译成身份写进 crash.log，
+// 直接回答「到底哪个线程在驱动内部炸了」——旧全局 g_where 标签跨线程污染，
+// 驱动线程崩溃全被误记成 main:cfg（主线程 5 秒一次 saveConfig 刷新的陈旧值）。
+static volatile DWORD g_tidMain = 0, g_tidCap = 0, g_tidPull = 0,
+                      g_tidDisc = 0, g_tidWeb = 0, g_tidDevNote = 0;
+static const char* tidName(DWORD t) {
+    if (t == g_tidMain)   return "main";
+    if (t == g_tidCap)    return "capture";
+    if (t == g_tidPull)   return "asio-callback";
+    if (t == g_tidDisc)   return "discovery";
+    if (t == g_tidWeb)    return "web-console";
+    if (t == g_tidDevNote)return "device-notify";
+    return "driver/com-rpc/other";
+}
+
 // 设备事件监听（Core Audio 属性监听模型）：渲染设备增删/状态变化/默认设备
 // 变化 → 触发链路重建。回调在 MTA 线程池线程上执行，只写原子量、零 COM。
 class DeviceNotifier : public IMMNotificationClient {
@@ -73,6 +89,7 @@ public:
     }
 private:
     void bump() {
+        if (!g_tidDevNote) g_tidDevNote = GetCurrentThreadId();   // 回调线程池线程身份
         if (!stop_->load(std::memory_order_relaxed))
             restart_->store(true, std::memory_order_relaxed);
     }
@@ -157,7 +174,10 @@ static void computeSpectrum(const float* in, float* mag, float* re, float* im, i
 // ===== 崩溃定位面包屑 =====
 // 各阶段进入前更新 g_where,未处理异常过滤器把崩溃位置 + 异常地址写 crash.log,
 // 用于定位空指针解引用(0xc0000005)到底发生在哪个环节。
-static volatile const char* g_where = "startup";
+// 线程局部(TLS)：过滤器在崩溃线程上执行，读到的是该线程自己的最后标签；
+// 未标记线程（驱动内部线程/COM RPC 线程池）显示 "unlabeled-thread"，
+// 配合 tidName() 即可定位崩溃线程身份
+static __declspec(thread) const char* g_where = "unlabeled-thread";
 
 // 把地址解析成 "模块名+0x偏移"——空指针 CALL 的调用点属于哪个 DLL 一目了然。
 // 崩溃上下文只能用内核/简单 Win32 API,绝不触碰 C++ 对象或分配内存。
@@ -280,7 +300,7 @@ static void relaunchSelf() {
 }
 
 static LONG WINAPI crashFilter(EXCEPTION_POINTERS* ep) {
-    char buf[640];
+    char buf[768];
     void* ret = ep->ContextRecord && ep->ContextRecord->Rsp
                 ? *(void**)ep->ContextRecord->Rsp : nullptr;   // 栈顶返回地址(空指针 CALL 的调用点)
     char mRet[128], mRip[128], mAddr[128];
@@ -288,8 +308,13 @@ static LONG WINAPI crashFilter(EXCEPTION_POINTERS* ep) {
     resolveModule(ep->ContextRecord ? (void*)ep->ContextRecord->Rip : nullptr, mRip, sizeof(mRip));
     resolveModule(ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr,
                   mAddr, sizeof(mAddr));
+    // 过滤器运行于崩溃线程：tid + 身份 + TLS 标签共同回答「哪个线程在哪炸的」；
+    // t=GetTickCount64 时间戳可与 stdout 日志的统计行(每 2 秒)对时
+    DWORD tid = GetCurrentThreadId();
     int len = wsprintfA(buf,
-                        "where=%s code=0x%08X addr=%p(%s) rip=%p(%s) ret=%p(%s)\n",
+                        "t=%lu tid=%lu(%s) where=%s code=0x%08X addr=%p(%s) rip=%p(%s) ret=%p(%s)\n",
+                        (unsigned long)GetTickCount64(),
+                        tid, tidName(tid),
                         g_where,
                         (unsigned)(ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0),
                         ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr, mAddr,
@@ -1128,6 +1153,7 @@ int wmain(int argc, wchar_t** argv) {
     bool singleInst = (hSingle && GetLastError() != ERROR_ALREADY_EXISTS);
 
     SetUnhandledExceptionFilter(crashFilter);   // 崩溃定位:写 crash.log
+    g_tidMain = GetCurrentThreadId();           // 主线程身份注册（崩溃日志线程归属）
 
     SetConsoleOutputCP(65001);
     setvbuf(stdout, nullptr, _IONBF, 0);   // 无缓冲，崩溃时也能看到输出
@@ -1141,6 +1167,7 @@ int wmain(int argc, wchar_t** argv) {
     bool ditherFlag = true;   // TPDF 抖动默认开启；优先级:命令行 > 配置文件 > 默认
     bool ditherArgGiven = false;   // 命令行是否显式指定 --dither/--no-dither
     bool passthroughArg = false;   // 直通模式：停用重采样
+    bool noMute = false;           // 诊断：跳过端点静音 hack（鉴别 RME 驱动崩溃触发源）
 
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
@@ -1151,6 +1178,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--buffer" && i + 1 < argc) reqBuffer = _wtol(argv[++i]);
         else if (a == L"--dither") { ditherFlag = true; ditherArgGiven = true; }
         else if (a == L"--no-dither") { ditherFlag = false; ditherArgGiven = true; }
+        else if (a == L"--no-mute") noMute = true;
         else if (a == L"--crash-test") crashTest = true;
         else if (a == L"--passthrough") passthroughArg = true;
         else if (a == L"--resampler-test") { return resamplerSelfTest(); }
@@ -1374,6 +1402,7 @@ int wmain(int argc, wchar_t** argv) {
     // 默认设备变化即时触发重建，取代纯轮询的迟钝响应。
     // 防抖：候选进程需连续两次扫描胜出才发布，单次瞬态不触发切换。
     std::thread discoveryThread([&] {
+        g_tidDisc = GetCurrentThreadId();   // 发现线程身份
         HRESULT hrc = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         if (FAILED(hrc)) return;
         IMMDeviceEnumerator* devEnum = nullptr;
@@ -1429,6 +1458,8 @@ int wmain(int argc, wchar_t** argv) {
         std::string oerr;
         uint16_t capCh = 2;
         auto onData = [&](const float* d, uint32_t frames) {
+                if (!g_tidCap) g_tidCap = GetCurrentThreadId();   // 采集线程身份
+                g_where = "cap:push";
                 // 静默→有声跃迁检测（>500ms 无采集即视为暂停）：触发重新 prime
                 {
                     LARGE_INTEGER q;
@@ -1491,15 +1522,19 @@ int wmain(int argc, wchar_t** argv) {
                 // tap→redirect：静音目标所在渲染端点的终点主音量，消除双重声。
                 // 数值自检证明回环取点在终点主音量之前、会话静音之后：
                 // 终点静音不影响捕获（ASIO 不走 WDM 终点音量，同样不受影响）
-                endpointMutes = MuteTargetEndpoints(pid);
-                if (!endpointMutes.empty())
-                    printf("[静音] 已静音目标进程 %lu 所在 %zu 个端点——消除双重声"
-                           "（重建/退出时自动恢复；该端点其他 WDM 声音也会静音）\n",
-                           (unsigned long)pid, endpointMutes.size());
-                else
-                    printf("[静音] 目标进程 %lu 所在端点：无新增静音"
-                           "（可能已处于静音态，或获取终点音量失败）\n",
-                           (unsigned long)pid);
+                if (noMute) {
+                    printf("[静音] --no-mute 诊断模式：跳过端点静音（可能出现双重声）\n");
+                } else {
+                    endpointMutes = MuteTargetEndpoints(pid);
+                    if (!endpointMutes.empty())
+                        printf("[静音] 已静音目标进程 %lu 所在 %zu 个端点——消除双重声"
+                               "（重建/退出时自动恢复；该端点其他 WDM 声音也会静音）\n",
+                               (unsigned long)pid, endpointMutes.size());
+                    else
+                        printf("[静音] 目标进程 %lu 所在端点：无新增静音"
+                               "（可能已处于静音态，或获取终点音量失败）\n",
+                               (unsigned long)pid);
+                }
             }
         }
         if (!capOk) {
@@ -1545,7 +1580,9 @@ int wmain(int argc, wchar_t** argv) {
         // 采集包周期（WASAPI 事件驱动引擎默认 ~10ms 周期）：命名常量替代魔法数
         const double kCapturePeriodMs = 10.0;
         asio.setPullCallback([&](float* dst, size_t frames, size_t ch) -> size_t {
-            // 恢复重新 prime：暂停→恢复后先持稳输出，等缓冲回填到 4×ASIO 缓冲。
+                if (!g_tidPull) g_tidPull = GetCurrentThreadId();   // ASIO 回调线程身份
+                g_where = "pull:entry";
+                // 恢复重新 prime：暂停→恢复后先持稳输出，等缓冲回填到 4×ASIO 缓冲。
             // 3 秒超时放弃（目标音频断续时缓冲迟迟不满，避免一直持稳误触看门狗）
             if (priming.load(std::memory_order_relaxed)) {
                 if (rb.available() < frames * capCh * 4) {
@@ -1670,6 +1707,7 @@ int wmain(int argc, wchar_t** argv) {
                 QueryPerformanceCounter(&q);
                 rateLock.pushOut((uint64_t)q.QuadPart, outTotS);
             }
+            g_where = "pull:done";   // 已出 DSP，后续若炸则在驱动侧（ASIOOutputReady/转换）
             return frames;
         });
 
@@ -1714,6 +1752,7 @@ int wmain(int argc, wchar_t** argv) {
         uint64_t driftRStart = 0;   // 窗口起始时的重建计数
         ULONGLONG driftStartAt = 0;
         while (!g_stop.load() && !needRestart.load()) {
+            g_where = "main:loop";   // 节拍标签：覆盖 saveConfig 的 5 秒陈旧 main:cfg
             ULONGLONG now = GetTickCount64();
             if (now - lastStats >= 2000) {
                 lastStats = now;
