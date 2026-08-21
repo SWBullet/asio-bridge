@@ -1075,6 +1075,51 @@ int wmain(int argc, wchar_t** argv) {
     };
     startWebConsole(web);
 
+    // ===== 配置持久化:加载/保存控制台设置(exe 同目录 asio_bridge.cfg)=====
+    // 下次服务重启时恢复上次操作(染色开关/暖度/直通/水位下限/重采样档)。
+    auto configPath = []() -> std::wstring {
+        wchar_t buf[MAX_PATH];
+        GetModuleFileNameW(nullptr, buf, MAX_PATH);
+        std::wstring p(buf);
+        size_t slash = p.find_last_of(L"\\/");
+        return (slash == std::wstring::npos) ? L"asio_bridge.cfg"
+                                             : p.substr(0, slash + 1) + L"asio_bridge.cfg";
+    };
+    auto saveConfig = [&]() {
+        FILE* f = _wfopen(configPath().c_str(), L"w");
+        if (!f) return;
+        fprintf(f, "tube_on=%d\n", tubeOn.load(std::memory_order_relaxed) ? 1 : 0);
+        fprintf(f, "tube_warmth=%.4f\n", tubeWarmth.load(std::memory_order_relaxed));
+        fprintf(f, "passthrough=%d\n", passthrough.load(std::memory_order_relaxed) ? 1 : 0);
+        fprintf(f, "floor=%zu\n", floorMult.load(std::memory_order_relaxed));
+        fprintf(f, "src_taps=%d\n", srcTaps.load(std::memory_order_relaxed));
+        fclose(f);
+    };
+    auto loadConfig = [&]() {
+        FILE* f = _wfopen(configPath().c_str(), L"r");
+        if (!f) return;   // 首次运行,用默认值
+        char line[128];
+        while (fgets(line, sizeof(line), f)) {
+            char key[64] = {0};
+            char val[64] = {0};
+            if (sscanf(line, "%63[^=]=%63s", key, val) == 2) {
+                if (!strcmp(key, "tube_on")) tubeOn.store(atoi(val) != 0, std::memory_order_relaxed);
+                else if (!strcmp(key, "tube_warmth")) {
+                    float fv = (float)atof(val);
+                    if (fv < 0.0f) fv = 0.0f;
+                    if (fv > 1.0f) fv = 1.0f;
+                    tubeWarmth.store(fv, std::memory_order_relaxed);
+                }
+                else if (!strcmp(key, "passthrough")) passthrough.store(atoi(val) != 0, std::memory_order_relaxed);
+                else if (!strcmp(key, "floor")) floorMult.store((size_t)atoi(val), std::memory_order_relaxed);
+                else if (!strcmp(key, "src_taps")) srcTaps.store(atoi(val), std::memory_order_relaxed);
+            }
+        }
+        fclose(f);
+    };
+    loadConfig();
+    ULONGLONG lastCfgSave = GetTickCount64();   // 配置定期保存节流(每 5 秒)
+
     // 目标发现线程（独立 MTA）：每 10 秒重新扫描「最响渲染进程」，
     // 结果经原子量异步发布，绝不阻塞 ASIO STA 主线程（阻塞实测会饿死回调）。
     // 同时注册设备事件监听（Core Audio 属性监听模型）：渲染设备增删/状态变化/
@@ -1183,6 +1228,11 @@ int wmain(int argc, wchar_t** argv) {
                 static int quietStreak = 0;
                 if ((quietStreak++ % 15) == 0)
                     printf("[Bridge] 未发现活跃渲染进程，静默等待中…\n");
+                // 无会话时也定期保存配置(用户可能已通过控制台改了设置)
+                {
+                    ULONGLONG nowCfg = GetTickCount64();
+                    if (nowCfg - lastCfgSave >= 5000) { saveConfig(); lastCfgSave = nowCfg; }
+                }
                 Sleep(2000);
                 continue;
             }
@@ -1661,6 +1711,14 @@ int wmain(int argc, wchar_t** argv) {
                     driftDStart = dropped.load();
                     driftRStart = rebuildCount.load(std::memory_order_relaxed);
                     driftStartAt = now;
+                }
+            }
+            // 配置定期保存(每 5 秒,节流避免频繁写盘)
+            {
+                ULONGLONG nowCfg = GetTickCount64();
+                if (nowCfg - lastCfgSave >= 5000) {
+                    saveConfig();
+                    lastCfgSave = nowCfg;
                 }
             }
             Sleep(50);
