@@ -40,6 +40,8 @@ struct BridgeStatsPtrs {
     std::atomic<bool>* passthrough;        // 直通模式（重采样停用）
     std::atomic<int>* passthroughReq;      // 控制台切换请求：0=无 1=开 2=关
     std::atomic<int>* srcTaps;             // 重采样质量档：0=线性 32=sinc
+    std::atomic<bool>* tubeOn;             // 300B 电子管染色开关
+    std::atomic<float>* tubeWarmth;        // 染色量 0~1
     std::atomic<unsigned long>* targetPid; // Bridge 采集目标进程 PID
     std::atomic<bool>* targetActive;       // 目标进程活跃状态
 };

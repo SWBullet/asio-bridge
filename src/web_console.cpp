@@ -190,6 +190,13 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
     </span>
   </div>
   <div class="ctlrow">
+    <span class="lbl">300B 染色</span>
+    <label class="switch"><input type="checkbox" id="tube"><span class="track"><span class="knob"></span></span><span class="led"></span></label>
+    <span class="lbl" style="margin-left:12px">暖度</span>
+    <input type="range" id="tubewarmth" min="0" max="100" value="30" style="width:150px">
+    <span id="tubewarmth-v" style="min-width:34px">30%</span>
+  </div>
+  <div class="ctlrow">
     <span class="lbl">观察窗口</span>
     <span id="bank-range">
       <button class="btn" data-v="60">1分</button><button class="btn" data-v="180">3分</button>
@@ -375,6 +382,9 @@ async function pollStatus(){
       firstInit=false;
       document.getElementById('dither').checked=!!s.dither;
       document.getElementById('passthrough').checked=!!s.passthrough;
+      document.getElementById('tube').checked=!!s.tubeOn;
+      document.getElementById('tubewarmth').value=Math.round((s.tubeWarmth||0.3)*100);
+      document.getElementById('tubewarmth-v').textContent=document.getElementById('tubewarmth').value+'%';
       setBank('bank-floor',String(s.floor));
       setBank('bank-src',String(s.srcTaps||0));
       setBank('bank-range',String(range));
@@ -405,6 +415,9 @@ bindBank('bank-scale',function(v){scale=v;draw()});
 function ctl(body){fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})}
 document.getElementById('dither').onchange=function(e){ctl('action=dither&value='+(e.target.checked?1:0))}
 document.getElementById('passthrough').onchange=function(e){ctl('action=passthrough&value='+(e.target.checked?1:0))}
+document.getElementById('tube').onchange=function(e){ctl('action=tube&value='+(e.target.checked?1:0))}
+document.getElementById('tubewarmth').oninput=function(e){document.getElementById('tubewarmth-v').textContent=e.target.value+'%'}
+document.getElementById('tubewarmth').onchange=function(e){ctl('action=tubewarmth&value='+e.target.value)}
 document.getElementById('rebuild').onclick=function(){this.classList.add('flash');setTimeout(function(){document.getElementById('rebuild').classList.remove('flash')},1600);ctl('action=rebuild&value=1')}
 document.getElementById('reset').onclick=function(){this.classList.add('flash');setTimeout(function(){document.getElementById('reset').classList.remove('flash')},1600);ctl('action=reset&value=1')}
 
@@ -524,6 +537,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             "\"ratioBase\":%.7f,\"inRate\":%.1f,\"outRate\":%.1f,\"passthrough\":%d,"
             "\"srcTaps\":%d,"
             "\"underRecent\":%d,"
+            "\"tubeOn\":%d,\"tubeWarmth\":%.2f,"
             "\"targetPid\":%u,\"targetActive\":%d}",
             wm, target, (unsigned long long)floorM, (unsigned long long)wmMult,
             u, d, (double)g_p.peak->load(std::memory_order_relaxed),
@@ -540,6 +554,8 @@ static void handleRequest(SOCKET s, char* req, int n) {
             g_p.passthrough->load(std::memory_order_relaxed) ? 1 : 0,
             (int)g_p.srcTaps->load(std::memory_order_relaxed),
             underRecent,
+            g_p.tubeOn->load(std::memory_order_relaxed) ? 1 : 0,
+            (double)g_p.tubeWarmth->load(std::memory_order_relaxed),
             (unsigned)g_p.targetPid->load(std::memory_order_relaxed),
             g_p.targetActive->load(std::memory_order_relaxed) ? 1 : 0);
         sendResponse(s, "200 OK", "application/json; charset=utf-8", body, len);
@@ -560,6 +576,13 @@ static void handleRequest(SOCKET s, char* req, int n) {
                 g_p.passthroughReq->store(v != 0 ? 1 : 2, std::memory_order_relaxed);
             } else if (strstr(body, "action=src")) {
                 g_p.srcTaps->store(v == 32 ? 32 : 0, std::memory_order_relaxed);
+            } else if (strstr(body, "action=tube")) {
+                g_p.tubeOn->store(v != 0, std::memory_order_relaxed);
+            } else if (strstr(body, "action=tubewarmth")) {
+                float w = (float)v / 100.0f;
+                if (w < 0.0f) w = 0.0f;
+                if (w > 1.0f) w = 1.0f;
+                g_p.tubeWarmth->store(w, std::memory_order_relaxed);
             } else if (strstr(body, "action=rebuild")) {
                 g_p.needRestart->store(true);
             } else if (strstr(body, "action=reset")) {

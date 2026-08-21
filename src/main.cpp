@@ -1,6 +1,7 @@
 // Bridge: 目标应用渲染流 → (进程回环按 PID 旁路取流) → RME MADIface ASIO → ADI-2 Pro
 // 免虚拟声卡、免引擎混音/APO；自动静音目标端点消除双重声。
 #include "asio_render.h"
+#include "dsp_tube.h"
 #include "rate_lock.h"
 #include "resampler.h"
 #include "ring_buffer.h"
@@ -224,6 +225,48 @@ static int resamplerSelfTest() {
 
     printf(allPass ? "== 重采样器自检全部通过 ==\n" : "== 自检存在失败项 ==\n");
     return allPass ? 0 : 1;
+}
+
+// 300B 电子管染色自检（--tube-test）：
+// 用正弦过 tube300B，数值量测 2 次/3 次谐波，验证：
+//   ① 2 次谐波远大于 3 次(偶次为主 = 暖)
+//   ② 2 次谐波随幅度线性增长(动态温暖)
+//   ③ 无直流(去直流成立)
+static int tubeSelfTest() {
+    int fails = 0;
+    const int N = 65536;
+    const int K = 1024;      // 测试音周期数(基波 ≈ 689 Hz @44.1k,远高于 DC blocker 5Hz)
+    const int WARMUP = 8000; // DC blocker 收敛预热(约 180ms)
+    const double twoPi = 6.28318530717958647692;
+    const double warmth = 0.5;
+    printf("[染色自检] TubeWarmth warmth=%.2f (含 DC blocker, 基波 %d 周期)\n", warmth, K);
+    double prev2 = -1.0;
+    double amps[] = {0.1, 0.3, 0.6};
+    for (int k = 0; k < 3; ++k) {
+        double A = amps[k];
+        TubeWarmth tw;
+        double dc = 0, f1 = 0, f2 = 0, f3 = 0;
+        int cnt = 0;
+        for (int i = 0; i < WARMUP + N; ++i) {
+            double t = twoPi * K * i / N;
+            float x = (float)(A * sin(t));
+            float y = tw.process(x, (float)warmth);
+            if (i < WARMUP) continue;   // 跳过 DC blocker 预热
+            dc += y; f1 += y * (float)sin(t);
+            f2 += y * (float)cos(2.0 * t); f3 += y * (float)sin(3.0 * t);
+            ++cnt;
+        }
+        dc /= cnt; f1 = 2.0 * f1 / cnt; f2 = 2.0 * f2 / cnt; f3 = 2.0 * f3 / cnt;
+        double r2 = fabs(f2 / f1), r3 = fabs(f3 / f1);
+        printf("  A=%.2f: 基波=%.4f 2次=%.2f%% 3次=%.4f%% 直流=%.7f\n",
+               A, f1, r2 * 100.0, r3 * 100.0, dc);
+        if (r2 < r3 * 5.0) { printf("  => FAIL: 2次未明显大于3次\n"); fails++; }
+        if (k > 0 && r2 < prev2 * 1.2) { printf("  => FAIL: 2次未随幅度增长\n"); fails++; }
+        if (fabs(dc) > 0.001) { printf("  => FAIL: 直流残留过大\n"); fails++; }
+        prev2 = r2;
+    }
+    printf(fails == 0 ? "== 染色自检通过 ==\n" : "== 染色自检存在 %d 项失败 ==\n", fails);
+    return fails;
 }
 
 // 速率锁 + 水位闭环联合仿真（--pll-test）：
@@ -890,6 +933,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--no-dither") ditherFlag = false;
         else if (a == L"--passthrough") passthroughArg = true;
         else if (a == L"--resampler-test") { return resamplerSelfTest(); }
+        else if (a == L"--tube-test") { return tubeSelfTest(); }
         else if (a == L"--pll-test") { return pllSelfTest(); }
         else if (a == L"--capture-test") { return captureSelfTest(); }
         else if (a == L"--limiter-test") { return limiterSelfTest(); }
@@ -979,8 +1023,11 @@ int wmain(int argc, wchar_t** argv) {
     std::atomic<int> srcTaps{32};    // 重采样质量档：0=线性（低延迟）32=sinc（高精度，默认）
     std::atomic<bool> passthrough{passthroughArg};   // 直通模式：ratio 恒 1.0，逐位直通
     std::atomic<int> passthroughReq{0};              // 控制台切换请求：0=无 1=开 2=关
+    std::atomic<bool> tubeOn{false};                 // 300B 电子管染色开关
+    std::atomic<float> tubeWarmth{0.3f};             // 染色量 0~1(0=干净,1=明显暖)
     FractionalResampler rs;
     std::vector<float> rsIn_;
+    std::vector<TubeWarmth> tubeState;   // 每声道一个 300B 染色实例(含 DC blocker 状态)
     double wmAvg = 0.0;                    // 平滑水位（主线程独占，约 20s 时间常数）
     // 时钟速率锁（双环前馈）：实测输入/输出设备速率 → ratio 基值
     RateLock rateLock;
@@ -1022,7 +1069,7 @@ int wmain(int argc, wchar_t** argv) {
         &g_stop, &asioRate, &asioBuffer, &asioType, &capRate, &wmNow,
         &totalLatencyMs,
         &histBuf, &histWrite, &ratioBase, &inRate, &outRate, &passthrough, &passthroughReq,
-        &srcTaps, &targetPid, &targetActive
+        &srcTaps, &tubeOn, &tubeWarmth, &targetPid, &targetActive
     };
     startWebConsole(web);
 
@@ -1256,6 +1303,16 @@ int wmain(int argc, wchar_t** argv) {
                 size_t gotS = rb.read(rsIn_.data(), avail < wantS ? avail : wantS);
                 if (gotS < wantS && !cq) { underruns++; lastUnderrunAt.store(GetTickCount64(), std::memory_order_relaxed); }
                 rs.process(rsIn_.data(), gotS / 2, dst, frames);
+                // 300B 电子管温暖染色(3/2 定律 + DC blocker):重采样之后、浮转整之前
+                if (tubeOn.load(std::memory_order_relaxed)) {
+                    float w = tubeWarmth.load(std::memory_order_relaxed);
+                    if (w > 0.0f) {
+                        if (tubeState.size() < ch) tubeState.resize(ch);
+                        for (size_t f = 0; f < frames; ++f)
+                            for (size_t c = 0; c < ch; ++c)
+                                dst[f * ch + c] = tubeState[c].process(dst[f * ch + c], w);
+                    }
+                }
                 consumed += gotS;
             }
             // 会话启动淡入（无咔嗒切换）：重建/换目标后前 ~23ms 线性爬升
