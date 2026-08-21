@@ -1457,10 +1457,10 @@ int wmain(int argc, wchar_t** argv) {
                         } else if (wmMin > target * 9 / 10) {
                             // 波谷始终高于 90% 目标 → 余量过剩，累计安全窗口
                             safeWindows++;
-                            if (safeWindows >= 6 &&
+                            if (safeWindows >= 3 &&
                                 m > floorMult.load(std::memory_order_relaxed)) {
                                 wMult.store(m - 4, std::memory_order_relaxed);
-                                printf("[自适应] 连续 6 窗口波谷充裕，水位目标回落至 %zu 采样\n",
+                                printf("[自适应] 连续 3 窗口波谷充裕，水位目标回落至 %zu 采样\n",
                                        (m - 4) * neededPerBuf);
                                 safeWindows = 0;
                             }
