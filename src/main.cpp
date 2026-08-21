@@ -157,17 +157,50 @@ static void computeSpectrum(const float* in, float* mag, float* re, float* im, i
 // 用于定位空指针解引用(0xc0000005)到底发生在哪个环节。
 static volatile const char* g_where = "startup";
 
+// 把地址解析成 "模块名+0x偏移"——空指针 CALL 的调用点属于哪个 DLL 一目了然。
+// 崩溃上下文只能用内核/简单 Win32 API,绝不触碰 C++ 对象或分配内存。
+static void resolveModule(void* addr, char* out, size_t outCap) {
+    (void)outCap;
+    if (!addr) { lstrcpyA(out, "null"); return; }
+    HMODULE hmod = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)addr, &hmod) && hmod) {
+        char path[MAX_PATH];
+        DWORD n = GetModuleFileNameA(hmod, path, MAX_PATH);
+        const char* name = path;
+        if (n) {
+            for (const char* s = path + n; s > path; --s)
+                if (s[-1] == '\\' || s[-1] == '/') { name = s; break; }
+        }
+        ULONGLONG base = (ULONGLONG)(ULONG_PTR)hmod;
+        ULONGLONG off  = (ULONGLONG)(ULONG_PTR)addr - base;
+        // wsprintfA 不支持 64 位格式符：偏移 < 4GB 用 32 位,否则拼高低两段
+        if (off <= 0xFFFFFFFFull)
+            wsprintfA(out, "%s+0x%X", name, (DWORD)off);
+        else
+            wsprintfA(out, "%s+0x%X%08X", name, (DWORD)(off >> 32), (DWORD)off);
+    } else {
+        wsprintfA(out, "0x%p", addr);
+    }
+}
+
 static LONG WINAPI crashFilter(EXCEPTION_POINTERS* ep) {
-    char buf[320];
+    char buf[640];
     void* ret = ep->ContextRecord && ep->ContextRecord->Rsp
                 ? *(void**)ep->ContextRecord->Rsp : nullptr;   // 栈顶返回地址(空指针 CALL 的调用点)
+    char mRet[128], mRip[128], mAddr[128];
+    resolveModule(ret, mRet, sizeof(mRet));
+    resolveModule(ep->ContextRecord ? (void*)ep->ContextRecord->Rip : nullptr, mRip, sizeof(mRip));
+    resolveModule(ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr,
+                  mAddr, sizeof(mAddr));
     int len = wsprintfA(buf,
-                        "where=%s code=0x%08X addr=%p rip=%p ret=%p\n",
+                        "where=%s code=0x%08X addr=%p(%s) rip=%p(%s) ret=%p(%s)\n",
                         g_where,
-                        (unsigned)ep->ExceptionRecord->ExceptionCode,
-                        ep->ExceptionRecord->ExceptionAddress,
-                        ep->ContextRecord ? (void*)ep->ContextRecord->Rip : nullptr,
-                        ret);
+                        (unsigned)(ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0),
+                        ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr, mAddr,
+                        ep->ContextRecord ? (void*)ep->ContextRecord->Rip : nullptr, mRip,
+                        ret, mRet);
     HANDLE h = CreateFileW(L"crash.log", FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
                            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h != INVALID_HANDLE_VALUE) {
