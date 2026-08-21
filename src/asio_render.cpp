@@ -96,13 +96,15 @@ bool AsioRender::initInner(const std::string& driverName, double sampleRate, std
     char name[64] = {0};
     strncpy_s(name, sizeof(name), driverName.c_str(), _TRUNCATE);
 
-    ASIODriverInfo info = {};
-    strncpy_s(info.name, sizeof(info.name), name, _TRUNCATE);
-    info.sysRef = nullptr;
+    // 驱动信息/回调表均存入成员（实例生命周期）——RME 驱动长期持有这两个指针，
+    // 栈上局部变量会在 init 返回后被复用清零，导致驱动的回调分发读到空指针
+    driverInfo_ = ASIODriverInfo{};
+    strncpy_s(driverInfo_.name, sizeof(driverInfo_.name), name, _TRUNCATE);
+    driverInfo_.sysRef = nullptr;
     ASIOError ae = ASE_NotPresent;
 
     // 设备掉线可能清空驱动函数指针表，loadAsioDriver/ASIOInit 会 AV —— SEH 兜底
-    if (asioLoadInitSafe(name, &info, &ae)) {
+    if (asioLoadInitSafe(name, &driverInfo_, &ae)) {
         loaded_ = true;
     }
 
@@ -133,11 +135,11 @@ bool AsioRender::initInner(const std::string& driverName, double sampleRate, std
     }
 
     if (ae != ASE_OK) {
-        err = std::string("ASIOInit 失败: ") + info.errorMessage;
+        err = std::string("ASIOInit 失败: ") + driverInfo_.errorMessage;
         shutdown();
         return false;
     }
-    printf("[ASIO] 驱动: %s 版本: %ld\n", info.name, info.driverVersion);
+    printf("[ASIO] 驱动: %s 版本: %ld\n", driverInfo_.name, driverInfo_.driverVersion);
 
     long inCh = 0, outCh = 0;
     if (ASIOGetChannels(&inCh, &outCh) != ASE_OK) { err = "ASIOGetChannels 失败"; shutdown(); return false; }
@@ -174,13 +176,16 @@ bool AsioRender::initInner(const std::string& driverName, double sampleRate, std
         bufInfos_[i].buffers[1] = nullptr;
     }
 
-    ASIOCallbacks cb = {};
-    cb.bufferSwitch = &AsioRender::bufferSwitchCB;
-    cb.sampleRateDidChange = &AsioRender::sampleRateDidChangeCB;
-    cb.asioMessage = &AsioRender::asioMessageCB;
-    cb.bufferSwitchTimeInfo = &AsioRender::bufferSwitchTimeInfoCB;
+    // ⚠ 回调表写入成员（实例生命周期）：RME 等驱动只存指针不拷贝 ASIOCallbacks，
+    // 栈上局部 struct 在 init 返回后即悬空——曾致完整模式运行 5~50 秒后
+    // 驱动调用已清零的 bufferSwitch 槽位（rip=0 空指针崩溃，crash.log 高频签名）
+    asioCallbacks_ = ASIOCallbacks{};
+    asioCallbacks_.bufferSwitch = &AsioRender::bufferSwitchCB;
+    asioCallbacks_.sampleRateDidChange = &AsioRender::sampleRateDidChangeCB;
+    asioCallbacks_.asioMessage = &AsioRender::asioMessageCB;
+    asioCallbacks_.bufferSwitchTimeInfo = &AsioRender::bufferSwitchTimeInfoCB;
 
-    ae = ASIOCreateBuffers(bufInfos_.data(), (long)channels_, bufferSize_, &cb);
+    ae = ASIOCreateBuffers(bufInfos_.data(), (long)channels_, bufferSize_, &asioCallbacks_);
     if (ae != ASE_OK) { err = "ASIOCreateBuffers 失败（错误码 " + std::to_string(ae) + "）"; shutdown(); return false; }
 
     ae = ASIOStart();

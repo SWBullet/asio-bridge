@@ -55,6 +55,12 @@ private:
     long sampleType_ = ASIOSTInt32LSB;
     long inputLatency_ = 0;                          // ASIOGetLatencies 输入延迟（帧）
     long outputLatency_ = 0;                         // ASIOGetLatencies 输出延迟（帧）
+    // ⚠ 宿主回调表/驱动信息必须与实例同生命周期（成员存储），绝不能放栈上：
+    // RME v1.017 等驱动对 ASIOCreateBuffers 的 callbacks 参数只存指针不拷贝，
+    // initInner() 返回后栈帧被复用清零 → 驱动经悬空指针读到 NULL 的
+    // bufferSwitch/bufferSwitchTimeInfo → rip=0 崩溃（实测 5~50 秒随机触发）
+    ASIODriverInfo driverInfo_ = {};
+    ASIOCallbacks asioCallbacks_ = {};
     bool started_ = false;
     bool loaded_ = false;
     bool prevUnderrun_ = false;                    // 上一包曾欠载 → 本包开头交叉淡化接缝
