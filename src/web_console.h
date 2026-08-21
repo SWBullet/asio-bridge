@@ -28,7 +28,7 @@ struct BridgeStatsPtrs {
     std::atomic<size_t>* floorMult;   // 水位下限倍数（控制台可调）
     std::atomic<double>* driftPpm;    // 最近一次漂移读数
     std::atomic<bool>* needRestart;   // 控制台触发链路重建
-    std::atomic<bool>* ditherReq;     // 抖动开关（重建后生效）
+    std::atomic<int>* ditherReq;      // 抖动开关请求：0=无 1=开 2=关（主循环节拍实时应用）
     std::atomic<bool>* ditherOn;      // 实际生效状态（控制台显示用）
     std::atomic<bool>* resetReq;      // 重置统计请求（主循环处理）
     std::atomic<bool>* gStop;

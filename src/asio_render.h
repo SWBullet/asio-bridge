@@ -19,9 +19,10 @@ public:
     bool init(const std::string& driverName, double sampleRate, std::string& err, long bufferFrames = 0);
     void shutdown();
     void setPullCallback(PullCallback cb) { pull_ = std::move(cb); }
-    // TPDF 抖动开关：float→整数转换时注入 ±1LSB 三角抖动（默认关，保持纯净）
-    void setDither(bool on) { dither_ = on; }
-    bool ditherEnabled() const { return dither_; }
+    // TPDF 抖动开关：float→整数转换时注入 ±1LSB 三角抖动（默认关，保持纯净）。
+    // 回调线程读、主线程写——显式 relaxed 原子（避免依赖隐式转换的模糊写法）
+    void setDither(bool on) { dither_.store(on, std::memory_order_relaxed); }
+    bool ditherEnabled() const { return dither_.load(std::memory_order_relaxed); }
 
     double sampleRate() const { return sampleRate_; }
     long bufferSize() const { return bufferSize_; }
@@ -58,10 +59,11 @@ private:
     bool loaded_ = false;
     bool prevUnderrun_ = false;                    // 上一包曾欠载 → 本包开头交叉淡化接缝
     size_t fadeInFrames_ = 32;                     // 恢复包淡入长度
-    bool dither_ = false;                          // TPDF 抖动开关
+    std::atomic<bool> dither_{false};              // TPDF 抖动开关（回调线程读，主线程写）
     uint32_t rngState_ = 0x9E3779B9;               // xorshift32 状态
     std::atomic<bool> callbackCrashed_{false};     // 数据回调内 SEH 捕获到 AV 标志
-    std::vector<std::vector<float>> hist_;         // 每通道最近波形历史（镜像填充用）
+    std::vector<std::vector<float>> hist_;         // 每通道波形历史环形缓冲（镜像填充用）
+    size_t histPos_ = 0;                           // hist_ 滚动写位置（最新样本的下一格）
     std::vector<ASIOBufferInfo> bufInfos_;
     std::vector<float> scratch_;
 };

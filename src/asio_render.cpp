@@ -190,10 +190,10 @@ bool AsioRender::initInner(const std::string& driverName, double sampleRate, std
     ASIOGetLatencies(&inputLatency_, &outputLatency_);
     printf("[ASIO] 延迟 输入=%ld 帧 输出=%ld 帧 @ %g Hz（%.2f ms）\n",
            inputLatency_, outputLatency_, sampleRate_, (double)outputLatency_ * 1000.0 / sampleRate_);
-    started_ = true;
 
     scratch_.resize((size_t)bufferSize_ * channels_);
     hist_.assign(channels_, std::vector<float>((size_t)bufferSize_, 0.0f));
+    histPos_ = 0;
     prevUnderrun_ = false;
     rngState_ = (uint32_t)GetTickCount() ^ 0x9E3779B9u;
     printf("[ASIO] %g Hz / %zu 通道 / 缓冲 %ld 帧 / 类型 %s\n",
@@ -276,13 +276,17 @@ void AsioRender::render(long idx) {
     const size_t frames = (size_t)bufferSize_;
     size_t got = pull_ ? pull_(scratch_.data(), frames, channels_) : 0;
     const size_t histLen = frames;
+    // 抖动开关一次性读取（回调内 6 个分支共用；atomic→bool 隐式 load 也行，显式更清晰）
+    const bool dith = dither_.load(std::memory_order_relaxed);
     if (got < frames) {
         // 波形镜像填充：把最近的真实波形反向回放填满缺口。
-        // 缺口起点 = 历史末采样，数值连续无跳变；缺口内线性淡出到静音
+        // 缺口起点 = 环形历史末采样（(histPos_+histLen-1)%histLen 恒为新到样本），
+        // 数值连续无跳变；缺口内线性淡出到静音。
+        // 旧写法 histLen-1-f 在「部分投递」时取到陈旧样本（上次回调残留），产生毛刺。
         const size_t gap = frames - got;
         for (size_t c = 0; c < channels_; ++c) {
             for (size_t f = 0; f < gap; ++f) {
-                const size_t hi = histLen - 1 - (f % histLen);
+                const size_t hi = (histPos_ + histLen - 1 - f) % histLen;
                 const float g = 1.0f - (float)f / (float)gap;   // 1 → 0
                 scratch_[(got + f) * channels_ + c] = hist_[c][hi] * g;
             }
@@ -298,11 +302,12 @@ void AsioRender::render(long idx) {
         }
         prevUnderrun_ = false;
     }
-    // 更新波形历史（仅真实到达的样本）
-    if (got > 0) {
+    // 更新波形历史（滚动环形写入：仅记录真实到达的样本，histPos_ 恒指向
+    // 「最新样本的下一格」——无论部分投递还是满包，时间轴都连续）
+    for (size_t f = 0; f < got; ++f) {
         for (size_t c = 0; c < channels_; ++c)
-            for (size_t f = 0; f < got; ++f)
-                hist_[c][f] = scratch_[f * channels_ + c];
+            hist_[c][histPos_] = scratch_[f * channels_ + c];
+        histPos_ = (histPos_ + 1) % histLen;
     }
 
     const long bytes = typeBytes(sampleType_);
@@ -323,38 +328,38 @@ void AsioRender::render(long idx) {
             case ASIOSTInt32LSB: {
                 int32_t* d = (int32_t*)dst;
                 for (size_t f = 0; f < frames; ++f)
-                    d[f] = quantizeSigned(src[f * channels_], 32, dither_, rngState_);
+                    d[f] = quantizeSigned(src[f * channels_], 32, dith, rngState_);
                 break;
             }
             // 32-bit 容器、N-bit 数据 LSB 对齐（有效位在低 N 位，范围 ±2^(N-1)）
             case ASIOSTInt32LSB16: {
                 int32_t* d = (int32_t*)dst;
                 for (size_t f = 0; f < frames; ++f)
-                    d[f] = quantizeSigned(src[f * channels_], 16, dither_, rngState_);
+                    d[f] = quantizeSigned(src[f * channels_], 16, dith, rngState_);
                 break;
             }
             case ASIOSTInt32LSB18: {
                 int32_t* d = (int32_t*)dst;
                 for (size_t f = 0; f < frames; ++f)
-                    d[f] = quantizeSigned(src[f * channels_], 18, dither_, rngState_);
+                    d[f] = quantizeSigned(src[f * channels_], 18, dith, rngState_);
                 break;
             }
             case ASIOSTInt32LSB20: {
                 int32_t* d = (int32_t*)dst;
                 for (size_t f = 0; f < frames; ++f)
-                    d[f] = quantizeSigned(src[f * channels_], 20, dither_, rngState_);
+                    d[f] = quantizeSigned(src[f * channels_], 20, dith, rngState_);
                 break;
             }
             case ASIOSTInt32LSB24: {
                 int32_t* d = (int32_t*)dst;
                 for (size_t f = 0; f < frames; ++f)
-                    d[f] = quantizeSigned(src[f * channels_], 24, dither_, rngState_);
+                    d[f] = quantizeSigned(src[f * channels_], 24, dith, rngState_);
                 break;
             }
             case ASIOSTInt24LSB: {
                 BYTE* d = (BYTE*)dst;
                 for (size_t f = 0; f < frames; ++f) {
-                    int32_t v = quantizeSigned(src[f * channels_], 24, dither_, rngState_);
+                    int32_t v = quantizeSigned(src[f * channels_], 24, dith, rngState_);
                     d[f * 3 + 0] = (BYTE)(v & 0xFF);
                     d[f * 3 + 1] = (BYTE)((v >> 8) & 0xFF);
                     d[f * 3 + 2] = (BYTE)((v >> 16) & 0xFF);
@@ -364,7 +369,7 @@ void AsioRender::render(long idx) {
             case ASIOSTInt16LSB: {
                 int16_t* d = (int16_t*)dst;
                 for (size_t f = 0; f < frames; ++f)
-                    d[f] = (int16_t)quantizeSigned(src[f * channels_], 16, dither_, rngState_);
+                    d[f] = (int16_t)quantizeSigned(src[f * channels_], 16, dith, rngState_);
                 break;
             }
             default:

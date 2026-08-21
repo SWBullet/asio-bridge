@@ -1138,7 +1138,8 @@ int wmain(int argc, wchar_t** argv) {
     std::string driver = "ASIO MADIface USB";
     double toneRate = 44100.0;
     long reqBuffer = 0;
-    bool ditherFlag = true;   // TPDF 抖动默认开启，--no-dither 关闭
+    bool ditherFlag = true;   // TPDF 抖动默认开启；优先级:命令行 > 配置文件 > 默认
+    bool ditherArgGiven = false;   // 命令行是否显式指定 --dither/--no-dither
     bool passthroughArg = false;   // 直通模式：停用重采样
 
     for (int i = 1; i < argc; ++i) {
@@ -1148,8 +1149,8 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--driver" && i + 1 < argc) driver = ws2s(argv[++i]);
         else if (a == L"--rate" && i + 1 < argc) toneRate = _wtof(argv[++i]);
         else if (a == L"--buffer" && i + 1 < argc) reqBuffer = _wtol(argv[++i]);
-        else if (a == L"--dither") ditherFlag = true;
-        else if (a == L"--no-dither") ditherFlag = false;
+        else if (a == L"--dither") { ditherFlag = true; ditherArgGiven = true; }
+        else if (a == L"--no-dither") { ditherFlag = false; ditherArgGiven = true; }
         else if (a == L"--crash-test") crashTest = true;
         else if (a == L"--passthrough") passthroughArg = true;
         else if (a == L"--resampler-test") { return resamplerSelfTest(); }
@@ -1244,7 +1245,7 @@ int wmain(int argc, wchar_t** argv) {
     std::atomic<size_t> wMult{8};          // 当前水位目标倍数
     std::atomic<size_t> floorMult{8};      // 下限倍数（控制台可调）
     std::atomic<double> driftPpm{0.0};     // 最近一次漂移读数
-    std::atomic<bool> ditherReq{false};    // 抖动开关请求（重建后生效）
+    std::atomic<int> ditherReq{0};         // 抖动开关请求：0=无 1=开 2=关（实时生效）
     std::atomic<bool> ditherOn{false};     // 实际生效状态（供控制台显示）
     std::atomic<bool> resetReq{false};     // 重置统计请求（控制台触发）
     // 分数重采样器状态（桥作用域，每次重建复位）
@@ -1336,6 +1337,7 @@ int wmain(int argc, wchar_t** argv) {
         fprintf(f, "passthrough=%d\n", passthrough.load(std::memory_order_relaxed) ? 1 : 0);
         fprintf(f, "floor=%zu\n", floorMult.load(std::memory_order_relaxed));
         fprintf(f, "src_taps=%d\n", srcTaps.load(std::memory_order_relaxed));
+        fprintf(f, "dither=%d\n", ditherOn.load(std::memory_order_relaxed) ? 1 : 0);
         fclose(f);
     };
     auto loadConfig = [&]() {
@@ -1356,11 +1358,14 @@ int wmain(int argc, wchar_t** argv) {
                 else if (!strcmp(key, "passthrough")) passthrough.store(atoi(val) != 0, std::memory_order_relaxed);
                 else if (!strcmp(key, "floor")) floorMult.store((size_t)atoi(val), std::memory_order_relaxed);
                 else if (!strcmp(key, "src_taps")) srcTaps.store(atoi(val), std::memory_order_relaxed);
+                else if (!strcmp(key, "dither") && !ditherArgGiven)
+                    ditherFlag = (atoi(val) != 0);   // 配置次之：命令行显式指定则忽略
             }
         }
         fclose(f);
     };
     loadConfig();
+    ditherOn.store(ditherFlag, std::memory_order_relaxed);   // 控制台在首个会话前即显示正确状态
     ULONGLONG lastCfgSave = GetTickCount64();   // 配置定期保存节流(每 5 秒)
 
     // 目标发现线程（独立 MTA）：每 10 秒重新扫描「最响渲染进程」，
@@ -1531,9 +1536,7 @@ int wmain(int argc, wchar_t** argv) {
         wmAvg = 0.0;
 
         AsioRender asio;
-        asio.setDither(ditherFlag || ditherReq.load(std::memory_order_relaxed));
-        ditherOn.store(ditherFlag || ditherReq.load(std::memory_order_relaxed),
-                       std::memory_order_relaxed);
+        asio.setDither(ditherOn.load(std::memory_order_relaxed));   // 含配置/控制台上次请求
         // 会话启动淡入（无咔嗒切换）：每次重建后输出从 0 线性爬升
         const size_t kFadeSamples = 2048;   // ≈23ms @88.2k 采样/秒
         size_t fadePos = 0;
@@ -1851,6 +1854,19 @@ int wmain(int argc, wchar_t** argv) {
                     windowHadGap = false;
                 }
 
+                // 控制台抖动开关（实时生效：仅切换转换核原子标志，无需重建链路）
+                {
+                    int dr = ditherReq.exchange(0, std::memory_order_relaxed);
+                    if (dr == 1) {
+                        asio.setDither(true);
+                        ditherOn.store(true, std::memory_order_relaxed);
+                        printf("[抖动] 控制台切换: TPDF 抖动开启\n");
+                    } else if (dr == 2) {
+                        asio.setDither(false);
+                        ditherOn.store(false, std::memory_order_relaxed);
+                        printf("[抖动] 控制台切换: TPDF 抖动关闭\n");
+                    }
+                }
                 // 控制台 A/B 切换：直通 ↔ 重采样（实时生效，无需重建链路）
                 {
                     int pr = passthroughReq.exchange(0, std::memory_order_relaxed);

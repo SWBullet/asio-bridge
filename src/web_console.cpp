@@ -49,13 +49,6 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
 .grid{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}
 @media(max-width:1000px){.grid{grid-template-columns:repeat(4,1fr)}}
 @media(max-width:640px){.grid{grid-template-columns:repeat(2,1fr)}}
-.meter{background:linear-gradient(180deg,#454b52,#2c3138);border:2px solid #5b626a;border-radius:8px;
-  padding:7px 12px 8px;box-shadow:inset 0 2px 6px rgba(0,0,0,.7)}
-.meter .l{font-size:10px;letter-spacing:2px;color:#9aa1aa}
-.meter .v{font-family:Consolas,monospace;font-size:19px;color:#ffd27f;text-shadow:0 0 9px rgba(255,190,80,.3);
-  font-variant-numeric:tabular-nums;margin-top:3px;line-height:1.25;white-space:nowrap;overflow:hidden}
-.meter .s{font-size:10px;color:#6d747d;margin-top:1px}
-.meter .v.warn{color:#ff8a5c}.meter .v.bad{color:#ff5c54}
 /* ===== 复古正圆指针表头（2 列 × 2 排） ===== */
 .gauge2{grid-column:span 2;grid-row:span 2;position:relative;display:flex;align-items:center;justify-content:center;padding:4px}
 .gauge2 canvas{width:100%;height:auto;aspect-ratio:1/1;display:block}
@@ -100,6 +93,8 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
 #spark{background:#06080a;border:2px solid #5b626a;border-radius:8px;width:100%;height:220px;display:block;
   box-shadow:inset 0 3px 8px rgba(0,0,0,.85)}
 #wf{background:#06080a;border:2px solid #5b626a;border-radius:8px;width:100%;height:180px;display:block;
+  box-shadow:inset 0 3px 8px rgba(0,0,0,.85)}
+#histcv{background:#06080a;border:2px solid #5b626a;border-radius:8px;width:100%;height:200px;display:block;
   box-shadow:inset 0 3px 8px rgba(0,0,0,.85)}
 .wflegend{font-size:11px;color:#8b939c;margin-top:6px;font-family:Consolas,monospace;letter-spacing:.5px}
 #tip{position:absolute;background:rgba(20,22,26,.95);border:1px solid #565c64;border-radius:6px;padding:6px 10px;
@@ -161,8 +156,20 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
 </div>
 
 <div class="panel">
+  <div class="mtitle">WATERMARK HISTORY · 水位历史</div>
+  <div style="position:relative"><canvas id="histcv"></canvas></div>
+  <div class="wflegend"><span style="color:#ffd27f">■ 水位</span> <span style="color:#ffb84a">┄ 目标水位</span> <span style="color:#6d747d">观察窗口/Y 刻度见 CONTROL DECK</span></div>
+</div>
+
+<div class="panel">
   <div class="mtitle">SYSTEM STATUS</div>
-  <div class="ledrow" id="leds"></div>
+  <div class="ledrow">
+    <div class="leditem"><span class="tube" id="l-chain"><span class="glass"></span><span class="getter"></span><span class="fil f1"></span><span class="fil f2"></span><span class="pin p1"></span><span class="pin p2"></span></span>采样率链一致</div>
+    <div class="leditem"><span class="tube" id="l-lock"><span class="glass"></span><span class="getter"></span><span class="fil f1"></span><span class="fil f2"></span><span class="pin p1"></span><span class="pin p2"></span></span>锁频锁定</div>
+    <div class="leditem"><span class="tube" id="l-under"><span class="glass"></span><span class="getter"></span><span class="fil f1"></span><span class="fil f2"></span><span class="pin p1"></span><span class="pin p2"></span></span>无欠载</div>
+    <div class="leditem"><span class="tube" id="l-clip"><span class="glass"></span><span class="getter"></span><span class="fil f1"></span><span class="fil f2"></span><span class="pin p1"></span><span class="pin p2"></span></span>无削波</div>
+    <div class="leditem"><span class="tube" id="l-drift"><span class="glass"></span><span class="getter"></span><span class="fil f1"></span><span class="fil f2"></span><span class="pin p1"></span><span class="pin p2"></span></span>时钟漂移 &lt;100ppm</div>
+  </div>
 </div>
 
 <div class="panel">
@@ -237,8 +244,6 @@ var range=600, scale=0;
 var tubeWarmthVal=0.3;   // 当前暖度(供传递曲线静态曲线计算)
 function fmt(n){return n.toLocaleString()}
 function setLed(el,on,amber){el.className='tube '+(on?(amber?'on dim':'on'):'bad')}
-function tubeSpan(id){return '<span class="tube" id="'+id+'"><span class="glass"></span><span class="getter"></span><span class="fil f1"></span><span class="fil f2"></span><span class="pin p1"></span><span class="pin p2"></span></span>'}
-function mtr(l,v,s,cls,id){return '<div class="meter"><div class="l">'+l+'</div><div class="v'+(cls?' '+cls:'')+'"'+(id?' id="'+id+'"':'')+'>'+v+'</div><div class="s">'+s+'</div></div>'}
 function chip(l,v){return '<span class="chip">'+l+' <b>'+v+'</b></span>'}
 /* ===== 三块复古正圆指针表头（麦景图式精工） ===== */
 var gPeak={cur:0,tgt:0,min:0,max:1,danger:0.85};
@@ -361,6 +366,7 @@ async function pollStatus(){
       rlTxt=(s.capRate/1000).toFixed(1)+'k→'+(s.asioRate/1000).toFixed(1)+'k '+sign+ppm+' ppm';
     }
     var tgt=s.targetPid?('PID '+s.targetPid+(s.targetActive?' · 活跃':' · 静默')):'发现中…';
+    var dr=(typeof s.drift==='number')?s.drift:0;
     document.getElementById('substrip').innerHTML=
       chip('目标',fmt(s.target))+
       chip('采集',s.capRate+' Hz')+
@@ -370,7 +376,10 @@ async function pollStatus(){
       chip('实测输入',s.inRate?s.inRate.toFixed(1)+' Hz':'—')+
       chip('实测输出',s.outRate?s.outRate.toFixed(1)+' Hz':'—')+
       chip('锁频',rlTxt)+
-      chip('目标进程',tgt);
+      chip('目标进程',tgt)+
+      chip('欠载',fmt(s.underruns||0))+
+      chip('丢弃',fmt(s.dropped||0))+
+      chip('漂移',dr.toFixed(1)+' ppm');
     // 三块指针的目标值
     gPeak.tgt=Math.min(1,Math.max(0,s.peak));
     gWm.max=Math.max(2048,s.target*2);
@@ -380,21 +389,18 @@ async function pollStatus(){
     tubeWarmthVal=(typeof s.tubeWarmth==='number')?s.tubeWarmth:0.3;
     setLed(document.getElementById('h-asio'),s.asioRate>0);
     setLed(document.getElementById('h-cap'),s.targetActive,s.targetPid&&!s.targetActive);
-    document.getElementById('leds').innerHTML=
-      '<div class="leditem">'+tubeSpan('l-chain')+'采样率链一致</div>'+
-      '<div class="leditem">'+tubeSpan('l-lock')+'锁频锁定</div>'+
-      '<div class="leditem">'+tubeSpan('l-under')+'无欠载</div>'+
-      '<div class="leditem">'+tubeSpan('l-clip')+'无削波</div>'+
-      '<div class="leditem">'+tubeSpan('l-active')+'目标活跃</div>';
+    // SYSTEM STATUS：静态 DOM 只改灯态（不再每 2s 重建 innerHTML）
     setLed(document.getElementById('l-chain'),s.capRate===s.asioRate);
     setLed(document.getElementById('l-lock'),s.inRate>0);
     setLed(document.getElementById('l-under'),!s.underRecent);
     setLed(document.getElementById('l-clip'),s.peak<=1.0);
-    setLed(document.getElementById('l-active'),s.targetActive);
+    // 时钟漂移：0=测量中(琥珀) |<100ppm=正常(绿) |超差=红
+    setLed(document.getElementById('l-drift'),Math.abs(dr)<100,dr===0);
+    // 拨杆开关每次轮询同步实际状态（三态请求 2s 内生效，这里回读防漂移）
+    document.getElementById('dither').checked=!!s.dither;
+    document.getElementById('passthrough').checked=!!s.passthrough;
     if(firstInit){
       firstInit=false;
-      document.getElementById('dither').checked=!!s.dither;
-      document.getElementById('passthrough').checked=!!s.passthrough;
       document.getElementById('tube').checked=!!s.tubeOn;
       document.getElementById('tubewarmth').value=Math.round((s.tubeWarmth||0.3)*100);
       document.getElementById('tubewarmth-v').textContent=document.getElementById('tubewarmth').value+'%';
@@ -423,8 +429,8 @@ function bindBank(id,fn){
 }
 bindBank('bank-floor',function(v){ctl('action=floor&value='+v)});
 bindBank('bank-src',function(v){ctl('action=src&value='+v)});
-bindBank('bank-range',function(v){range=v;draw()});
-bindBank('bank-scale',function(v){scale=v;draw()});
+bindBank('bank-range',function(v){range=v;drawHist()});
+bindBank('bank-scale',function(v){scale=v;drawHist()});
 function ctl(body){if(!CSRF)return;fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body+'&token='+encodeURIComponent(CSRF)})}
 document.getElementById('dither').onchange=function(e){ctl('action=dither&value='+(e.target.checked?1:0))}
 document.getElementById('passthrough').onchange=function(e){ctl('action=passthrough&value='+(e.target.checked?1:0))}
@@ -524,11 +530,71 @@ async function drawWaterfall(){
   }catch(e){}
 }
 function roundRect(ctx,x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
-window.onresize=function(){draw()}
+/* ===== 水位历史曲线（观察窗口 = X 轴时间范围，Y 刻度 = 0 自动 / 固定满刻度） ===== */
+async function drawHist(){
+  try{
+    var r=await fetch('/api/history?range='+range);var s=await r.json();
+    var pts=s.points||[];
+    var cv=document.getElementById('histcv'),ctx=cv.getContext('2d');
+    var dpr=window.devicePixelRatio||1;
+    var rect=cv.getBoundingClientRect();
+    if(cv.width!==Math.round(rect.width*dpr)){cv.width=Math.round(rect.width*dpr);cv.height=Math.round(rect.height*dpr);}
+    var W=rect.width,H=rect.height;ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+    // 背景横网格
+    ctx.strokeStyle='rgba(154,162,172,0.10)';ctx.lineWidth=1;
+    for(var gi=1;gi<5;gi++){ctx.beginPath();ctx.moveTo(0,H*gi/5);ctx.lineTo(W,H*gi/5);ctx.stroke();}
+    if(pts.length<2){
+      ctx.fillStyle='#6d747d';ctx.font='12px Consolas,monospace';ctx.textAlign='center';
+      ctx.fillText('水位历史采集中…（每 2 秒一个采样点）',W/2,H/2);
+      ctx.textAlign='left';return;
+    }
+    var t0=pts[0][0],t1=pts[pts.length-1][0];
+    var tspan=Math.max(1,t1-t0);
+    // Y 范围：scale=0 自动（数据峰值上浮 15% 对齐 1024），否则固定满刻度
+    var ymax=scale;
+    if(!ymax){
+      ymax=2048;
+      for(var pi=0;pi<pts.length;pi++){
+        if(pts[pi][1]>ymax)ymax=pts[pi][1];
+        if(pts[pi][2]>ymax)ymax=pts[pi][2];
+      }
+      ymax=Math.ceil(ymax*1.15/1024)*1024;
+    }
+    var padR=48,padB=16;
+    var X=function(t){return 2+(t-t0)/tspan*(W-padR-4)};
+    var Y=function(v){return H-padB-(Math.max(0,Math.min(v,ymax))/ymax)*(H-padB-6)};
+    // 目标水位线（琥珀虚线）
+    ctx.strokeStyle='rgba(255,184,74,0.8)';ctx.lineWidth=1.5;ctx.setLineDash([6,4]);
+    ctx.beginPath();ctx.moveTo(X(t0),Y(pts[0][2]));ctx.lineTo(X(t1),Y(pts[pts.length-1][2]));ctx.stroke();
+    ctx.setLineDash([]);
+    // 水位曲线（暖黄描线 + 半透明填充）
+    ctx.strokeStyle='#ffd27f';ctx.lineWidth=1.8;ctx.beginPath();
+    for(var ci=0;ci<pts.length;ci++){
+      var px=X(pts[ci][0]),py=Y(pts[ci][1]);
+      ci?ctx.lineTo(px,py):ctx.moveTo(px,py);
+    }
+    ctx.stroke();
+    ctx.lineTo(X(t1),H-padB);ctx.lineTo(X(t0),H-padB);ctx.closePath();
+    ctx.fillStyle='rgba(255,210,127,0.10)';ctx.fill();
+    // Y 轴刻度（右侧，5 档）
+    ctx.fillStyle='#6d747d';ctx.font='10px Consolas,monospace';ctx.textAlign='left';
+    for(var yi=0;yi<=5;yi++){
+      var v=Math.round(ymax*yi/5);
+      var vv=(v>=1024)?((v/1024)+'k'):String(v);
+      ctx.fillText(vv,W-padR+4,H-padB-(H-padB-6)*yi/5+3);
+    }
+    // X 轴时间标签（起/止）
+    ctx.fillText('-'+Math.round(tspan/60)+' 分',2,H-3);
+    ctx.textAlign='right';ctx.fillText('现在',W-padR,H-3);ctx.textAlign='left';
+  }catch(e){}
+}
+window.onresize=function(){draw();drawHist()}
 setInterval(pollStatus,2000);   // 状态轮询(表头/LED)
 setInterval(draw,100);          // 传递曲线轨迹(快速刷新)
 setInterval(drawWaterfall,100); // 频谱瀑布(快速刷新)
-pollStatus();draw();
+setInterval(drawHist,2000);     // 水位历史曲线(慢速刷新)
+pollStatus();draw();drawHist();
 </script>
 )HTML";
 
@@ -668,8 +734,8 @@ static void handleRequest(SOCKET s, char* req, int n) {
                 if (v > 32) v = 32;
                 g_p.floorMult->store((size_t)v, std::memory_order_relaxed);
             } else if (strstr(body, "action=dither")) {
-                g_p.ditherReq->store(v != 0, std::memory_order_relaxed);
-                g_p.needRestart->store(true);   // 重建后生效
+                // 三态请求：主循环 2s 节拍实时应用（无需重建链路）
+                g_p.ditherReq->store(v != 0 ? 1 : 2, std::memory_order_relaxed);
             } else if (strstr(body, "action=passthrough")) {
                 g_p.passthroughReq->store(v != 0 ? 1 : 2, std::memory_order_relaxed);
             } else if (strstr(body, "action=src")) {
@@ -696,7 +762,8 @@ static void handleRequest(SOCKET s, char* req, int n) {
         if (rng < 30) rng = 30;
         if (rng > 7200) rng = 7200;
         const uint64_t nowSec = GetTickCount64() / 1000;
-        const uint64_t startSec = nowSec - (uint64_t)rng;
+        // 注意防下溢：进程运行时长不足观察窗口时从 0 起算（否则 uint64 回绕滤掉全部点）
+        const uint64_t startSec = (nowSec > (uint64_t)rng) ? (nowSec - (uint64_t)rng) : 0;
         const uint64_t w = g_p.histWrite->load(std::memory_order_acquire);
         const uint64_t oldest = (w >= kHistCap) ? (w - kHistCap) : 0;
         std::vector<HistPoint> sel;
