@@ -37,6 +37,8 @@ public:
 
 private:
     static void bufferSwitchCB(long doubleBufferIndex, ASIOBool directProcess);
+    // init 的 POD 主体（由 init 用 SEH 包裹调用：设备掉线时驱动函数指针失效会 AV）
+    bool initInner(const std::string& driverName, double sampleRate, std::string& err, long bufferFrames);
     static ASIOTime* bufferSwitchTimeInfoCB(ASIOTime* time, long doubleBufferIndex, ASIOBool directProcess);
     static void sampleRateDidChangeCB(ASIOSampleRate rate);
     static long asioMessageCB(long selector, long value, void* message, double* opt);

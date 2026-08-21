@@ -91,7 +91,7 @@ static inline int32_t quantizeSigned(float x, int bits, bool dither, uint32_t& r
     return (int32_t)llrint(v);
 }
 
-bool AsioRender::init(const std::string& driverName, double sampleRate, std::string& err, long bufferFrames) {
+bool AsioRender::initInner(const std::string& driverName, double sampleRate, std::string& err, long bufferFrames) {
     g_self = this;
     char name[64] = {0};
     strncpy_s(name, sizeof(name), driverName.c_str(), _TRUNCATE);
@@ -199,6 +199,21 @@ bool AsioRender::init(const std::string& driverName, double sampleRate, std::str
     printf("[ASIO] %g Hz / %zu 通道 / 缓冲 %ld 帧 / 类型 %s\n",
            sampleRate_, channels_, bufferSize_, typeName(sampleType_));
     return true;
+}
+
+// init 的 SEH 包装：设备掉线会清空驱动函数指针表(ASIOGetChannels/SetSampleRate/
+// GetSampleRate/CreateBuffers/Start 等都是全局函数指针),调用即 AV(0xc0000005 空指针)。
+// 主体在 initInner(POD 无 SEH),本包装函数只有 __try + 函数调用,无非 POD 局部对象,不会 C2712。
+bool AsioRender::init(const std::string& driverName, double sampleRate, std::string& err, long bufferFrames) {
+    g_crashContext = "init";
+    __try {
+        return initInner(driverName, sampleRate, err, bufferFrames);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        g_crashContext = "init:SEH";
+        printf("[ASIO] 初始化期间驱动函数指针失效(设备掉线)，已安全跳过\n");
+        err = "ASIO 初始化期间设备掉线（驱动函数指针失效）";
+        return false;
+    }
 }
 
 void AsioRender::shutdown() {

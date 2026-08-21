@@ -152,6 +152,32 @@ static void computeSpectrum(const float* in, float* mag, float* re, float* im, i
         mag[k] = sqrtf(re[k] * re[k] + im[k] * im[k]);
 }
 
+// ===== 崩溃定位面包屑 =====
+// 各阶段进入前更新 g_where,未处理异常过滤器把崩溃位置 + 异常地址写 crash.log,
+// 用于定位空指针解引用(0xc0000005)到底发生在哪个环节。
+static volatile const char* g_where = "startup";
+
+static LONG WINAPI crashFilter(EXCEPTION_POINTERS* ep) {
+    char buf[320];
+    void* ret = ep->ContextRecord && ep->ContextRecord->Rsp
+                ? *(void**)ep->ContextRecord->Rsp : nullptr;   // 栈顶返回地址(空指针 CALL 的调用点)
+    int len = wsprintfA(buf,
+                        "where=%s code=0x%08X addr=%p rip=%p ret=%p\n",
+                        g_where,
+                        (unsigned)ep->ExceptionRecord->ExceptionCode,
+                        ep->ExceptionRecord->ExceptionAddress,
+                        ep->ContextRecord ? (void*)ep->ContextRecord->Rip : nullptr,
+                        ret);
+    HANDLE h = CreateFileW(L"crash.log", FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD w = 0;
+        WriteFile(h, buf, (DWORD)len, &w, nullptr);
+        CloseHandle(h);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;   // 仍让系统走默认崩溃流程(WER)
+}
+
 // 分数重采样器离线自检：正弦信号下验证直通精确性、速率偏移失真与饥饿行为。
 // 与真链路共用同一 FractionalResampler 实现——数值过关才允许上线。
 static int resamplerSelfTest() {
@@ -960,6 +986,8 @@ int wmain(int argc, wchar_t** argv) {
     HANDLE hSingle = CreateMutexW(nullptr, TRUE, L"Local\\asio_bridge_single_instance");
     bool singleInst = (hSingle && GetLastError() != ERROR_ALREADY_EXISTS);
 
+    SetUnhandledExceptionFilter(crashFilter);   // 崩溃定位:写 crash.log
+
     SetConsoleOutputCP(65001);
     setvbuf(stdout, nullptr, _IONBF, 0);   // 无缓冲，崩溃时也能看到输出
     SetConsoleCtrlHandler(ctrlHandler, TRUE);
@@ -1152,6 +1180,7 @@ int wmain(int argc, wchar_t** argv) {
                                              : p.substr(0, slash + 1) + L"asio_bridge.cfg";
     };
     auto saveConfig = [&]() {
+        g_where = "main:cfg";
         FILE* f = _wfopen(configPath().c_str(), L"w");
         if (!f) return;
         fprintf(f, "tube_on=%d\n", tubeOn.load(std::memory_order_relaxed) ? 1 : 0);
@@ -1437,12 +1466,13 @@ int wmain(int argc, wchar_t** argv) {
                                 fftInBuf[fftPos] = x;
                                 fftResBuf[fftPos] = r;
                                 if (++fftPos >= kFftN) {
+                                    g_where = "pull:fft";
                                     computeSpectrum(fftInBuf.data(), specIn.data(), fftRe.data(), fftIm.data(), kFftN);
                                     computeSpectrum(fftResBuf.data(), specRes.data(), fftRe.data(), fftIm.data(), kFftN);
                                     specSeq.fetch_add(1, std::memory_order_relaxed);
                                     fftPos = 0;
                                 }
-                                // 传递曲线 XY,每 4 帧采一个点
+                                g_where = "pull:xy";
                                 if ((f & 3) == 0) {
                                     size_t wi = tubeXYWrite.fetch_add(1, std::memory_order_relaxed);
                                     tubeXY[wi % 256].x = x;
