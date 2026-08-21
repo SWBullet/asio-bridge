@@ -185,6 +185,16 @@ static void resolveModule(void* addr, char* out, size_t outCap) {
     }
 }
 
+// 把崩溃日志路径固定到 exe 同目录(build/Release),而不是进程 CWD——
+// 之前从 pwsh Start-Process 启动时 CWD 是 E:\Harness,crash.log 落到那里,找错位置。
+static void crashLogPath(wchar_t* out, size_t cap) {
+    DWORD n = GetModuleFileNameW(nullptr, out, (DWORD)cap);
+    if (n == 0 || n >= cap) { lstrcpyW(out, L"crash.log"); return; }
+    wchar_t* slash = out + n;
+    while (slash > out && slash[-1] != L'\\' && slash[-1] != L'/') --slash;
+    lstrcpyW(slash, L"crash.log");
+}
+
 static LONG WINAPI crashFilter(EXCEPTION_POINTERS* ep) {
     char buf[640];
     void* ret = ep->ContextRecord && ep->ContextRecord->Rsp
@@ -201,7 +211,9 @@ static LONG WINAPI crashFilter(EXCEPTION_POINTERS* ep) {
                         ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr, mAddr,
                         ep->ContextRecord ? (void*)ep->ContextRecord->Rip : nullptr, mRip,
                         ret, mRet);
-    HANDLE h = CreateFileW(L"crash.log", FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+    wchar_t cpath[MAX_PATH];
+    crashLogPath(cpath, MAX_PATH);
+    HANDLE h = CreateFileW(cpath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
                            nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h != INVALID_HANDLE_VALUE) {
         DWORD w = 0;
