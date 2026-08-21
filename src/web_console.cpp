@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <cstdio>
 #include <cstring>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -231,6 +232,7 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
 </div>
 <script>
 var firstInit=true;
+var CSRF='';   // CSRF Token（由服务端在页面尾部注入，POST 控制接口必须携带）
 var range=600, scale=0;
 var tubeWarmthVal=0.3;   // 当前暖度(供传递曲线静态曲线计算)
 function fmt(n){return n.toLocaleString()}
@@ -423,7 +425,7 @@ bindBank('bank-floor',function(v){ctl('action=floor&value='+v)});
 bindBank('bank-src',function(v){ctl('action=src&value='+v)});
 bindBank('bank-range',function(v){range=v;draw()});
 bindBank('bank-scale',function(v){scale=v;draw()});
-function ctl(body){fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})}
+function ctl(body){if(!CSRF)return;fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body+'&token='+encodeURIComponent(CSRF)})}
 document.getElementById('dither').onchange=function(e){ctl('action=dither&value='+(e.target.checked?1:0))}
 document.getElementById('passthrough').onchange=function(e){ctl('action=passthrough&value='+(e.target.checked?1:0))}
 document.getElementById('tube').onchange=function(e){ctl('action=tube&value='+(e.target.checked?1:0))}
@@ -527,14 +529,58 @@ setInterval(pollStatus,2000);   // 状态轮询(表头/LED)
 setInterval(draw,100);          // 传递曲线轨迹(快速刷新)
 setInterval(drawWaterfall,100); // 频谱瀑布(快速刷新)
 pollStatus();draw();
-</script></body></html>
+</script>
 )HTML";
+
+// HTML 尾部（与主体分离，便于在 </body> 前注入 CSRF Token 脚本）
+static const char* HTML_TAIL = "</body></html>";
 
 static SOCKET g_listen = INVALID_SOCKET;
 static std::thread g_thread;
 static BridgeStatsPtrs g_p;
 static ULONGLONG g_startTick = 0;
 static std::atomic<bool> g_httpStop{false};
+static unsigned short g_port = 3999;          // 实际监听端口（来自 startWebConsole 参数）
+static char g_csrfToken[33] = {0};            // 每次进程启动随机生成，POST 控制接口必验
+
+// 生成 128-bit 随机 CSRF Token（32 个十六进制字符）
+static void genCsrfToken() {
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    gen.seed(rd() ^ (std::mt19937_64::result_type)GetTickCount64()
+                 ^ ((std::mt19937_64::result_type)GetCurrentProcessId() << 32));
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 32; ++i) g_csrfToken[i] = hex[gen() & 0xF];
+    g_csrfToken[32] = 0;
+}
+
+// Host 头白名单校验：只接受 127.0.0.1 / localhost / [::1]（防 DNS rebinding 与跨站请求）
+static bool hostAllowed(const char* req) {
+    char host[128] = {0};
+    const char* h = req;
+    while ((h = strstr(h, "\r\n")) != nullptr) {
+        h += 2;
+        if (_strnicmp(h, "Host:", 5) == 0) {
+            const char* v = h + 5;
+            while (*v == ' ' || *v == '\t') v++;
+            const char* e;
+            if (*v == '[') {                      // IPv6 字面量 [::1]:port
+                e = strchr(v, ']');
+                if (e) e++;
+            } else {                              // 域名/IPv4，截到冒号（去端口）或行尾
+                e = v;
+                while (*e && *e != '\r' && *e != '\n' && *e != ':') e++;
+            }
+            size_t len = (size_t)(e - v);
+            if (len >= sizeof(host)) len = sizeof(host) - 1;
+            memcpy(host, v, len);
+            break;
+        }
+    }
+    return _stricmp(host, "127.0.0.1") == 0
+        || _stricmp(host, "localhost") == 0
+        || _stricmp(host, "[::1]") == 0;
+}
 
 static void sendResponse(SOCKET s, const char* status, const char* contentType, const char* body, int len) {
     char hdr[512];
@@ -549,6 +595,13 @@ static void handleRequest(SOCKET s, char* req, int n) {
     (void)n;
     char method[8] = {0}, path[256] = {0};
     sscanf(req, "%7s %255s", method, path);
+
+    // 所有 /api/* 接口先过 Host 白名单（DNS rebinding / 跨站防护第一道）
+    if (strncmp(path, "/api/", 5) == 0 && !hostAllowed(req)) {
+        const char* denied = "{\"error\":\"forbidden host\"}";
+        sendResponse(s, "403 Forbidden", "application/json", denied, (int)strlen(denied));
+        return;
+    }
 
     if (strcmp(path, "/api/status") == 0) {
         unsigned long long w = g_p.written->load(std::memory_order_relaxed);
@@ -597,6 +650,14 @@ static void handleRequest(SOCKET s, char* req, int n) {
             g_p.targetActive->load(std::memory_order_relaxed) ? 1 : 0);
         sendResponse(s, "200 OK", "application/json; charset=utf-8", body, len);
     } else if (strcmp(path, "/api/control") == 0 && strcmp(method, "POST") == 0) {
+        // CSRF Token 校验（跨站防护第二道：恶意页面猜不到本进程随机生成的 Token）
+        char tokExpect[64];
+        snprintf(tokExpect, sizeof(tokExpect), "token=%s", g_csrfToken);
+        if (!strstr(req, tokExpect)) {
+            const char* denied = "{\"error\":\"bad token\"}";
+            sendResponse(s, "403 Forbidden", "application/json", denied, (int)strlen(denied));
+            return;
+        }
         char* body = strstr(req, "\r\n\r\n");
         if (body) {
             body += 4;
@@ -692,7 +753,18 @@ static void handleRequest(SOCKET s, char* req, int n) {
         off += snprintf(body + off, sizeof(body) - off, "]}");
         sendResponse(s, "200 OK", "application/json; charset=utf-8", body, off);
     } else {
-        sendResponse(s, "200 OK", "text/html; charset=utf-8", HTML, (int)strlen(HTML));
+        // 首页：注入 CSRF Token（位于主脚本之后、</body> 之前，加载完成即可用）
+        char inj[128];
+        int ilen = snprintf(inj, sizeof(inj), "<script>CSRF=\"%s\";</script>", g_csrfToken);
+        int totalLen = (int)strlen(HTML) + ilen + (int)strlen(HTML_TAIL);
+        char hdr[512];
+        int hlen = snprintf(hdr, sizeof(hdr),
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n",
+            totalLen);
+        send(s, hdr, hlen, 0);
+        send(s, HTML, (int)strlen(HTML), 0);
+        send(s, inj, ilen, 0);
+        send(s, HTML_TAIL, (int)strlen(HTML_TAIL), 0);
     }
 }
 
@@ -709,15 +781,15 @@ static void httpThread() {
     sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    addr.sin_port = htons(3999);
+    addr.sin_port = htons(g_port);
     if (bind(g_listen, (sockaddr*)&addr, sizeof(addr)) != 0) {
-        printf("[控制台] 绑定 127.0.0.1:3999 失败（端口被占用？）\n");
+        printf("[控制台] 绑定 127.0.0.1:%u 失败（端口被占用？）\n", (unsigned)g_port);
         closesocket(g_listen);
         WSACleanup();
         return;
     }
     listen(g_listen, 4);
-    printf("[控制台] 已启动: http://127.0.0.1:3999\n");
+    printf("[控制台] 已启动: http://127.0.0.1:%u\n", (unsigned)g_port);
 
     while (!g_httpStop.load()) {
         fd_set fds;
@@ -755,9 +827,11 @@ static void httpThread() {
 }
 
 bool startWebConsole(const BridgeStatsPtrs& p, unsigned short port) {
-    (void)port;
+    if (port == 0) port = 3999;
+    g_port = port;
     g_p = p;
     g_startTick = GetTickCount64();   // 进程内 uptime 起点
+    genCsrfToken();                   // 每次启动生成新 CSRF Token
     g_httpStop.store(false);
     g_thread = std::thread(httpThread);
     return true;
