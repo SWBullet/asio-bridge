@@ -106,7 +106,9 @@ static void usage() {
         "  asio_bridge --resampler-test  重采样器正弦离线自检（数值验证）\n"
         "  asio_bridge --pll-test        速率锁+水位闭环联合仿真自检（数值验证）\n"
         "  asio_bridge --capture-test    Bridge 采集正弦自检（渲染→按 PID 回环自采比对）\n"
-        "Ctrl+C 停止\n");
+        "  asio_bridge --crash-test      启动后故意崩溃，验证崩溃自愈链路（诊断用）\n"
+        "  asio_bridge --respawn <毫秒>  （内部）崩溃自愈拉起前等待旧实例退出\n"
+        "Ctrl+C 停止；崩溃时自动重启（5 分钟内最多 5 次，防死循环），详见 restarts.log\n");
 }
 
 // ===== 频谱观察(瀑布图)FFT =====
@@ -195,6 +197,88 @@ static void crashLogPath(wchar_t* out, size_t cap) {
     lstrcpyW(slash, L"crash.log");
 }
 
+// ===== 崩溃自愈:驱动级空指针崩溃后自动拉起新实例 =====
+// RME 驱动掉线时会清空自身函数表,驱动线程回头调用空指针把整个进程带走
+// (crash.log: madiface_asio_amd.dll+0x4385, rip=0)。进程内无法拦截驱动线程的
+// 崩溃,唯一出路是 crashFilter 里拉起新实例接管。为防"启动即崩"死循环,
+// 用 exe 同目录 restarts.log 记录拉起时间戳:300 秒窗口内最多 5 次,超了就放弃。
+// 全程只用 Win32 API(与 crashFilter 约束一致:绝不碰 CRT 堆,防死锁)。
+static volatile LONG g_bridgeLive = 0;   // 桥服务真正跑起来后才允许自愈拉起
+
+static void restartsLogPath(wchar_t* out, size_t cap) {
+    DWORD n = GetModuleFileNameW(nullptr, out, (DWORD)cap);
+    if (n == 0 || n >= cap) { lstrcpyW(out, L"restarts.log"); return; }
+    wchar_t* slash = out + n;
+    while (slash > out && slash[-1] != L'\\' && slash[-1] != L'/') --slash;
+    lstrcpyW(slash, L"restarts.log");
+}
+
+static int appendU64(char* out, int pos, ULONGLONG v) {
+    char tmp[24]; int t = 0;
+    do { tmp[t++] = (char)('0' + (int)(v % 10)); v /= 10; } while (v);
+    while (t) out[pos++] = tmp[--t];
+    out[pos++] = '\n';
+    return pos;
+}
+
+// 记录本次拉起并判断是否仍在允许窗口内;返回 false 表示疑似死循环,放弃拉起
+static bool crashLoopAllowed() {
+    const ULONGLONG windowMs = 300000;   // 5 分钟窗口
+    const int maxRestarts = 5;
+    ULONGLONG now = GetTickCount64();
+    wchar_t path[MAX_PATH];
+    restartsLogPath(path, MAX_PATH);
+    char buf[512] = {0};
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD rd = 0;
+        ReadFile(h, buf, sizeof(buf) - 1, &rd, nullptr);
+        CloseHandle(h);
+    }
+    ULONGLONG keep[16]; int cnt = 0;
+    for (char* s = buf; *s && cnt < 16; ) {
+        while (*s == '\n' || *s == '\r' || *s == ' ' || *s == '\t') ++s;
+        if (!*s) break;
+        ULONGLONG v = 0; int digits = 0;
+        while (*s >= '0' && *s <= '9') { v = v * 10 + (ULONGLONG)(*s - '0'); ++s; ++digits; }
+        if (digits && now - v < windowMs) keep[cnt++] = v;   // 只保留窗口内的
+        while (*s && *s != '\n') ++s;
+    }
+    if (cnt >= maxRestarts) return false;
+    char out[512]; int pos = 0;
+    for (int i = 0; i < cnt; ++i) pos = appendU64(out, pos, keep[i]);
+    pos = appendU64(out, pos, now);
+    h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) {
+        DWORD wr = 0;
+        WriteFile(h, out, (DWORD)pos, &wr, nullptr);
+        CloseHandle(h);
+    }
+    return true;
+}
+
+static void relaunchSelf() {
+    if (!g_bridgeLive) return;             // 启动早期崩溃:不拉起,让问题暴露
+    if (!crashLoopAllowed()) return;       // 死循环保护:窗口内次数用尽
+    wchar_t exe[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+    wchar_t cmd[MAX_PATH + 32];
+    lstrcpyW(cmd, L"\"");
+    lstrcatW(cmd, exe);
+    lstrcatW(cmd, L"\" --respawn 3000");   // 等旧实例(互斥锁/静音恢复)完全退出
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {};
+    // CREATE_NO_WINDOW:自愈拉起不弹黑框(与 start_hidden.vbs 静默部署一致)
+    if (CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+}
+
 static LONG WINAPI crashFilter(EXCEPTION_POINTERS* ep) {
     char buf[640];
     void* ret = ep->ContextRecord && ep->ContextRecord->Rsp
@@ -220,6 +304,7 @@ static LONG WINAPI crashFilter(EXCEPTION_POINTERS* ep) {
         WriteFile(h, buf, (DWORD)len, &w, nullptr);
         CloseHandle(h);
     }
+    relaunchSelf();                      // 崩溃自愈:拉起新实例接管(带防死循环)
     return EXCEPTION_EXECUTE_HANDLER;   // 仍让系统走默认崩溃流程(WER)
 }
 
@@ -1025,6 +1110,17 @@ static int limiterSelfTest() {
 }
 
 int wmain(int argc, wchar_t** argv) {
+    // --respawn MS:崩溃自愈内部参数——crashFilter 拉起的新实例先等旧实例
+    // (单实例互斥锁/ASIO 句柄/端点静音恢复)完全退出再启动。等待后从
+    // argv 移除该参数,不影响后续正常参数解析。
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (wcscmp(argv[i], L"--respawn") == 0) {
+            Sleep(wcstoul(argv[i + 1], nullptr, 10));
+            for (int j = i; j + 2 < argc; ++j) argv[j] = argv[j + 2];
+            argc -= 2;
+            break;
+        }
+    }
     // 单实例互斥锁:若已有桥实例在运行(如计划任务自动重启拉起的副本),
     // 立即退出,避免多个实例同时抢 ASIO 设备/端口/目标进程。
     // 注意:--list/--tone/--*-test 等诊断模式不需要互斥,放后面判断。
@@ -1038,6 +1134,7 @@ int wmain(int argc, wchar_t** argv) {
     SetConsoleCtrlHandler(ctrlHandler, TRUE);
 
     bool list = false, tone = false;
+    bool crashTest = false;   // --crash-test:服务启动后故意空指针崩溃,验证自愈拉起链路
     std::string driver = "ASIO MADIface USB";
     double toneRate = 44100.0;
     long reqBuffer = 0;
@@ -1053,6 +1150,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--buffer" && i + 1 < argc) reqBuffer = _wtol(argv[++i]);
         else if (a == L"--dither") ditherFlag = true;
         else if (a == L"--no-dither") ditherFlag = false;
+        else if (a == L"--crash-test") crashTest = true;
         else if (a == L"--passthrough") passthroughArg = true;
         else if (a == L"--resampler-test") { return resamplerSelfTest(); }
         else if (a == L"--tube-test") { return tubeSelfTest(); }
@@ -1213,6 +1311,11 @@ int wmain(int argc, wchar_t** argv) {
         &targetPid, &targetActive
     };
     startWebConsole(web);
+    g_bridgeLive = 1;   // 自愈拉起解锁:服务主体已启动,此后崩溃值得自动重启
+    if (crashTest) {    // 故意崩溃:验证 crashFilter→relaunchSelf→--respawn 全链路
+        volatile int* p = nullptr;
+        *p = 1;
+    }
 
     // ===== 配置持久化:加载/保存控制台设置(exe 同目录 asio_bridge.cfg)=====
     // 下次服务重启时恢复上次操作(染色开关/暖度/直通/水位下限/重采样档)。
