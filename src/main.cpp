@@ -954,6 +954,12 @@ static int limiterSelfTest() {
 }
 
 int wmain(int argc, wchar_t** argv) {
+    // 单实例互斥锁:若已有桥实例在运行(如计划任务自动重启拉起的副本),
+    // 立即退出,避免多个实例同时抢 ASIO 设备/端口/目标进程。
+    // 注意:--list/--tone/--*-test 等诊断模式不需要互斥,放后面判断。
+    HANDLE hSingle = CreateMutexW(nullptr, TRUE, L"Local\\asio_bridge_single_instance");
+    bool singleInst = (hSingle && GetLastError() != ERROR_ALREADY_EXISTS);
+
     SetConsoleOutputCP(65001);
     setvbuf(stdout, nullptr, _IONBF, 0);   // 无缓冲，崩溃时也能看到输出
     SetConsoleCtrlHandler(ctrlHandler, TRUE);
@@ -1036,6 +1042,15 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     // ===== 正式桥接模式（含端点速率变更自适应）=====
+    // 单实例互斥:正式桥接模式独占 ASIO 设备/控制台端口/目标进程,
+    // 已有实例在运行则本实例退出,避免多实例抢设备(计划任务自动重启会拉起副本)。
+    if (!singleInst) {
+        printf("[Bridge] 已有另一个 asio_bridge 实例在运行，本实例退出（单实例互斥锁）\n");
+        if (hSingle) CloseHandle(hSingle);
+        CoUninitialize();
+        return 0;
+    }
+
     RingBuffer rb;
     rb.init(1 << 17);   // 131072 采样 ≈ 3s @44.1k
 
@@ -1805,6 +1820,7 @@ int wmain(int argc, wchar_t** argv) {
     if (discoveryThread.joinable()) discoveryThread.join();
     stopWebConsole();
     CoUninitialize();
+    if (hSingle) CloseHandle(hSingle);
     printf("已退出。\n");
     return 0;
 }
