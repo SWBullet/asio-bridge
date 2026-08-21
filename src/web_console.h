@@ -15,6 +15,7 @@ struct BridgeStatsPtrs {
     std::atomic<uint64_t>* written;
     std::atomic<uint64_t>* consumed;
     std::atomic<uint64_t>* underruns;
+    std::atomic<uint64_t>* lastUnderrunAt;   // 最近一次真欠载时刻(ms)，滑动窗口 LED 用
     std::atomic<uint64_t>* dropped;
     std::atomic<float>* peak;
     std::atomic<size_t>* wMult;       // 当前水位目标倍数

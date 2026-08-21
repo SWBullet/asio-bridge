@@ -953,6 +953,7 @@ int wmain(int argc, wchar_t** argv) {
     rb.init(1 << 17);   // 131072 采样 ≈ 3s @44.1k
 
     std::atomic<uint64_t> written{0}, consumed{0}, underruns{0}, dropped{0};
+    std::atomic<uint64_t> lastUnderrunAt{0};   // 最近一次真欠载时刻(GetTickCount64 ms)，供滑动窗口 LED
     std::atomic<uint64_t> drainEvent{0};   // 快排丢弃量（监视线程消费打印后清零）
     std::atomic<float> peak{0.0f};
     std::atomic<bool> needRestart{false};
@@ -1016,7 +1017,7 @@ int wmain(int argc, wchar_t** argv) {
 
     // 内嵌 Web 控制台（纯 socket 线程，零 COM）
     BridgeStatsPtrs web = {
-        &written, &consumed, &underruns, &dropped, &peak,
+        &written, &consumed, &underruns, &lastUnderrunAt, &dropped, &peak,
         &wMult, &floorMult, &driftPpm, &needRestart, &ditherReq, &ditherOn, &resetReq,
         &g_stop, &asioRate, &asioBuffer, &asioType, &capRate, &wmNow,
         &totalLatencyMs,
@@ -1248,12 +1249,12 @@ int wmain(int argc, wchar_t** argv) {
                 bool cq = !lpq || ((uint64_t)qg.QuadPart - lpq) > (uint64_t)(qpcFreq * 0.04);
                 if (want > 0 && avail == 0) {
                     memset(dst, 0, frames * ch * sizeof(float));
-                    if (!cq) underruns++;
+                    if (!cq) { underruns++; lastUnderrunAt.store(GetTickCount64(), std::memory_order_relaxed); }
                     return frames;
                 }
                 if (rsIn_.size() < wantS) rsIn_.resize(wantS);
                 size_t gotS = rb.read(rsIn_.data(), avail < wantS ? avail : wantS);
-                if (gotS < wantS && !cq) underruns++;
+                if (gotS < wantS && !cq) { underruns++; lastUnderrunAt.store(GetTickCount64(), std::memory_order_relaxed); }
                 rs.process(rsIn_.data(), gotS / 2, dst, frames);
                 consumed += gotS;
             }

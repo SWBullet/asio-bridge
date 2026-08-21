@@ -368,7 +368,7 @@ async function pollStatus(){
       '<div class="leditem">'+tubeSpan('l-active')+'目标活跃</div>';
     setLed(document.getElementById('l-chain'),s.capRate===s.asioRate);
     setLed(document.getElementById('l-lock'),s.inRate>0);
-    setLed(document.getElementById('l-under'),s.underruns===0);
+    setLed(document.getElementById('l-under'),!s.underRecent);
     setLed(document.getElementById('l-clip'),s.peak<=1.0);
     setLed(document.getElementById('l-active'),s.targetActive);
     if(firstInit){
@@ -505,6 +505,9 @@ static void handleRequest(SOCKET s, char* req, int n) {
         unsigned long long c = g_p.consumed->load(std::memory_order_relaxed);
         unsigned long long d = g_p.dropped->load(std::memory_order_relaxed);
         unsigned long long u = g_p.underruns->load(std::memory_order_relaxed);
+        // 滑动窗口：最近 10 分钟内是否发生过真欠载（LED 用，不随历史累计永久变红）
+        unsigned long long lastUnder = g_p.lastUnderrunAt->load(std::memory_order_relaxed);
+        int underRecent = (lastUnder && (GetTickCount64() - lastUnder < 600000)) ? 1 : 0;
         unsigned long long wm = g_p.wmNow->load(std::memory_order_relaxed);   // 真实水位
         size_t wmMult = g_p.wMult->load(std::memory_order_relaxed);
         size_t floorM = g_p.floorMult->load(std::memory_order_relaxed);
@@ -520,6 +523,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             "\"latencyMs\":%d,"
             "\"ratioBase\":%.7f,\"inRate\":%.1f,\"outRate\":%.1f,\"passthrough\":%d,"
             "\"srcTaps\":%d,"
+            "\"underRecent\":%d,"
             "\"targetPid\":%u,\"targetActive\":%d}",
             wm, target, (unsigned long long)floorM, (unsigned long long)wmMult,
             u, d, (double)g_p.peak->load(std::memory_order_relaxed),
@@ -535,6 +539,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             (double)g_p.outRate->load(std::memory_order_relaxed),
             g_p.passthrough->load(std::memory_order_relaxed) ? 1 : 0,
             (int)g_p.srcTaps->load(std::memory_order_relaxed),
+            underRecent,
             (unsigned)g_p.targetPid->load(std::memory_order_relaxed),
             g_p.targetActive->load(std::memory_order_relaxed) ? 1 : 0);
         sendResponse(s, "200 OK", "application/json; charset=utf-8", body, len);
