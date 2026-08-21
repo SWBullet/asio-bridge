@@ -56,19 +56,16 @@ bool WasapiProcessCapture::open(DWORD pid, DataCallback cb, std::string& err) {
     DWORD r = WaitForSingleObject(readyEvent_, 8000);
     if (r != WAIT_OBJECT_0) {
         err = "进程回环采集线程初始化超时";
+        // 统一生命周期门：close() 会先置 cbValid_=false（阻止线程再触碰 cb_）、
+        // 等线程退出、线程若挂死则泄漏句柄而非误关（与 close() 的纪律一致）。
+        close();
+        return false;
     } else if (!initErr_.empty()) {
         err = initErr_;
-    } else {
-        return true;
+        close();
+        return false;
     }
-    running_.store(false);
-    if (event_) SetEvent(event_);
-    WaitForSingleObject(thread_, 3000);
-    CloseHandle(thread_); thread_ = nullptr;
-    if (event_) { CloseHandle(event_); event_ = nullptr; }
-    if (readyEvent_) { CloseHandle(readyEvent_); readyEvent_ = nullptr; }
-    cb_ = nullptr;
-    return false;
+    return true;
 }
 
 void WasapiProcessCapture::close() {
@@ -297,7 +294,7 @@ void WasapiProcessCapture::drainInner() {
     HRESULT hr = capture_->GetNextPacketSize(&packets);
     if (hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_SERVICE_NOT_RUNNING) {
         failed_.store(true);
-        if (onError_) onError_();
+        if (cbValid_.load(std::memory_order_acquire) && onError_) onError_();
         return;
     }
     if (FAILED(hr)) packets = 0;

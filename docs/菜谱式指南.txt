@@ -3,67 +3,49 @@
 ================================================================================
 
 本菜名: 原味直通牛（Apple Music -> RME ADI-2 Pro，不加系统调味料）
-口味特点: bit-perfect（比特透明）、零欠载、44.1kHz 全对齐
+口味特点: bit-perfect（比特透明）、零欠载、免虚拟声卡、按 PID 自动跟随目标
 难度: ★★★★☆（需要 VS2022 + C++，全部坑已标注解法）
 耗时: 首次约 2~4 小时（含调试）；照抄本菜谱约 1 小时
-总延迟: 约 90~120ms（听音乐无感知，看视频请走系统路径）
+总延迟: 约 20~120ms（听音乐无感知，看视频请走系统路径）
 
 ================================================================================
 第一章 · 成品清单（已确认的技术成果）
 ================================================================================
 
- 1. 应用->RME 的 ASIO 直通桥
-    C++ + 官方 ASIO SDK 2.3，WASAPI 采集 -> 环形缓冲 -> MADIface ASIO 直出。
-
- 2. STA 公寓定律（关键发现）
-    RME 的 ASIO COM 对象(ThreadingModel=Apartment) 只在 STA 线程暴露接口，
-    MTA 下返回 E_NOINTERFACE。
-
- 3. ASIO 宿主禁律（崩溃根因）
-    绝不能在 ASIO 的 STA 主线程做阻塞式 COM 调用——会饿死 MADIface 回调，
-    进程数秒内崩溃(0xC0000005)。
-
- 4. VB-CABLE 固定速率实证
-    驱动内部速率固定 44100Hz、不读注册表；只有 GUI 控制面板(私有 IOCTL)
-    能改；注册表值只是面板的记录。
-
- 5. 引擎周期锁定实证
-    WASAPI 共享模式 periodicity 必须为 0，引擎周期锁 10ms；
-    VB-CABLE 不支持独占采集。
-
- 6. 引擎格式持久化实证
-    混音速率以 PKEY_AudioEngine_DeviceFormat（每端点持久化）为准；
-    直写注册表被 ACL 拒绝，须走端点属性存储(IPropertyStore)。
-
- 7. 零欠载水位带配方
-    环形缓冲目标水位 = 8×ASIO 缓冲（2048 采样），丢弃阈值 +4096
-    -> 实测零欠载。
-
- 8. 三保险自适应架构
-    命名事件握手 + SEH 野指针兜底 + ASIO 停滞看门狗(4 秒检测自动重建)。
-
- 9. 无窗口开机自启
-    计划任务 + wscript + VBS(窗口样式 0)，三个开机任务全部无窗口。
-
-10. 全参数实测基线
-    44.1kHz / 2ch / 128 帧 ASIO / VB-CABLE 缓冲 1536 / float32 全链路 /
-    Int32LSB 输出。
+ 1. 进程回环直通桥(v2): Win11 原生按 PID 旁路采集 -> 环形缓冲 -> 速率锁 +
+    分数重采样 -> MADIface ASIO 直出
+ 2. 免虚拟声卡: 不再装 VB-CABLE；目标输出到哪个设备都行，桥按「最响渲染
+    进程」自动锁定
+ 3. STA 公寓定律: RME 的 ASIO COM 对象(ThreadingModel=Apartment) 只在 STA
+    线程暴露接口，MTA 下返回 E_NOINTERFACE
+ 4. ASIO 宿主禁律: 绝不能在 ASIO 的 STA 主线程做阻塞式 COM 调用——会饿死
+    MADIface 回调，进程数秒内崩溃
+ 5. 跨公寓枚举修复: 非 MTA 线程枚举会话会 RPC_E_CHANGED_MODE 静默返回 0，
+    RunComOnMta 委托 MTA 线程才修好自动发现
+ 6. tap→redirect 取点实证: 回环取点在「会话静音之后、终点主音量之前」——
+    静音目标端点主音量消除双重声且不影响捕获
+ 7. 回环格式回退链: 回环客户端 GetMixFormat 恒 E_NOTIMPL -> 退目标端点混音
+    格式 -> 再退 16/2/44100+AUTOCONVERTPCM
+ 8. 双环速率锁 + 分数重采样: QPC 成对时间戳最小二乘测两时钟速率，sinc
+    重采样吸收 ppm 漂移，长时间平滑无滑移
+ 9. 崩溃自愈: 驱动级空指针崩溃进程内无法拦截 -> crashFilter 拉起新实例，
+    300 秒窗口最多 5 次防死循环
+10. 内嵌 Web 控制台: http://127.0.0.1:3999 复古仪表风，水位/速率锁/链路
+    LED/染色/直通全可调
 
 ================================================================================
 第二章 · 食材与厨具（清单）
 ================================================================================
 
-【必需】
-  RME 声卡 + MADIface 驱动       ADI-2 Pro / 其他 MADIface 系列
-  Windows 10/11 x64              驱动签名要求
-  Visual Studio 2022 Community   C++ 桌面开发负载 + CMake（免费）
-  ASIO SDK 2.3                   Steinberg 官网 asiosdk2.3.zip（仓库已内嵌）
-  VB-CABLE                       VB-Audio 官网 VBCABLE_Driver_Pack（免费捐赠版）
+必需:
+  - RME 声卡 + MADIface 驱动（ADI-2 Pro / 其他 MADIface 系列）
+  - Windows 11 22H2+ x64（进程回环 API 最低要求）
+  - Visual Studio 2022 Community（C++ 桌面开发负载 + CMake）
+  - ASIO SDK 2.3（本仓库已内嵌于 third_party/）
 
-【可选调味】
-  Apple Music / 流媒体           音源
-  VB-CABLE Control Panel         改内部速率 / Max Latency（GUI）
-  RME MADIface Settings          改 ASIO 缓冲帧数
+可选调味:
+  - Apple Music / 流媒体 / 浏览器 / 游戏（任意渲染进程）
+  - RME MADIface Settings（改 ASIO 缓冲帧数）
 
 ================================================================================
 第三章 · 原理（这道菜为什么这么做）
@@ -71,239 +53,162 @@
 
 3.1 完整数据流（成品上桌路径）
 
-  Apple Music --PCM--> [CABLE Input 端点] --> VB-CABLE 内核驱动(内部44.1kHz)
-                                                     | 虚拟电缆直通
-                                                     v
-                                            [CABLE Output 端点]
-                                                     | WASAPI 共享采集
-                                                     | (float32, 引擎10ms周期)
-                                                     v
-  ┌────────────────── asio_bridge.exe ──────────────────────┐
-  │ 采集线程(MTA+MMCSS+SEH) --float32--> 环形缓冲(SPSC无锁)  │
-  │                                           | 水位控制    │
-  │ 主线程(STA: ASIO会话) <--统计/看门狗/握手 |             │
-  │                                           v             │
-  │                              ASIO回调(128帧=2.9ms)      │
-  │                              float32 -> Int32LSB        │
-  └──────────────────────────────┬──────────────────────────┘
-                                 v
-                     MADIface ASIO 驱动(madiface_asio_amd.dll)
-                                 v
-                       ADI-2 Pro DAC --> 耳机/音箱
+  目标应用 --WASAPI共享渲染(float32)--> Windows音频引擎(audiodg)
+                                            | VAD\Process_Loopback 按 PID 旁路
+                                            v
+  +---------------------- asio_bridge.exe ----------------------+
+  | 采集线程(MTA+SEH) --float32--> 环形缓冲(SPSC无锁)             |
+  |                                         | 速率锁+重采样      |
+  | 主线程(STA: ASIO会话) <-- 统计/看门狗/自适应水位              |
+  |                                         v                    |
+  |                  ASIO回调 bufferSwitchTimeInfo               |
+  |                  float32 -> Int32LSB (+TPDF抖动, 可选染色)   |
+  +-------------------------------|------------------------------+
+                                  v
+                   MADIface ASIO 驱动(madiface_asio_amd.dll)
+                                  v
+                     ADI-2 Pro DAC --> 耳机/音箱
 
 3.2 三个"为什么"
 
-  · 为什么用虚拟电缆截流？
-    封闭应用（Apple Music、浏览器）只支持 WASAPI 共享输出，无法给它装
-    ASIO 输出插件。让应用渲染到虚拟声卡端点，就拿到了它的干净 PCM。
+  为什么用进程回环而不是虚拟声卡？封闭应用只支持 WASAPI 共享输出，装不了
+  ASIO 插件。v1 用 VB-CABLE 截流但固定 44.1k 且需装驱动；v2 直接用 Win11
+  原生按 PID 回环旁路，免驱动、免虚拟声卡、跟设备无关。
 
-  · 为什么不直接用系统路径到 RME？
-    系统路径必然经过 audiodg 的混音/重采样/APO，且 RME 的 WDM 端点是
-    16bit 截断；MADIface ASIO 驱动才是唯一支持全位深/全采样率的通道。
+  为什么不直接用系统路径到 RME？系统路径必然经过 audiodg 的混音/重采样/
+  APO，且 RME WDM 端点是 16bit 截断；MADIface ASIO 才是全位深/全采样率通道。
 
-  · 为什么桥需要环形缓冲？
-    采集时钟（系统）与 ASIO 时钟（RME 硬件）独立运行，存在 ppm 级漂移；
-    环形缓冲 + 水位控制吸收漂移和调度抖动。欠载用末样本保持、
-    超水位丢弃多余采样。
+  为什么需要环形缓冲 + 速率锁？采集时钟与 ASIO 硬件时钟独立，ppm 级漂移；
+  环形缓冲吸收抖动，速率锁 + 分数重采样让重采样比精确追踪两时钟速率。
 
 3.3 bit-perfect 的成立条件（验收标准）
 
-  1. 内容采样率 = 44.1kHz 系（CD 16/44.1、无损 24/44.1 等）
-  2. 应用音量 = 100%（引擎才会原样传递）
-  3. CABLE 端点无 APO / 无"音频增强"
-  4. 只有目标应用渲染到 CABLE Input（多应用会在此混音）
-  5. VB-CABLE 面板内部速率 = 44100（与引擎 DeviceFormat 一致）
-
-  满足全部条件时：全链路仅发生 float32 格式转换（≤24bit 无损），
-  零重采样、零量化损失。
+  1. 内容采样率 = 引擎混音格式（float32 全链路位透明）
+  2. 应用音量 = 100%
+  3. 目标端点无 APO / 无增强
+  4. 直通模式(--passthrough)下 ratio 恒 1.0 逐位直通
 
 ================================================================================
 第四章 · 制作步骤（复现指南）
 ================================================================================
 
-步骤 1：备料
-  # 安装 VB-CABLE（官网下载 Pack 后静默安装，需管理员）
-  VBCABLE_Setup_x64.exe -i -h
-  # 打开 VB-CABLE Control Panel：内部速率 44100、Max Latency 1536
+步骤 1 备料: 无需装虚拟声卡；确认系统 Win11 22H2+ 且装了 RME MADIface 驱动。
 
-步骤 2：搭工程
-  拷贝仓库至asio-bridge（third_party 已含 ASIO SDK 2.3）
+步骤 2 搭工程: git 或拷贝仓库至 E:\Harness\asio-bridge（third_party 已含 SDK）。
 
-步骤 3：编译
-  cmake -B build -S .
-  # VS2022 自带 CMake 位于:
-  # C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\
-  #   CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe
-  cmake --build build --config Release
+步骤 3 编译:
+    cmake -B build -S .
+    cmake --build build --config Release
+    （或命令行重建: cmd /c tools\rebuild.cmd）
 
-步骤 4：首测（ASIO 链路验证）
-  .\build\Release\asio_bridge.exe --tone --rate 44100
-  # 听到 1kHz 正弦、ADI-2 Pro 屏幕显示 44.1 -> ASIO 链路 OK，Ctrl+C 停止
+步骤 4 首测(ASIO 链路验证):
+    .\build\Release\asio_bridge.exe --tone --rate 44100
+    听到 1kHz 正弦、ADI-2 Pro 屏幕显示 44.1 -> 链路 OK，Ctrl+C 停止。
 
-步骤 5：全链路测试
-  # 终端 1：启动桥
-  .\build\Release\asio_bridge.exe
-  # 终端 2：向 CABLE Input 灌 8 秒 440Hz 正弦
-  pwsh -File tools\test_render.ps1 -Seconds 8
-  # 观察桥日志：峰值 > 0 说明音频穿过整条链；欠载=0 为佳
+步骤 5 全链路测试:
+    终端1: .\build\Release\asio_bridge.exe
+    终端2: 播放任意音频
+    观察桥日志：目标 PID 出现、峰值 > 0、欠载=0 为佳。
 
-步骤 6：开机自启（无窗口）
-  pwsh -File tools\install_autostart.ps1           # 安装（登录触发、隐藏、失败自动重启）
-  pwsh -File tools\install_autostart.ps1 -Remove   # 卸载
-  # 日志：C:\Users\Administrator\asio_bridge.log
+步骤 6 数值自检(先测后上线):
+    --resampler-test  --pll-test  --tube-test  --conv-test
+    --capture-test    --limiter-test
 
-步骤 7：日常使用
-  1. 应用输出设备选 "CABLE Input (VB-Audio Virtual Cable)"
-  2. 播放 -> 声音经 ADI-2 Pro 直出（屏幕显示 44.1）
-  3. 看视频/游戏 -> 把该应用输出切回 RME 端点（走系统路径）
+步骤 7 开机自启(无窗口):
+    pwsh -File tools\install_autostart.ps1           安装
+    pwsh -File tools\install_autostart.ps1 -Remove   卸载
+    日志: %USERPROFILE%\asio_bridge.log
+
+步骤 8 日常使用:
+    启动桥 -> 播放任意音频 -> 10~20 秒自动锁定目标 -> 控制台看状态。
 
 ================================================================================
 第五章 · 火候与调味（参数对照表 + 音质提升思路）
 ================================================================================
 
-5.1 调参表（低延迟 <-> 高稳定 光谱）
+5.1 调参表（低延迟 <-> 高稳定）
 
-  参数                   位置                    已验证取值            效果
-  ---------------------------------------------------------------------------
-  ASIO 缓冲帧数          RME MADIface Settings   128（驱动锁min=max）  每帧2.9ms
-  VB-CABLE Max Latency   控制面板                1536（最小档；原默认   电缆内部缓冲，
-                                                7168≈162ms）          单项最大延迟来源
-  VB-CABLE 内部速率      控制面板                44100                 唯一能改驱动速率
-                                                                     的入口(GUI IOCTL)
-  环形水位目标           main.cpp wTarget        8×缓冲=2048 采样      越大越稳越延迟
-  采集周期               不可调（实测）          引擎锁 10ms           共享模式periodicity
-                                                                     必须为 0
+  ASIO 缓冲帧数     --buffer            128(驱动锁 min=max)   越小延迟越低
+  水位下限倍数      控制台/cfg floor     8×缓冲                越大越稳越延迟
+  重采样质量档      控制台/cfg src_taps  32=sinc(默认)0=线性   sinc 高精度
+  直通模式          --passthrough        关闭(默认)            开则 ratio 恒 1.0
+  TPDF 抖动         --no-dither          开(默认)              关更纯净
+  300B 染色         控制台/cfg warmth    0.3                   0=干净 1=暖
 
-5.2 提升音质的思路（进阶菜谱，按性价比排序）
+5.2 提升音质的思路（进阶菜谱）
 
-  【已做到的（本菜谱）】
-   · 绕开混音/APO/音效——单应用截流成立
-   · float32 全链路，输出 Int32LSB 全分辨率——RME WDM 的 16bit 截断消失
-   · 44.1kHz 采样率全对齐——无重采样
-
-  【下一步可以做的（思路清单）】
-   1. 多采样率自适应：换支持独占采集/动态格式的虚拟声卡（VAC 值得实测），
-      桥的握手/格式写入机制已备好，可实现 44.1k/48k/96k 按内容切换
-   2. 分数重采样漂移校正：把水位丢弃换成窗口 sinc 分数重采样器——
-      漂移校正不再产生采样滑移，长时聆听更平滑
-   3. 消除 VB-CABLE 内部缓冲：自研 AVStream 虚拟驱动（需 EV 签名证书），
-      直通采集独占模式，延迟可到个位数毫秒
-   4. 隔离播放链：音乐专用虚拟端点禁用一切引擎增强、固定 DeviceFormat，
-      杜绝系统声音混入
-   5. 更高位深/DSD：MADIface ASIO 支持 32bit 与 DSD，桥的转换层已预留通道
-   6. 时钟同步：若未来 ASIO 双向（采集+回放），用 ASIO 时间戳做精确对齐
+  已做到: 绕开混音/APO、float32 全链路、双环速率锁+分数重采样平滑无滑移。
+  可再做: 多采样率自适应、隔离播放链、更高位深/DSD、ASIO 双向时钟同步。
 
 5.3 音质自检清单
-
   [ ] ADI-2 Pro 屏幕速率 = 内容速率
-  [ ] 桥日志 欠载=0、峰值<1.0（无削波）
+  [ ] 桥日志 欠载=0、峰值<1.0
   [ ] 应用音量 100%
-  [ ] CABLE 端点属性里无任何增强
-  [ ] 播放期间 CABLE Input 只有目标应用
+  [ ] 目标端点无增强
+  [ ] 直通模式下 ratio 恒 1.0
 
 ================================================================================
 第六章 · 常见翻车点（全部实测踩过，附解法）
 ================================================================================
 
-  症状                                    根因                            解法
-  --------------------------------------------------------------------------------
-  加载 ASIO 驱动报                          RME COM 对象只在 STA 公寓        主线程
-  E_NOINTERFACE(0x80004002)                 暴露接口                        CoInitializeEx(STA)
-
-  桥运行 4~5 秒必崩                          STA 主线程阻塞式 COM 调用       主线程零 COM 调用；
-  (0xC0000005)                              饿死 MADIface 回调              检测移出主线程
-
-  设备重启时采集线程崩溃                    引擎释放 COM 对象后野指针调用   SEH 兜底 + 握手
-                                                                            先释放流
-
-  同一客户端连续两次                        失败后引擎残留半初始化状态      失败必 Release +
-  Initialize 崩溃                                                            重新 Activate 再 Init
-
-  改注册表速率无效                          VB-CABLE 驱动不读注册表，        用控制面板 GUI(IOCTL)
-                                            固定 44.1k                      改，桥看门狗自动跟随
-
-  桥重开后仍是旧速率                        引擎按 DeviceFormat 持久化恢复； 桥经 IPropertyStore 写
-                                            直写注册表被 ACL 拒绝            PKEY_AudioEngine_
-                                                                             DeviceFormat
-
-  共享模式请求 3ms 失败                     共享模式 periodicity 必须为 0     接受 10ms 周期（硬限制）
-
-  水位 512 目标 -> 每秒欠载                 10ms 采集突发(882采样)决定下限    目标水位≥8×ASIO 缓冲
-                                                                             (2048 采样)
-
-  开机弹 cmd 窗口                           计划任务直启控制台程序            wscript + VBS
-                                                                            (窗口样式 0) 隐藏链
-
-  ASIO 驱动被 DAW 占用桥起不来              MADIface ASIO 单客户端           先停桥再用 DAW，
-                                                                            反之亦然
+  E_NOINTERFACE(0x80004002)            RME COM 只在 STA 暴露 -> 主线程 STA
+  运行 4~5 秒必崩(0xC0000005)          STA 主线程阻塞 COM -> 主线程零 COM
+  自动发现失效(静默空结果)             RPC_E_CHANGED_MODE -> RunComOnMta
+  回环激活 E_OUTOFMEMORY(0x8007000E)   handler 缺 IAgileObject -> 补上
+  回环 GetMixFormat E_NOTIMPL          目标无活动流 -> 退目标端点格式
+  速率锁读数突跳 ±700ppm               暂停/恢复污染 -> 60s 短窗+断档截断
+  设备重启采集线程崩溃                 野指针 COM -> SEH 兜底+设备事件重建
+  双重声                               原声+副本 -> 自动静音目标端点主音量
+  开机弹 cmd 窗口                      计划任务直启 -> wscript+VBS 隐藏链
+  ASIO 被 DAW 占用起不来               MADIface 单客户端 -> 先停桥再用 DAW
 
 ================================================================================
 第七章 · 成品验收
 ================================================================================
 
-  # 1) 桥健康
-  Get-Content C:\Users\Administrator\asio_bridge.log -Tail 5 -Encoding UTF8
-  #    看到：水位 1600~3500、欠载=0、峰值随音乐起伏 -> 合格
-
-  # 2) ASIO 会话
-  #    桥日志含 [ASIO] 44100 Hz / 128 帧 / Int32LSB；ADI-2 Pro 屏幕显示 44.1
-
-  # 3) 听觉验收
-  #    播放 24bit/44.1k 无损，对比系统路径：声场更静、细节更多、无底噪调制
+  Get-Content "$env:USERPROFILE\asio_bridge.log" -Tail 5 -Encoding UTF8
+  # 水位稳定、欠载=0、峰值随音乐起伏 -> 合格
+  # 桥日志含 [采集] ... 模式: Bridge 进程回环；ADI-2 Pro 屏幕显示对应采样率
 
 ================================================================================
-第八章 · 偷懒变体（不想自己写的替代菜谱）
+第八章 · 偷懒变体（替代菜谱）
 ================================================================================
 
-  变体                          做法                          适用人群          代价
-  --------------------------------------------------------------------------------
-  A. 系统"侦听此设备"            CABLE Output 属性->侦听       零动手能力        重新进引擎，16bit
-                                ->输出到 RME                                     截断，无 bit-perfect
-  B. VB-Audio 官方             官方虚拟电缆+官方桥           想用现成 GUI 产品  架构相同但黑盒、
-    HIFI-CABLE & ASIO Bridge                                                     坑不可见
-  C. Voicemeeter                CABLE->Voicemeeter->A1       需要多路路由/直播 自带混音/重采样，
-                               输出选 MADIface ASIO                              非比特透明
-  D. 播放器 ASIO 插件           foobar2000 等装 ASIO 输出组件  只播本地文件的用户  对 Apple Music/流媒体
-                                                                                 无效
+  A. 系统「侦听此设备」     零动手           重新进引擎 16bit 截断 无 bit-perfect
+  B. VB-Audio 官方桥        现成 GUI         需装驱动 黑盒 坑不可见
+  C. Voicemeeter            多路路由         自带混音/重采样 非比特透明
+  D. 播放器 ASIO 插件       只播本地文件     对 Apple Music/流媒体无效
 
 ================================================================================
-附录 A · 命令速查
+附录 · 命令速查 / 错误码 / 关键文件
 ================================================================================
 
-  asio_bridge                        桥接模式
-  asio_bridge --tone --rate 44100    ASIO 链路自检(1kHz)
-  asio_bridge --list                列出驱动与端点
-  asio_bridge --log <文件> --buffer 128    日志 + ASIO 缓冲
-  Stop-Process -Name asio_bridge                  停桥
-  Start-ScheduledTask -TaskName 'ASIO Bridge'     起桥(自启任务)
+命令:
+  asio_bridge                         桥接模式(自动发现目标)
+  asio_bridge --tone --rate 44100     ASIO 链路自检
+  asio_bridge --list                  列出驱动
+  asio_bridge --passthrough           直通模式
+  Stop-Process -Name asio_bridge      停桥
 
+错误码:
+  0x80004002 E_NOINTERFACE       RME 需 STA
+  0x8007000E E_OUTOFMEMORY       缺 IAgileObject
+  0x80010106 RPC_E_CHANGED_MODE  需 MTA 线程枚举
+  0x88890004 DEVICE_INVALIDATED  端点失效重建
+  0x8889000A DEVICE_IN_USE       ASIO 被占用
+  0xC0000005 访问违例            野指针/函数表清空
+
+关键文件:
+  src\main.cpp                主流程/自检/发现/水位/看门狗/崩溃自愈
+  src\wasapi_process_capture.* 进程回环采集(COM/SEH/格式/发现/静音)
+  src\asio_render.*           ASIO 输出
+  src\ring_buffer.h           无锁环形缓冲
+  src\resampler.h             分数重采样器
+  src\rate_lock.h             双环速率锁
+  src\dsp_tube.h              300B 染色
+  src\web_console.*           内嵌 Web 控制台
+  tools\install_autostart.ps1 无窗口开机自启
+  docs\详细介绍.txt           技术细节完整版
+
+  *本菜谱所有参数均在本机（Win11 22H2+ + RME ADI-2 Pro）实测验证。*
 ================================================================================
-附录 B · 错误码速查
-================================================================================
-
-  码          含义              本菜谱中的对应坑
-  -----------------------------------------------------------
-  0x80004002  E_NOINTERFACE     RME 需要 STA 公寓
-  0xC0000005  访问违例          野指针 COM / 主线程 COM 饿死回调
-  0x8889000A  DEVICE_IN_USE     ASIO 被 DAW 占用
-  0x88890008  UNSUPPORTED_FORMAT  VB-CABLE 拒绝独占/该格式
-  0x88890016  BUFFER_NOT_ALIGNED  独占缓冲未按设备周期对齐
-
-================================================================================
-附录 C · 关键文件
-================================================================================
-
-  src\main.cpp              主流程/握手/看门狗/水位控制
-  src\wasapi_capture.*      WASAPI 采集(线程自管 COM/SEH/格式转换)
-  src\asio_render.*         ASIO 输出(SDK 集成/类型转换)
-  src\ring_buffer.h         无锁环形缓冲
-  tools\set_cable_rate.ps1  速率记录+握手重启
-  tools\test_render.ps1     440Hz 测试渲染器
-  tools\install_autostart.ps1  无窗口开机自启
-  docs\详细介绍.txt         技术细节完整版
-  docs\思维导图.mmd / 原理图.mmd   思维导图与原理图源文件
-
-================================================================================
-
-*本菜谱所有参数均在本机（Win11 + RME ADI-2 Pro + VB-CABLE）实测验证。
- 换机器/换声卡/换虚拟声卡时，第 5~6 章的实测结论可能需要重新校准。*

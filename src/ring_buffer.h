@@ -47,8 +47,13 @@ public:
     }
 
     size_t available() const {
-        return writePos_.load(std::memory_order_acquire) -
-               readPos_.load(std::memory_order_acquire);
+        // 先读 readPos 再读 writePos：若先读 writePos，两次 load 之间消费者把
+        // readPos 推进越过 writePos 快照，w-r 无符号下溢为 ~2^64（假水位污染
+        // wmAvg、ratio 长时间钳死）。先读 readPos 保证读 w 时 readPos<=writePos
+        // 恒成立，下溢不可能；末尾防御性守卫兜底。
+        const size_t r = readPos_.load(std::memory_order_acquire);
+        const size_t w = writePos_.load(std::memory_order_acquire);
+        return (w >= r) ? (w - r) : 0;
     }
 
     // 仅消费者调用：丢弃 n 个采样（水位过高时的漂移校正）

@@ -11,7 +11,9 @@
 extern AsioDrivers* asioDrivers;
 bool loadAsioDriver(char* name);
 
-static AsioRender* g_self = nullptr;
+// 驱动回调线程读、主线程(shutdown)写：必须原子，否则 TOCTOU 下回调读到的
+// 指针与置空构成数据竞争（UB）。load/store 用 acquire/release 配对。
+static std::atomic<AsioRender*> g_self{nullptr};
 
 // 崩溃面包屑：每个 SEH 保护区进入前更新，供日志/异常过滤器定位「在哪一步炸的」
 static volatile const char* g_crashContext = "idle";
@@ -92,7 +94,7 @@ static inline int32_t quantizeSigned(float x, int bits, bool dither, uint32_t& r
 }
 
 bool AsioRender::initInner(const std::string& driverName, double sampleRate, std::string& err, long bufferFrames) {
-    g_self = this;
+    g_self.store(this, std::memory_order_release);
     char name[64] = {0};
     strncpy_s(name, sizeof(name), driverName.c_str(), _TRUNCATE);
 
@@ -110,6 +112,7 @@ bool AsioRender::initInner(const std::string& driverName, double sampleRate, std
 
     if (!loaded_) {
         err = "加载 ASIO 驱动失败: " + driverName + "（请确认注册表 HKLM\\SOFTWARE\\ASIO 下存在该驱动）";
+        g_self.store(nullptr, std::memory_order_release);   // 驱动未加载：不留悬垂 g_self
         // 诊断：手动复现 SDK 加载链，定位失败环节
         HKEY hk = nullptr;
         if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, ("SOFTWARE\\ASIO\\" + driverName).c_str(), 0,
@@ -143,8 +146,10 @@ bool AsioRender::initInner(const std::string& driverName, double sampleRate, std
 
     long inCh = 0, outCh = 0;
     if (ASIOGetChannels(&inCh, &outCh) != ASE_OK) { err = "ASIOGetChannels 失败"; shutdown(); return false; }
-    if (outCh <= 0) { err = "驱动没有输出通道"; shutdown(); return false; }
-    channels_ = (size_t)std::min<long>(outCh, 2);   // 用前两个通道 (1+2)
+    // 整条 DSP 链（环形缓冲/重采样器/染色/FFT）均为立体声硬编码；单声道设备
+    // 会让 resampler 每帧写 2 float 到仅 1 通道的 scratch_ → 堆越界。
+    if (outCh < 2) { err = "驱动输出通道不足 2（桥为立体声直通，需至少 2 通道）"; shutdown(); return false; }
+    channels_ = 2;   // 用前两个通道 (1+2)
 
     ae = ASIOSetSampleRate(ASIOSampleRate(sampleRate));
     ASIOSampleRate actual = 0.0;
@@ -188,6 +193,15 @@ bool AsioRender::initInner(const std::string& driverName, double sampleRate, std
     ae = ASIOCreateBuffers(bufInfos_.data(), (long)channels_, bufferSize_, &asioCallbacks_);
     if (ae != ASE_OK) { err = "ASIOCreateBuffers 失败（错误码 " + std::to_string(ae) + "）"; shutdown(); return false; }
 
+    // 回调缓冲/历史/状态必须在 ASIOStart 之前就绪：start 后驱动立即开始
+    // 回调，若这些未初始化，首个回调会写空 vector(data()==nullptr) 触发 AV
+    // （小缓冲下几乎必现）。此前放在 ASIOStart 之后是 P0 缺陷。
+    scratch_.resize((size_t)bufferSize_ * channels_);
+    hist_.assign(channels_, std::vector<float>((size_t)bufferSize_, 0.0f));
+    histPos_ = 0;
+    prevUnderrun_ = false;
+    rngState_ = (uint32_t)GetTickCount() ^ 0x9E3779B9u;
+
     ae = ASIOStart();
     if (ae != ASE_OK) { err = "ASIOStart 失败（错误码 " + std::to_string(ae) + "，驱动可能被其他程序占用）"; shutdown(); return false; }
     started_ = true;
@@ -196,11 +210,6 @@ bool AsioRender::initInner(const std::string& driverName, double sampleRate, std
     printf("[ASIO] 延迟 输入=%ld 帧 输出=%ld 帧 @ %g Hz（%.2f ms）\n",
            inputLatency_, outputLatency_, sampleRate_, (double)outputLatency_ * 1000.0 / sampleRate_);
 
-    scratch_.resize((size_t)bufferSize_ * channels_);
-    hist_.assign(channels_, std::vector<float>((size_t)bufferSize_, 0.0f));
-    histPos_ = 0;
-    prevUnderrun_ = false;
-    rngState_ = (uint32_t)GetTickCount() ^ 0x9E3779B9u;
     printf("[ASIO] %g Hz / %zu 通道 / 缓冲 %ld 帧 / 类型 %s\n",
            sampleRate_, channels_, bufferSize_, typeName(sampleType_));
     return true;
@@ -224,7 +233,7 @@ bool AsioRender::init(const std::string& driverName, double sampleRate, std::str
 void AsioRender::shutdown() {
     // 先切断回调路由：ASIOStop/DisposeBuffers 期间若仍有在途回调命中
     // render()，会访问正被释放的缓冲导致 use-after-free 崩溃
-    g_self = nullptr;
+    g_self.store(nullptr, std::memory_order_release);
     // 设备掉线会清空驱动的函数指针表，调用 ASIOStop/DisposeBuffers 会在
     // 本进程内访问违例（0xc0000005）——SEH 兜底，跳过已死驱动的清理
     __try {
@@ -241,12 +250,12 @@ void AsioRender::shutdown() {
 
 void AsioRender::bufferSwitchCB(long doubleBufferIndex, ASIOBool directProcess) {
     (void)directProcess;
-    if (g_self) g_self->render(doubleBufferIndex);
+    if (AsioRender* s = g_self.load(std::memory_order_acquire)) s->render(doubleBufferIndex);
 }
 
 ASIOTime* AsioRender::bufferSwitchTimeInfoCB(ASIOTime* time, long doubleBufferIndex, ASIOBool directProcess) {
     (void)time; (void)directProcess;
-    if (g_self) g_self->render(doubleBufferIndex);
+    if (AsioRender* s = g_self.load(std::memory_order_acquire)) s->render(doubleBufferIndex);
     return nullptr;
 }
 

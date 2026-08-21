@@ -1,18 +1,20 @@
 flowchart LR
-  APP[第三方应用<br/>Apple Music / 浏览器] -->|"渲染 PCM (共享模式)"| IN[端点: CABLE Input<br/>VB-Audio Virtual Cable]
-  IN --> DRV["VB-CABLE 内核驱动 VBAudioVACMME<br/>（内部速率固定 44100Hz）"]
-  DRV --> OUT[端点: CABLE Output]
+  APP["目标应用<br/>Apple Music / 浏览器 / 游戏"] -->|"渲染 PCM (WASAPI 共享, float32)"| ENG["Windows 音频引擎<br/>audiodg"]
+  ENG -->|"VAD\\Process_Loopback<br/>按 PID 旁路取流<br/>(会话处理之后, 终点主音量之前)"| CAP
 
-  OUT -->|"WASAPI 共享采集<br/>float32/44.1k/2ch"| CAP["桥·采集线程<br/>(独立线程, MTA, SEH 防护)"]
-  CAP -->|"float32 交错采样"| RB["环形缓冲 131072 采样<br/>SPSC 无锁"]
-  RB -->|"水位控制 + 漂移校正<br/>(丢弃多余采样)"| ASIOCB["ASIO 回调<br/>bufferSwitchTimeInfo"]
+  subgraph BRIDGE["asio_bridge.exe"]
+    CAP["采集线程<br/>(独立 MTA, SEH 防护)<br/>进程回环按 PID"] -->|"float32 交错采样"| RB["环形缓冲 131072 采样<br/>SPSC 无锁 (cache-line 对齐)"]
+    RB -->|"速率锁 + 分数重采样<br/>sinc/线性 + 水位闭环"| DSP["TPDF 抖动<br/>+ 300B 电子管染色"]
+    DSP --> ASIOCB["ASIO 回调<br/>bufferSwitchTimeInfo"]
+  end
+
   ASIOCB -->|"转 Int32LSB 写入驱动缓冲"| ASIODRV["RME MADIface ASIO 驱动<br/>madiface_asio_amd.dll<br/>(STA 公寓, COM)"]
   ASIODRV --> HW["ADI-2 Pro DAC"]
   HW --> OUTDEV[耳机 / 音箱]
 
-  SCRIPT["set_cable_rate.ps1"] -.->|"命名事件握手<br/>Local\\AsioBridge_ReleaseDevice<br/>/ AsioBridge_Released"| CAP
+  BRIDGE -.->|"tap→redirect: 静音目标<br/>端点主音量消除双重声<br/>(取点在主音量之前, 不影响捕获)"| ENG
 
-  subgraph LEGEND[被绕过的部分]
+  subgraph LEGEND["被绕过的部分"]
     MIX["系统音频引擎 audiodg<br/>混音 / 重采样 / APO"]
   end
   APP -.->|"原路径(弃用)"| MIX

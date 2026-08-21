@@ -1,10 +1,9 @@
-# detect_source.ps1 - Probe the current audio source feeding the bridge:
-#   1) <Match> Input endpoint engine mix format (PKEY_AudioEngine_DeviceFormat)
-#   2) Sessions rendering into <Match> Input (pid / state / volume)
-#   3) Bridge measured delivery cadence (from console API)
-# Usage:  detect_source.ps1 [-Match CABLE|OpenCable]
+# detect_source.ps1 - Probe the current audio source feeding the bridge.
+#   v2 (process loopback): lists ALL active render endpoints and their audio
+#   sessions (pid / process / state / volume / peak), plus the bridge's own
+#   measured target + rates from the web console API.
+# Usage:  detect_source.ps1
 # ASCII only (PS 5.1 ANSI-safe). Requires FullLanguage (Add-Type).
-param([string]$Match = 'CABLE')
 $src = @'
 using System;
 using System.Runtime.InteropServices;
@@ -56,7 +55,7 @@ public interface IAudioSessionManager2 {
     int RegisterSessionNotification(IntPtr n);
     int UnregisterSessionNotification(IntPtr n);
     int RegisterDuckNotification(string id, IntPtr n);
-    int UnregisterDuckNotification(IntPtr n);
+    int UnregisterDuckNotification(string id, IntPtr n);
 }
 [ComImport, Guid("E2F5BB11-0570-40CA-ACDD-3AA01277DEE8"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 public interface IAudioSessionEnumerator {
@@ -101,7 +100,11 @@ public interface ISimpleAudioVolume {
     int SetMute(bool m, ref Guid c);
     int GetMute(out bool m);
 }
-
+// ISimpleAudioMeter (undocumented; IID/vtable from public docs) for per-session peak
+[ComImport, Guid("C02216F6-8C67-4B5B-9D00-D008E73E0064"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface ISimpleAudioMeter {
+    int GetPeakValue(out float peak);
+}
 [ComImport, Guid("1CB9AD4C-DBFA-4c32-B178-C2F568A703B2"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 public interface IAudioClient {
     int Initialize(int mode, int flags, long dur, long period, IntPtr fmt, IntPtr guid);
@@ -119,47 +122,51 @@ public interface IAudioClient {
 }
 
 public static class AudioProbe {
-    // Returns "endpointName\nmixFormat\nsession;session;..." (single string, no out-param loss)
-    public static string Probe(string filter) {
+    static string FriendlyName(IMMDevice dev) {
+        try {
+            IPropertyStore ps; dev.OpenPropertyStore(0, out ps);
+            PropertyKey k = new PropertyKey();
+            k.fmtid = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"); k.pid = 14;
+            PropVariant v;
+            if (ps.GetValue(ref k, out v) == 0 && v.vt == 31 && v.p0 != IntPtr.Zero)
+                return Marshal.PtrToStringUni(v.p0);
+        } catch { }
+        return "?";
+    }
+
+    static string MixFormat(IMMDevice dev) {
+        try {
+            object o;
+            Guid iid = typeof(IAudioClient).GUID;
+            dev.Activate(ref iid, 1, IntPtr.Zero, out o);
+            var ac = (IAudioClient)o;
+            IntPtr pwf; int hr = ac.GetMixFormat(out pwf);
+            if (hr == 0 && pwf != IntPtr.Zero) {
+                int rate = Marshal.ReadInt32(pwf, 4);
+                short ch = Marshal.ReadInt16(pwf, 2);
+                short bits = Marshal.ReadInt16(pwf, 14);
+                short tag = Marshal.ReadInt16(pwf, 0);
+                string ft = tag == 3 ? "float32" : (tag == -2 ? "ext" : "pcm");
+                Marshal.FreeCoTaskMem(pwf);
+                return rate + "Hz/" + ch + "ch/" + bits + "bit/" + ft;
+            }
+            if (pwf != IntPtr.Zero) Marshal.FreeCoTaskMem(pwf);
+        } catch { }
+        return "?";
+    }
+
+    // Returns one string enumerating every active render endpoint, its engine
+    // mix format, and every audio session on it (pid|state|volume|peak|display).
+    public static string ProbeAll() {
         var sb = new StringBuilder();
         var en = (IMMDeviceEnumerator)(new MMDeviceEnumeratorCom());
         IMMDeviceCollection coll;
-        en.EnumAudioEndpoints(0, 1, out coll);
+        if (en.EnumAudioEndpoints(0, 1, out coll) != 0) return "enum-failed";
         int n; coll.GetCount(out n);
-        Guid fmtKey = new Guid("f19f064d-082c-4e27-bc73-6882a1bb8e4c");
-        Guid nameKey = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0");
-        var names = new StringBuilder();
-        bool found = false;
         for (int i = 0; i < n; i++) {
             IMMDevice dev; coll.Item(i, out dev);
-            string name = "?";
-            try {
-                IPropertyStore ps; dev.OpenPropertyStore(0, out ps);
-                PropertyKey k = new PropertyKey(); k.fmtid = nameKey; k.pid = 14;
-                PropVariant v;
-                if (ps.GetValue(ref k, out v) == 0 && v.vt == 31 && v.p0 != IntPtr.Zero)
-                    name = Marshal.PtrToStringUni(v.p0);
-            } catch { }
-            names.Append(name + ";");
-            if (name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
-            found = true;
-            sb.Append(name + "\n");
-            try {
-                IPropertyStore ps; dev.OpenPropertyStore(0, out ps);
-                PropertyKey k = new PropertyKey(); k.fmtid = fmtKey; k.pid = 0;
-                PropVariant v;
-                if (ps.GetValue(ref k, out v) == 0 && v.vt == 65 && v.p1 != IntPtr.Zero) {
-                    int rate = Marshal.ReadInt32(v.p1, 4);
-                    short ch = Marshal.ReadInt16(v.p1, 2);
-                    short bits = Marshal.ReadInt16(v.p1, 14);
-                    short tag = Marshal.ReadInt16(v.p1, 0);
-                    string ft = tag == 3 ? "float32" : (tag == -2 ? "ext" : "pcm");
-                    sb.Append(rate + "|" + ch + "|" + bits + "|" + ft);
-                } else {
-                    sb.Append("read-failed(vt=" + v.vt + ")");
-                }
-                sb.Append("\n");
-            } catch { sb.Append("read-failed\n"); }
+            string name = FriendlyName(dev);
+            sb.Append("ENDPOINT\t" + name + "\t" + MixFormat(dev) + "\n");
             try {
                 object o;
                 Guid iid = typeof(IAudioSessionManager2).GUID;
@@ -171,124 +178,52 @@ public static class AudioProbe {
                     try {
                         object raw; se.GetSession(j, out raw);
                         var c2 = (IAudioSessionControl2)raw;
-                        if (c2.IsSystemSoundsSession() != 0) continue;  // S_OK(0)=not system sounds; S_FALSE(1)=system sounds
+                        if (c2.IsSystemSoundsSession() != 0) continue;  // S_OK(0)=not system sounds
                         uint pid; c2.GetProcessId(out pid);
                         int st; c2.GetState(out st);
                         var vol = raw as ISimpleAudioVolume;
                         float lv = -1f; if (vol != null) vol.GetMasterVolume(out lv);
+                        var meter = raw as ISimpleAudioMeter;
+                        float pk = -1f; if (meter != null) meter.GetPeakValue(out pk);
                         string disp = "?"; c2.GetDisplayName(out disp);
-                        sb.Append(pid + "|" + st + "|" + lv.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) + "|" + disp + ";");
+                        sb.Append("SESSION\t" + pid + "\t" + st + "\t" +
+                            lv.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) + "\t" +
+                            pk.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture) + "\t" + disp + "\n");
                     } catch { }
                 }
             } catch { }
-            break;
+            Marshal.FinalReleaseComObject(dev);
         }
-        if (!found) sb.Append("(no CABLE Input endpoint) all names: " + names + "\n");
-        return sb.ToString();
-    }
-
-    // Capture side: stored format + engine GetMixFormat + pin supported rates
-    public static string ProbeCapture(string filter) {
-        var sb = new StringBuilder();
-        var en = (IMMDeviceEnumerator)(new MMDeviceEnumeratorCom());
-        IMMDeviceCollection coll;
-        en.EnumAudioEndpoints(1, 1, out coll);
-        int n; coll.GetCount(out n);
-        Guid fmtKey = new Guid("f19f064d-082c-4e27-bc73-6882a1bb8e4c");
-        Guid nameKey = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0");
-        for (int i = 0; i < n; i++) {
-            IMMDevice dev; coll.Item(i, out dev);
-            string name = "?";
-            try {
-                IPropertyStore ps; dev.OpenPropertyStore(0, out ps);
-                PropertyKey k = new PropertyKey(); k.fmtid = nameKey; k.pid = 14;
-                PropVariant v;
-                if (ps.GetValue(ref k, out v) == 0 && v.vt == 31 && v.p0 != IntPtr.Zero)
-                    name = Marshal.PtrToStringUni(v.p0);
-            } catch { }
-            if (name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) < 0) continue;
-            sb.Append(name + "\n");
-            try {
-                IPropertyStore ps; dev.OpenPropertyStore(0, out ps);
-                PropertyKey k = new PropertyKey(); k.fmtid = fmtKey; k.pid = 0;
-                PropVariant v;
-                if (ps.GetValue(ref k, out v) == 0 && v.vt == 65 && v.p1 != IntPtr.Zero) {
-                    int rate = Marshal.ReadInt32(v.p1, 4);
-                    short ch = Marshal.ReadInt16(v.p1, 2);
-                    short bits = Marshal.ReadInt16(v.p1, 14);
-                    short tag = Marshal.ReadInt16(v.p1, 0);
-                    string ft = tag == 3 ? "float32" : (tag == -2 ? "ext" : "pcm");
-                    sb.Append("stored:" + rate + "|" + ch + "|" + bits + "|" + ft + "\n");
-                } else sb.Append("stored:read-failed\n");
-            } catch { sb.Append("stored:read-failed\n"); }
-            try {
-                object o;
-                Guid iid = typeof(IAudioClient).GUID;
-                dev.Activate(ref iid, 1, IntPtr.Zero, out o);
-                var ac = (IAudioClient)o;
-                IntPtr pwf; int hr = ac.GetMixFormat(out pwf);
-                if (hr == 0 && pwf != IntPtr.Zero) {
-                    int rate = Marshal.ReadInt32(pwf, 4);
-                    short ch = Marshal.ReadInt16(pwf, 2);
-                    short bits = Marshal.ReadInt16(pwf, 14);
-                    short tag = Marshal.ReadInt16(pwf, 0);
-                    string ft = tag == 3 ? "float32" : (tag == -2 ? "ext" : "pcm");
-                    sb.Append("mixfmt:" + rate + "|" + ch + "|" + bits + "|" + ft + "\n");
-                    Marshal.FreeCoTaskMem(pwf);
-                } else sb.Append("mixfmt:failed hr=0x" + hr.ToString("X8") + "\n");
-                // Capture pin supported rates (direct IsFormatSupported query)
-                var sup = new StringBuilder();
-                foreach (int r in new int[] { 44100, 48000, 88200, 96000 }) {
-                    byte[] blob = new byte[40];
-                    BitConverter.GetBytes(unchecked((short)0xFFFE)).CopyTo(blob, 0);
-                    BitConverter.GetBytes((short)2).CopyTo(blob, 2);
-                    BitConverter.GetBytes((int)r).CopyTo(blob, 4);
-                    BitConverter.GetBytes((int)(r * 8)).CopyTo(blob, 8);
-                    BitConverter.GetBytes((short)8).CopyTo(blob, 12);
-                    BitConverter.GetBytes((short)32).CopyTo(blob, 14);
-                    BitConverter.GetBytes((short)22).CopyTo(blob, 16);
-                    BitConverter.GetBytes((short)32).CopyTo(blob, 18);
-                    BitConverter.GetBytes((int)3).CopyTo(blob, 20);
-                    new Guid("00000003-0000-0010-8000-00aa00389b71").ToByteArray().CopyTo(blob, 24);
-                    IntPtr p = Marshal.AllocCoTaskMem(40);
-                    Marshal.Copy(blob, 0, p, 40);
-                    IntPtr closest;
-                    int h2 = ac.IsFormatSupported(0, p, out closest);
-                    if (closest != IntPtr.Zero) Marshal.FreeCoTaskMem(closest);
-                    Marshal.FreeCoTaskMem(p);
-                    sup.Append(r + ":" + (h2 == 0 ? "Y" : (h2 == 1 ? "N" : "?")) + " ");
-                }
-                sb.Append("supports: " + sup + "\n");
-            } catch { sb.Append("mixfmt:failed\n"); }
-            break;
-        }
+        Marshal.FinalReleaseComObject(en);
         return sb.ToString();
     }
 }
 '@
 Add-Type -TypeDefinition $src -Language CSharp
-"== Capture side ($Match Output) =="
-$cap = [AudioProbe]::ProbeCapture("$Match Output")
-$cap
-$probe = [AudioProbe]::Probe("$Match Input")
-$lines = $probe -split "`n"
-"== Source detection =="
-"Endpoint: $($lines[0])"
-"Engine mix format: $($lines[1])"
-"--- Render sessions on $Match Input (pid|state|volume|display) ---"
-$sess = $lines[2..($lines.Count-1)] -join "`n"
-if ($sess -and $sess -notmatch '^\(no') {
-    foreach ($s in ($sess -split ';' | Where-Object { $_ })) {
-        $p = $s -split '\|'
-        $proc = (Get-Process -Id ([int]$p[0]) -ErrorAction SilentlyContinue).ProcessName
+
+"== Render endpoints + audio sessions (all active) =="
+$lines = [AudioProbe]::ProbeAll() -split "`n"
+foreach ($ln in $lines) {
+    if ($ln -eq '') { continue }
+    $p = $ln -split "`t"
+    if ($p[0] -eq 'ENDPOINT') {
+        "`n[endpoint] $($p[1])  (engine mix format: $($p[2]))"
+    } elseif ($p[0] -eq 'SESSION') {
+        $proc = (Get-Process -Id ([int]$p[1]) -ErrorAction SilentlyContinue).ProcessName
         if (-not $proc) { $proc = "(exited)" }
-        $st = switch ($p[1]) { '1' { 'active' } '0' { 'inactive' } default { "s$($p[1])" } }
-        "  PID $($p[0]) [$proc] state=$st volume=$($p[2]) display=$($p[3])"
+        $st = switch ($p[2]) { '1' { 'active' } '0' { 'inactive' } default { "s$($p[2])" } }
+        "  PID $($p[1]) [$proc] state=$st volume=$($p[3]) peak=$($p[4]) display=$($p[5])"
     }
-} else { "  (no active sessions)" }
+}
+
+"`n== Bridge measured status (from http://127.0.0.1:3999/api/status) =="
 try {
     $api = (Invoke-WebRequest -Uri 'http://127.0.0.1:3999/api/status' -UseBasicParsing -TimeoutSec 5).Content | ConvertFrom-Json
-    "--- Bridge measured cadence ---"
-    if ($api.inRate) { "Input sample stream rate: {0:N1} Hz (per channel {1:N3} Hz)" -f $api.inRate, ($api.inRate / 2) }
-    "Engine capRate: $($api.capRate) Hz / registry panelSR: $($api.panelSR) Hz"
-} catch { "Bridge API unreachable (bridge not running?)" }
+    "targetPid=$($api.targetPid) targetActive=$($api.targetActive)"
+    "capRate=$($api.capRate) Hz   asioRate=$($api.asioRate) Hz"
+    "inRate=$($api.inRate) Hz   outRate=$($api.outRate) Hz   ratioBase=$($api.ratioBase)"
+    "watermark=$($api.watermark) / target=$($api.target)   underruns=$($api.underruns)   dropped=$($api.dropped)   drift=$($api.drift) ppm"
+    "passthrough=$($api.passthrough)   srcTaps=$($api.srcTaps)   dither=$($api.dither)   latencyMs=$($api.latencyMs)"
+} catch {
+    "Bridge API unreachable (bridge not running?): $_"
+}

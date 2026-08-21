@@ -19,12 +19,12 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
 
 /* ===== 拉丝金属表头 ===== */
 .topbar{position:relative;background:
-  repeating-linear-gradient(90deg,rgba(0,0,0,.045) 0 1px,transparent 1px 3px),
+  repeating-linear-gradient(0deg,rgba(0,0,0,.045) 0 1px,transparent 1px 3px),
   linear-gradient(180deg,#ececec 0%,#d2d2d2 35%,#9e9e9e 62%,#c9c9c9 100%);
   border:1px solid #6f6f6f;border-radius:10px;padding:16px 22px;margin-bottom:16px;
   box-shadow:0 5px 14px rgba(0,0,0,.55),inset 0 1px 0 rgba(255,255,255,.85);
   display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
-.topbar .brand{color:#26262a;font-weight:800;font-size:26px;letter-spacing:7px;text-shadow:0 1px 0 rgba(255,255,255,.7);font-family:Consolas,monospace}
+.topbar .brand{color:#2a2a2e;font-weight:400;font-size:30px;letter-spacing:5px;text-shadow:0 1px 0 rgba(255,255,255,.75);font-family:"方正瘦金书","汉仪瘦金体","华康瘦金体","STKaiti","KaiTi","楷体",serif}
 .topbar .sub{color:#5a5a5e;font-size:10px;letter-spacing:4px;margin-top:2px}
 .screw{position:absolute;width:11px;height:11px;border-radius:50%;
   background:radial-gradient(circle at 35% 30%,#f7f7f7,#8f8f8f 55%,#555);box-shadow:0 1px 2px rgba(0,0,0,.65)}
@@ -32,11 +32,22 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
 .s1{top:7px;left:9px}.s2{top:7px;right:9px}.s3{bottom:7px;left:9px}.s4{bottom:7px;right:9px}
 
 /* ===== 面板与表头（LCD） ===== */
-.panel{background:linear-gradient(180deg,#3b4148,#2a2f35 70%,#262b31);border:1px solid #565c64;border-radius:9px;
-  padding:12px 14px;margin-bottom:14px;box-shadow:0 4px 10px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.07)}
+.panel{position:relative;background:
+  repeating-linear-gradient(0deg,rgba(255,255,255,.04) 0 1px,rgba(0,0,0,.05) 1px 2px,transparent 2px 3px),
+  linear-gradient(180deg,#414850,#2c3138 70%,#272c33);
+  border:1px solid #565c64;border-radius:9px;
+  padding:12px 14px;margin-bottom:14px;
+  box-shadow:0 4px 10px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.07)}
+/* 机架安装：四角螺丝（金属钉头 + 高光） */
+.panel::before{content:'';position:absolute;inset:0;pointer-events:none;border-radius:9px;
+  background:
+    radial-gradient(circle at 9px 9px,#14171b 0 3px,#6a717a 3.5px 5px,transparent 5.5px),
+    radial-gradient(circle at calc(100% - 9px) 9px,#14171b 0 3px,#6a717a 3.5px 5px,transparent 5.5px),
+    radial-gradient(circle at 9px calc(100% - 9px),#14171b 0 3px,#6a717a 3.5px 5px,transparent 5.5px),
+    radial-gradient(circle at calc(100% - 9px) calc(100% - 9px),#14171b 0 3px,#6a717a 3.5px 5px,transparent 5.5px)}
 /* 模块铭牌：与表头相同的拉丝金属材质 + 两侧螺丝 */
 .mtitle{position:relative;display:inline-block;
-  background:repeating-linear-gradient(90deg,rgba(0,0,0,.05) 0 1px,transparent 1px 3px),
+  background:repeating-linear-gradient(0deg,rgba(0,0,0,.05) 0 1px,transparent 1px 3px),
   linear-gradient(180deg,#ececec 0%,#d2d2d2 35%,#9e9e9e 62%,#c9c9c9 100%);
   border:1px solid #6f6f6f;border-radius:6px;padding:6px 30px 6px 26px;margin-bottom:10px;
   color:#26262a;font-weight:700;font-size:11px;letter-spacing:3px;font-family:Consolas,monospace;
@@ -90,15 +101,11 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
 .led.a{background:#ffb84a;box-shadow:0 0 8px rgba(255,184,74,.85)}
 
 /* ===== 示波窗 ===== */
-#spark{background:#06080a;border:2px solid #5b626a;border-radius:8px;width:100%;height:220px;display:block;
-  box-shadow:inset 0 3px 8px rgba(0,0,0,.85)}
 #wf{background:#06080a;border:2px solid #5b626a;border-radius:8px;width:100%;height:180px;display:block;
   box-shadow:inset 0 3px 8px rgba(0,0,0,.85)}
 #histcv{background:#06080a;border:2px solid #5b626a;border-radius:8px;width:100%;height:200px;display:block;
   box-shadow:inset 0 3px 8px rgba(0,0,0,.85)}
 .wflegend{font-size:11px;color:#8b939c;margin-top:6px;font-family:Consolas,monospace;letter-spacing:.5px}
-#tip{position:absolute;background:rgba(20,22,26,.95);border:1px solid #565c64;border-radius:6px;padding:6px 10px;
-  font-size:12px;display:none;pointer-events:none;z-index:5;line-height:1.7;font-family:Consolas,monospace}
 
 /* ===== 机械按键 ===== */
 .btn{font-family:inherit;font-size:12px;letter-spacing:1px;font-weight:700;color:#2c2c2c;
@@ -119,6 +126,26 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
   margin-left:7px;box-shadow:0 0 6px #3fb950;animation:blink .5s 3}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.15}}
 
+/* ===== 复古导弹发射按键（正圆拇指肚大小） ===== */
+.launchwrap{display:inline-flex;flex-direction:column;align-items:center;gap:6px;margin:0 8px}
+.launchbtn{position:relative;width:60px;height:60px;border-radius:50%;cursor:pointer;padding:0;flex:none;
+  border:2px solid #4a5056;
+  background:radial-gradient(circle at 40% 30%,#eef0f2,#aeb3b9 55%,#6b727a 100%);
+  box-shadow:0 6px 13px rgba(0,0,0,.65),inset 0 1px 1px rgba(255,255,255,.9),inset 0 -2px 4px rgba(0,0,0,.35);
+  transition:transform .05s}
+.launchbtn:active{transform:translateY(3px)}
+.launchbtn .face{position:absolute;inset:10px;border-radius:50%;
+  background:radial-gradient(circle at 38% 28%,#7d858e,#33383f 72%);
+  box-shadow:inset 0 4px 9px rgba(0,0,0,.85),0 1px 0 rgba(255,255,255,.22)}
+.launchbtn.on .face{background:radial-gradient(circle at 38% 28%,#ff9a8a,#d02020 55%,#7a0e0e 100%);
+  box-shadow:inset 0 4px 9px rgba(0,0,0,.55),0 0 16px 4px rgba(248,81,73,.8)}
+.launchbtn.amber .face{background:radial-gradient(circle at 38% 28%,#ffe9b0,#e9a23c 55%,#9a6a1a 100%);
+  box-shadow:inset 0 4px 9px rgba(0,0,0,.55),0 0 12px 3px rgba(255,184,74,.6)}
+.launchbtn .tag{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);text-align:center;
+  font-family:Consolas,monospace;font-size:8px;font-weight:700;letter-spacing:1px;color:#111318;pointer-events:none}
+.launchbtn.on .tag,.launchbtn.amber .tag{color:#fff7e8;text-shadow:0 1px 2px rgba(0,0,0,.6)}
+.lblcap{font-family:Consolas,monospace;font-size:10px;letter-spacing:2px;color:#9aa2ac;font-weight:600;white-space:nowrap}
+
 /* ===== 机械拨杆开关 ===== */
 .ctlrow{display:flex;gap:18px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
 .ctlrow .lbl{font-size:12px;letter-spacing:2px;color:#9aa2ac;font-weight:600}
@@ -137,7 +164,7 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
 <div class="wrap">
 <div class="topbar">
   <span class="screw s1"></span><span class="screw s2"></span><span class="screw s3"></span><span class="screw s4"></span>
-  <div><div class="brand">BRIDGE</div><div class="sub">AUDIO RELAY CONSOLE</div></div>
+  <div><div class="brand">文超工作室</div><div class="sub">AUDIO RELAY CONSOLE</div></div>
   <div class="ledrow">
     <div class="leditem"><span class="tube on" id="h-pwr"><span class="glass"></span><span class="getter"></span><span class="fil f1"></span><span class="fil f2"></span><span class="pin p1"></span><span class="pin p2"></span></span>PWR</div>
     <div class="leditem"><span class="tube" id="h-asio"><span class="glass"></span><span class="getter"></span><span class="fil f1"></span><span class="fil f2"></span><span class="pin p1"></span><span class="pin p2"></span></span>ASIO</div>
@@ -158,7 +185,7 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
 <div class="panel">
   <div class="mtitle">WATERMARK HISTORY · 水位历史</div>
   <div style="position:relative"><canvas id="histcv"></canvas></div>
-  <div class="wflegend"><span style="color:#ffd27f">■ 水位</span> <span style="color:#ffb84a">┄ 目标水位</span> <span style="color:#6d747d">观察窗口/Y 刻度见 CONTROL DECK</span></div>
+  <div class="wflegend"><span style="color:#ffd27f">■ 水位</span> <span style="color:#ffb84a">┄ 目标水位</span> <span style="color:#6d747d">观察窗口 10 分钟 · Y 自动</span></div>
 </div>
 
 <div class="panel">
@@ -173,14 +200,9 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
 </div>
 
 <div class="panel">
-  <div class="mtitle">300B TRANSFER CURVE</div>
-  <div style="position:relative"><canvas id="spark"></canvas><div id="tip"></div></div>
-</div>
-
-<div class="panel">
   <div class="mtitle">300B SPECTRUM · 谐波叠加</div>
   <div style="position:relative"><canvas id="wf"></canvas></div>
-  <div class="wflegend"><span style="color:#ffbe50">■ 音乐原始</span> <span style="color:#4dd8e6">■ 新增谐波</span></div>
+  <div class="wflegend"><span style="color:#ffbe50">■ 音乐原始</span> <span style="color:#4dd8e6">■ 新增谐波</span> <span style="margin-left:14px">谐波增益</span> <input type="range" id="harmgain" min="0" max="60" value="0" style="width:140px"> <span id="harmgain-v" style="min-width:44px">0 dB</span></div>
 </div>
 
 <div class="panel">
@@ -214,24 +236,14 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
     <span id="tubewarmth-v" style="min-width:34px">30%</span>
   </div>
   <div class="ctlrow">
-    <span class="lbl">观察窗口</span>
-    <span id="bank-range">
-      <button class="btn" data-v="60">1分</button><button class="btn" data-v="180">3分</button>
-      <button class="btn" data-v="600">10分</button><button class="btn" data-v="1800">30分</button>
-      <button class="btn" data-v="3600">1时</button><button class="btn" data-v="7200">2时</button>
-    </span>
-  </div>
-  <div class="ctlrow">
-    <span class="lbl">Y 刻度</span>
-    <span id="bank-scale">
-      <button class="btn" data-v="0">自动</button><button class="btn" data-v="2048">2048</button>
-      <button class="btn" data-v="4096">4096</button><button class="btn" data-v="8192">8192</button>
-      <button class="btn" data-v="16384">16384</button><button class="btn" data-v="32768">32768</button>
-    </span>
-  </div>
-  <div class="ctlrow">
-    <button class="btn big danger" id="rebuild">重 建 链 路</button>
-    <button class="btn big" id="reset">重 置 统 计</button>
+    <div class="launchwrap">
+      <button class="launchbtn on" id="bridge"><span class="face"></span><span class="tag">BRIDGE</span></button>
+      <span class="lblcap">ASIO Bridge</span>
+    </div>
+    <div class="launchwrap">
+      <button class="launchbtn amber" id="reset"><span class="face"></span><span class="tag">RESET</span></button>
+      <span class="lblcap">重置统计</span>
+    </div>
   </div>
 </div>
 
@@ -240,8 +252,6 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
 <script>
 var firstInit=true;
 var CSRF='';   // CSRF Token（由服务端在页面尾部注入，POST 控制接口必须携带）
-var range=600, scale=0;
-var tubeWarmthVal=0.3;   // 当前暖度(供传递曲线静态曲线计算)
 function fmt(n){return n.toLocaleString()}
 function setLed(el,on,amber){el.className='tube '+(on?(amber?'on dim':'on'):'bad')}
 function chip(l,v){return '<span class="chip">'+l+' <b>'+v+'</b></span>'}
@@ -378,7 +388,6 @@ async function pollStatus(){
       chip('锁频',rlTxt)+
       chip('目标进程',tgt)+
       chip('欠载',fmt(s.underruns||0))+
-      chip('丢弃',fmt(s.dropped||0))+
       chip('漂移',dr.toFixed(1)+' ppm');
     // 三块指针的目标值
     gPeak.tgt=Math.min(1,Math.max(0,s.peak));
@@ -386,7 +395,6 @@ async function pollStatus(){
     gWm.mark=s.target;
     gWm.tgt=Math.min(gWm.max,Math.max(0,s.watermark));
     gLat.tgt=s.latencyMs>0?Math.min(300,s.latencyMs):0;
-    tubeWarmthVal=(typeof s.tubeWarmth==='number')?s.tubeWarmth:0.3;
     setLed(document.getElementById('h-asio'),s.asioRate>0);
     setLed(document.getElementById('h-cap'),s.targetActive,s.targetPid&&!s.targetActive);
     // SYSTEM STATUS：静态 DOM 只改灯态（不再每 2s 重建 innerHTML）
@@ -399,6 +407,7 @@ async function pollStatus(){
     // 拨杆开关每次轮询同步实际状态（三态请求 2s 内生效，这里回读防漂移）
     document.getElementById('dither').checked=!!s.dither;
     document.getElementById('passthrough').checked=!!s.passthrough;
+    document.getElementById('bridge').classList.toggle('on',!!s.bridgeOn);
     if(firstInit){
       firstInit=false;
       document.getElementById('tube').checked=!!s.tubeOn;
@@ -406,8 +415,6 @@ async function pollStatus(){
       document.getElementById('tubewarmth-v').textContent=document.getElementById('tubewarmth').value+'%';
       setBank('bank-floor',String(s.floor));
       setBank('bank-src',String(s.srcTaps||0));
-      setBank('bank-range',String(range));
-      setBank('bank-scale',String(scale));
     }
   }catch(e){}
 }
@@ -429,111 +436,74 @@ function bindBank(id,fn){
 }
 bindBank('bank-floor',function(v){ctl('action=floor&value='+v)});
 bindBank('bank-src',function(v){ctl('action=src&value='+v)});
-bindBank('bank-range',function(v){range=v;drawHist()});
-bindBank('bank-scale',function(v){scale=v;drawHist()});
 function ctl(body){if(!CSRF)return;fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body+'&token='+encodeURIComponent(CSRF)})}
 document.getElementById('dither').onchange=function(e){ctl('action=dither&value='+(e.target.checked?1:0))}
 document.getElementById('passthrough').onchange=function(e){ctl('action=passthrough&value='+(e.target.checked?1:0))}
 document.getElementById('tube').onchange=function(e){ctl('action=tube&value='+(e.target.checked?1:0))}
 document.getElementById('tubewarmth').oninput=function(e){document.getElementById('tubewarmth-v').textContent=e.target.value+'%'}
 document.getElementById('tubewarmth').onchange=function(e){ctl('action=tubewarmth&value='+e.target.value)}
-document.getElementById('rebuild').onclick=function(){this.classList.add('flash');setTimeout(function(){document.getElementById('rebuild').classList.remove('flash')},1600);ctl('action=rebuild&value=1')}
-document.getElementById('reset').onclick=function(){this.classList.add('flash');setTimeout(function(){document.getElementById('reset').classList.remove('flash')},1600);ctl('action=reset&value=1')}
+document.getElementById('bridge').onclick=function(){var on=!this.classList.contains('on');this.classList.toggle('on',on);ctl('action=bridge&value='+(on?1:0))}
+document.getElementById('reset').onclick=function(){ctl('action=reset&value=1')}
 
-async function draw(){
-  try{
-    var r=await fetch('/api/tubexy');var s=await r.json();
-    var xy=s.xy||[];
-    var cv=document.getElementById('spark'),ctx=cv.getContext('2d');
-    var dpr=window.devicePixelRatio||1;
-    var rect=cv.getBoundingClientRect();
-    if(cv.width!==Math.round(rect.width*dpr)){cv.width=Math.round(rect.width*dpr);cv.height=Math.round(rect.height*dpr);}
-    var W=rect.width,H=rect.height;ctx.setTransform(dpr,0,0,dpr,0,0);
-    ctx.clearRect(0,0,W,H);
-    var LO=-1.2, HI=1.2;
-    var X=function(x){return (x-LO)/(HI-LO)*W};
-    var Y=function(y){return H-(y-LO)/(HI-LO)*H};
-    // 轴线
-    ctx.strokeStyle='rgba(154,162,172,0.15)';ctx.lineWidth=1;
-    ctx.beginPath();ctx.moveTo(X(0),0);ctx.lineTo(X(0),H);ctx.stroke();
-    ctx.beginPath();ctx.moveTo(0,Y(0));ctx.lineTo(W,Y(0));ctx.stroke();
-    // 对角线 y=x(线性参考)
-    ctx.strokeStyle='rgba(154,162,172,0.35)';ctx.setLineDash([4,4]);
-    ctx.beginPath();ctx.moveTo(X(LO),Y(LO));ctx.lineTo(X(HI),Y(HI));ctx.stroke();ctx.setLineDash([]);
-    // 静态 3/2 定律曲线
-    var bias=12.5/(1+4*tubeWarmthVal);
-    var b=Math.sqrt(bias);
-    ctx.strokeStyle='#ffd27f';ctx.lineWidth=2;
-    ctx.beginPath();
-    var firstP=true;
-    for(var xi=LO;xi<=HI;xi+=0.005){
-      var v=bias+xi;
-      var yi=(v<=0)?(-bias/1.5):((v*Math.sqrt(v)-bias*b)/(1.5*b));
-      var px=X(xi),py=Y(yi);
-      if(firstP){ctx.moveTo(px,py);firstP=false;}else ctx.lineTo(px,py);
-    }
-    ctx.stroke();
-    // 实时轨迹(绿色散点,最新的更亮)
-    if(xy.length>=4){
-      var n=Math.floor(xy.length/2);
-      for(var i=0;i<n;i++){
-        var xv=xy[i*2], yv=xy[i*2+1];
-        var t=n>1?i/(n-1):1;
-        ctx.fillStyle='rgba(63,185,80,'+(0.12+0.72*t).toFixed(3)+')';
-        ctx.fillRect(X(xv)-1.5,Y(yv)-1.5,3,3);
-      }
-    }
-    // 状态标签
-    ctx.fillStyle='rgba(10,12,14,0.8)';
-    roundRect(ctx,8,8,118,24,12);ctx.fill();
-    ctx.fillStyle='#ffd27f';ctx.font='12px Segoe UI';
-    ctx.fillText(tubeWarmthVal>0?('染色 '+Math.round(tubeWarmthVal*100)+'%'):'染色关',18,24);
-    ctx.fillStyle='#6d747d';ctx.font='11px Consolas,monospace';
-    ctx.fillText('输入 x →',W-64,H-8);
-    ctx.fillText('输出 y ↑',6,12);
-  }catch(e){}
+var harmGain=0;    // 谐波增益(dB):默认 0(正常比例),需要时放大残差频谱观测谐波覆盖范围
+function fmtFreq(hz){
+  if(hz>=1000){var v=hz/1000;v=v>=10?Math.round(v):Math.round(v*10)/10;return v+'k'}
+  return String(Math.round(hz));
 }
-var wfRows=[];   // 频谱历史(每行 {in:[...], res:[...]},最多 120 行)
-async function drawWaterfall(){
+async function drawSpectrum(){
   try{
     var r=await fetch('/api/spectrum');var s=await r.json();
     if(!s['in']||!s['in'].length)return;
-    wfRows.push({in:s['in'],res:s['res']});
-    if(wfRows.length>120)wfRows.shift();
+    var rate=s.rate||44100;
     var cv=document.getElementById('wf'),ctx=cv.getContext('2d');
     var dpr=window.devicePixelRatio||1;
     var rect=cv.getBoundingClientRect();
     if(cv.width!==Math.round(rect.width*dpr)){cv.width=Math.round(rect.width*dpr);cv.height=Math.round(rect.height*dpr);}
     var W=rect.width,H=rect.height;ctx.setTransform(dpr,0,0,dpr,0,0);
     ctx.clearRect(0,0,W,H);
-    var bins=wfRows[0]['in'].length;
-    var rows=wfRows.length;
-    var rh=H/120;            // 行高
-    var bw=W/bins;           // bin 宽
-    // 从旧(上)到新(下)绘制
-    for(var ri=0;ri<rows;ri++){
-      var y=H-(rows-ri)*rh;
-      if(y<0)y=0;
-      for(var k=0;k<bins;k++){
-        var x=k*bw;
-        // 音乐原始:暖黄
-        var aIn=Math.min(1,wfRows[ri]['in'][k]/45);
-        if(aIn>0.015){ctx.fillStyle='rgba(255,190,80,'+aIn.toFixed(3)+')';ctx.fillRect(x,y,bw+0.5,rh+0.5);}
-        // 新增谐波:青,半透明叠加
-        var aRes=Math.min(1,wfRows[ri]['res'][k]/4.5);
-        if(aRes>0.015){ctx.fillStyle='rgba(77,216,230,'+aRes.toFixed(3)+')';ctx.fillRect(x,y,bw+0.5,rh+0.5);}
-      }
+    var padL=54,padR=12,padT=8,padB=20;
+    var plotW=W-padL-padR, plotH=H-padT-padB;
+    var fHi=rate/2;              // 线性频率轴 0 ~ Nyquist
+    var bins=s['in'].length;     // 128 bin
+    var ref=64;                  // 满刻度正弦(Hann 256)峰幅≈N/4 → 0 dBFS
+    var X=function(k){return padL+k/bins*plotW};
+    var Y=function(db){db=db<-120?-120:(db>0?0:db);return padT+(0-db)/120*plotH};
+    function dbOf(m){var a=Math.abs(m)/ref;return a>0?20*Math.log10(a):-200}
+    // 网格线:dB 横线 + 频率竖线(每 5kHz)
+    ctx.strokeStyle='rgba(154,162,172,0.10)';ctx.lineWidth=1;
+    for(var db=-120;db<=0;db+=20){ctx.beginPath();ctx.moveTo(padL,Y(db));ctx.lineTo(padL+plotW,Y(db));ctx.stroke();}
+    for(var f=0;f<=fHi;f+=5000){var gx=padL+f/fHi*plotW;ctx.beginPath();ctx.moveTo(gx,padT);ctx.lineTo(gx,padT+plotH);ctx.stroke();}
+    // 透明染色波浪:音乐原始(暖黄)+ 新增谐波(青),线性逐 bin 填充
+    function wave(mags,gainDb,fill){
+      ctx.fillStyle=fill;
+      ctx.beginPath();
+      ctx.moveTo(padL,padT+plotH);
+      for(var k=0;k<bins;k++)ctx.lineTo(X(k),Y(dbOf(mags[k])+gainDb));
+      ctx.lineTo(padL+plotW,padT+plotH);
+      ctx.closePath();
+      ctx.fill();
     }
-    ctx.fillStyle='#6d747d';ctx.font='10px Consolas,monospace';
-    ctx.fillText('0 Hz',6,H-4);
-    ctx.fillText('Nyquist',W-46,H-4);
+    wave(s['in'],0,'rgba(255,190,80,0.40)');
+    wave(s['res'],harmGain,'rgba(77,216,230,0.55)');
+    // X 轴频率刻度(线性,每 5kHz)
+    ctx.fillStyle='#6d747d';ctx.font='10px Consolas,monospace';ctx.textAlign='center';
+    for(var f=0;f<=fHi;f+=5000){ctx.fillText(fmtFreq(f),padL+f/fHi*plotW,padT+plotH+14);}
+    // Y 轴 dBFS 刻度(响度)
+    ctx.textAlign='right';
+    for(var db=-120;db<=0;db+=20){ctx.fillText(db+' dBFS',padL-5,Y(db)+3);}
+    ctx.textAlign='left';
+    // 谐波增益角标(仅放大时显示)
+    if(harmGain>0){
+      ctx.fillStyle='rgba(10,12,14,0.7)';ctx.fillRect(6,6,104,16);
+      ctx.fillStyle='#4dd8e6';ctx.fillText('谐波 +'+harmGain+' dB',12,18);
+    }
   }catch(e){}
 }
-function roundRect(ctx,x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
+document.getElementById('harmgain').oninput=function(e){harmGain=+e.target.value;document.getElementById('harmgain-v').textContent=(harmGain>0?'+':'')+harmGain+' dB'};
 /* ===== 水位历史曲线（观察窗口 = X 轴时间范围，Y 刻度 = 0 自动 / 固定满刻度） ===== */
 async function drawHist(){
   try{
-    var r=await fetch('/api/history?range='+range);var s=await r.json();
+    var r=await fetch('/api/history?range=600');var s=await r.json();
     var pts=s.points||[];
     var cv=document.getElementById('histcv'),ctx=cv.getContext('2d');
     var dpr=window.devicePixelRatio||1;
@@ -551,16 +521,13 @@ async function drawHist(){
     }
     var t0=pts[0][0],t1=pts[pts.length-1][0];
     var tspan=Math.max(1,t1-t0);
-    // Y 范围：scale=0 自动（数据峰值上浮 15% 对齐 1024），否则固定满刻度
-    var ymax=scale;
-    if(!ymax){
-      ymax=2048;
-      for(var pi=0;pi<pts.length;pi++){
-        if(pts[pi][1]>ymax)ymax=pts[pi][1];
-        if(pts[pi][2]>ymax)ymax=pts[pi][2];
-      }
-      ymax=Math.ceil(ymax*1.15/1024)*1024;
+    // Y 范围：自动（数据峰值上浮 15% 对齐 1024）
+    var ymax=2048;
+    for(var pi=0;pi<pts.length;pi++){
+      if(pts[pi][1]>ymax)ymax=pts[pi][1];
+      if(pts[pi][2]>ymax)ymax=pts[pi][2];
     }
+    ymax=Math.ceil(ymax*1.15/1024)*1024;
     var padR=48,padB=16;
     var X=function(t){return 2+(t-t0)/tspan*(W-padR-4)};
     var Y=function(v){return H-padB-(Math.max(0,Math.min(v,ymax))/ymax)*(H-padB-6)};
@@ -589,12 +556,11 @@ async function drawHist(){
     ctx.textAlign='right';ctx.fillText('现在',W-padR,H-3);ctx.textAlign='left';
   }catch(e){}
 }
-window.onresize=function(){draw();drawHist()}
+window.onresize=function(){drawSpectrum();drawHist()}
 setInterval(pollStatus,2000);   // 状态轮询(表头/LED)
-setInterval(draw,100);          // 传递曲线轨迹(快速刷新)
-setInterval(drawWaterfall,100); // 频谱瀑布(快速刷新)
+setInterval(drawSpectrum,100);  // 频谱律动(1/3 倍频程,快速刷新)
 setInterval(drawHist,2000);     // 水位历史曲线(慢速刷新)
-pollStatus();draw();drawHist();
+pollStatus();drawSpectrum();drawHist();
 </script>
 )HTML";
 
@@ -694,6 +660,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             "\"srcTaps\":%d,"
             "\"underRecent\":%d,"
             "\"tubeOn\":%d,\"tubeWarmth\":%.2f,"
+            "\"bridgeOn\":%d,"
             "\"targetPid\":%u,\"targetActive\":%d}",
             wm, target, (unsigned long long)floorM, (unsigned long long)wmMult,
             u, d, (double)g_p.peak->load(std::memory_order_relaxed),
@@ -712,6 +679,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             underRecent,
             g_p.tubeOn->load(std::memory_order_relaxed) ? 1 : 0,
             (double)g_p.tubeWarmth->load(std::memory_order_relaxed),
+            g_p.bridgeOn->load(std::memory_order_relaxed) ? 1 : 0,
             (unsigned)g_p.targetPid->load(std::memory_order_relaxed),
             g_p.targetActive->load(std::memory_order_relaxed) ? 1 : 0);
         sendResponse(s, "200 OK", "application/json; charset=utf-8", body, len);
@@ -740,15 +708,19 @@ static void handleRequest(SOCKET s, char* req, int n) {
                 g_p.passthroughReq->store(v != 0 ? 1 : 2, std::memory_order_relaxed);
             } else if (strstr(body, "action=src")) {
                 g_p.srcTaps->store(v == 32 ? 32 : 0, std::memory_order_relaxed);
-            } else if (strstr(body, "action=tube")) {
-                g_p.tubeOn->store(v != 0, std::memory_order_relaxed);
             } else if (strstr(body, "action=tubewarmth")) {
+                // 必须排在 action=tube 之前：strstr 前缀匹配会把 action=tubewarmth
+                // 误吞进 action=tube（暖度滑块失效且误开染色）。
                 float w = (float)v / 100.0f;
                 if (w < 0.0f) w = 0.0f;
                 if (w > 1.0f) w = 1.0f;
                 g_p.tubeWarmth->store(w, std::memory_order_relaxed);
-            } else if (strstr(body, "action=rebuild")) {
-                g_p.needRestart->store(true);
+            } else if (strstr(body, "action=tube")) {
+                g_p.tubeOn->store(v != 0, std::memory_order_relaxed);
+            } else if (strstr(body, "action=bridge")) {
+                // ASIO Bridge 开关：开=桥接(静音目标端点), 关=停止(恢复系统音量)
+                g_p.bridgeOn->store(v != 0, std::memory_order_relaxed);
+                if (v == 0) g_p.needRestart->store(true);   // 关闭时立即断开会话
             } else if (strstr(body, "action=reset")) {
                 g_p.resetReq->store(true);
             }
@@ -786,30 +758,13 @@ static void handleRequest(SOCKET s, char* req, int n) {
         }
         body += "]}";
         sendResponse(s, "200 OK", "application/json; charset=utf-8", body.c_str(), (int)body.size());
-    } else if (strcmp(path, "/api/tubexy") == 0) {
-        // 300B 传递曲线 XY 轨迹(最近 128 点,从旧到新,扁平数组 [x1,y1,x2,y2,...])
-        char body[4096];
-        int off = 0;
-        uint64_t w = g_p.tubeXYWrite->load(std::memory_order_acquire);
-        int n = 128;
-        if (w < (uint64_t)n) n = (int)w;
-        off += snprintf(body + off, sizeof(body) - off, "{\"xy\":[");
-        bool first = true;
-        uint64_t start = (w >= (uint64_t)n) ? (w - (uint64_t)n) : 0;
-        for (uint64_t i = start; i < w; ++i) {
-            const TubeXYPoint& p = (*g_p.tubeXY)[i % 256];
-            off += snprintf(body + off, sizeof(body) - off, "%s%.4f,%.4f",
-                            first ? "" : ",", p.x, p.y);
-            first = false;
-        }
-        off += snprintf(body + off, sizeof(body) - off, "]}");
-        sendResponse(s, "200 OK", "application/json; charset=utf-8", body, off);
     } else if (strcmp(path, "/api/spectrum") == 0) {
-        // 频谱(瀑布图):输入频谱(音乐原始)+ 残差频谱(新增谐波),各 128 bin
+        // 频谱:输入频谱(音乐原始)+ 残差频谱(新增谐波),各 128 bin;rate=采样率(供 1/3 倍频程映射)
         char body[8192];
         int off = 0;
-        off += snprintf(body + off, sizeof(body) - off, "{\"seq\":%llu,\"in\":[",
-                        (unsigned long long)g_p.specSeq->load(std::memory_order_acquire));
+        off += snprintf(body + off, sizeof(body) - off, "{\"seq\":%llu,\"rate\":%ld,\"in\":[",
+                        (unsigned long long)g_p.specSeq->load(std::memory_order_acquire),
+                        (long)g_p.asioRate->load(std::memory_order_relaxed));
         for (int k = 0; k < 128; ++k)
             off += snprintf(body + off, sizeof(body) - off, "%s%.3f", k ? "," : "",
                             (*g_p.specIn)[k]);

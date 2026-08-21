@@ -1,9 +1,11 @@
-# Test renderer: play 440Hz sine into a render endpoint (default CABLE Input) for N seconds.
-# Usage: pwsh -File test_render.ps1 [-Seconds 10] [-Device "CABLE Input"] [-Delay 2]
+# Test renderer: play 440Hz sine into a render endpoint for N seconds.
+# With process loopback the bridge taps by PID, so render to the default device
+# (empty -Device) or any -Device substring; the bridge picks up this process.
+# Usage: pwsh -File test_render.ps1 [-Seconds 10] [-Device ""] [-Delay 2]
 # NOTE: keep this file ASCII-only (Windows PowerShell 5.1 reads BOM-less scripts as ANSI).
 param(
     [int]$Seconds = 10,
-    [string]$Device = "CABLE Input",
+    [string]$Device = "",
     [int]$Delay = 2
 )
 
@@ -20,6 +22,7 @@ public class MMDeviceEnumeratorComObject { }
 [ComImport, Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
 public interface IMMDeviceEnumerator {
     [PreserveSig] int EnumAudioEndpoints(int dataFlow, int stateMask, out IMMDeviceCollection devices);
+    [PreserveSig] int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice device);
 }
 
 [ComImport, Guid("0BD7A1BE-7A1A-44DB-8397-CC5392387B5E"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
@@ -96,26 +99,34 @@ public static class RenderTest {
             CoInitializeEx(IntPtr.Zero, 0); // MTA
             var t2 = Type.GetTypeFromCLSID(new Guid("BCDE0395-E52F-467C-8E3D-C4579291692E"));
             var en = (IMMDeviceEnumerator)Activator.CreateInstance(t2);
-            IMMDeviceCollection coll;
-            en.EnumAudioEndpoints(0, 1, out coll);
-            uint n; coll.GetCount(out n);
             IMMDevice dev = null;
             PROPERTYKEY pk = new PROPERTYKEY {
                 fmtid = new Guid("a45c254e-df1c-4efd-8020-67d146a850e0"), pid = 14
             };
-            for (uint i = 0; i < n; i++) {
-                IMMDevice d; coll.Item(i, out d);
-                IPropertyStore st; d.OpenPropertyStore(0, out st);
-                PROPVARIANT pv = new PROPVARIANT();
-                string name = "";
-                if (st.GetValue(ref pk, out pv) == 0 && pv.vt == 31)
-                    name = Marshal.PtrToStringUni(pv.pwszVal);
-                PropVariantClear(ref pv);
-                Marshal.FinalReleaseComObject(st);
-                if (name.Contains(deviceSubstr)) { dev = d; break; }
-                Marshal.FinalReleaseComObject(d);
+            if (deviceSubstr == null || deviceSubstr.Length == 0) {
+                en.GetDefaultAudioEndpoint(0, 1, out dev);   // eRender, eConsole
+            } else {
+                IMMDeviceCollection coll;
+                en.EnumAudioEndpoints(0, 1, out coll);
+                uint n; coll.GetCount(out n);
+                for (uint i = 0; i < n; i++) {
+                    IMMDevice d; coll.Item(i, out d);
+                    IPropertyStore st; d.OpenPropertyStore(0, out st);
+                    PROPVARIANT pv = new PROPVARIANT();
+                    string name = "";
+                    if (st.GetValue(ref pk, out pv) == 0 && pv.vt == 31)
+                        name = Marshal.PtrToStringUni(pv.pwszVal);
+                    PropVariantClear(ref pv);
+                    Marshal.FinalReleaseComObject(st);
+                    if (name.Contains(deviceSubstr)) { dev = d; break; }
+                    Marshal.FinalReleaseComObject(d);
+                }
+                Marshal.FinalReleaseComObject(coll);
             }
-            if (dev == null) { sb.AppendLine("未找到端点: " + deviceSubstr); CoUninitialize(); return; }
+            if (dev == null) {
+                sb.AppendLine("未找到端点: " + (deviceSubstr.Length == 0 ? "(默认渲染设备)" : deviceSubstr));
+                CoUninitialize(); return;
+            }
 
             Guid iidAc = new Guid("1CB9AD4C-DBFA-4c32-B178-C2F568A703B2");
             object o1; dev.Activate(ref iidAc, 23, IntPtr.Zero, out o1);

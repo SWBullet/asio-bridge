@@ -1259,6 +1259,7 @@ int wmain(int argc, wchar_t** argv) {
     std::atomic<uint64_t> drainEvent{0};   // 快排丢弃量（监视线程消费打印后清零）
     std::atomic<float> peak{0.0f};
     std::atomic<bool> needRestart{false};
+    std::atomic<bool> bridgeOn{true};   // ASIO Bridge 开关：true=桥接(端点静音), false=关闭(系统音量恢复)
 
     // 桥内延迟实测（Core Audio AudioTimeStamp 模型）：
     // 采集线程把「已写采样数 → QPC」时间戳发布到环；ASIO 回调按消费前沿
@@ -1286,8 +1287,6 @@ int wmain(int argc, wchar_t** argv) {
     FractionalResampler rs;
     std::vector<float> rsIn_;
     std::vector<TubeWarmth> tubeState;   // 每声道一个 300B 染色实例(含 DC blocker 状态)
-    std::vector<TubeXYPoint> tubeXY(256); // 传递曲线 XY 轨迹环形缓冲(256 点,供控制台观察窗)
-    std::atomic<uint64_t> tubeXYWrite{0};// XY 轨迹写入计数
     // 频谱观察(瀑布图):输入频谱(音乐原始)+ 残差频谱(新增谐波),各 kFftBins 个 bin
     std::vector<float> specIn(kFftBins), specRes(kFftBins);
     std::atomic<uint64_t> specSeq{0};    // 频谱更新序号
@@ -1332,10 +1331,10 @@ int wmain(int argc, wchar_t** argv) {
     BridgeStatsPtrs web = {
         &written, &consumed, &underruns, &lastUnderrunAt, &dropped, &peak,
         &wMult, &floorMult, &driftPpm, &needRestart, &ditherReq, &ditherOn, &resetReq,
-        &g_stop, &asioRate, &asioBuffer, &asioType, &capRate, &wmNow,
+        &bridgeOn, &g_stop, &asioRate, &asioBuffer, &asioType, &capRate, &wmNow,
         &totalLatencyMs,
         &histBuf, &histWrite, &ratioBase, &inRate, &outRate, &passthrough, &passthroughReq,
-        &srcTaps, &tubeOn, &tubeWarmth, &tubeXY, &tubeXYWrite,
+        &srcTaps, &tubeOn, &tubeWarmth,
         &specIn, &specRes, &specSeq,
         &targetPid, &targetActive
     };
@@ -1442,6 +1441,25 @@ int wmain(int argc, wchar_t** argv) {
             RestoreEndpointMutes(endpointMutes);
             printf("[静音] 已恢复 %zu 个端点的原音量\n", n);
         }
+        // ASIO Bridge 关闭：系统音量已恢复，静默等待重新开启
+        if (!bridgeOn.load(std::memory_order_relaxed)) {
+            // 清空陈旧的会话显示值（桥已关闭，无活动会话）
+            capRate.store(0, std::memory_order_relaxed);
+            asioRate.store(0, std::memory_order_relaxed);
+            asioBuffer.store(0, std::memory_order_relaxed);
+            asioType.store(0, std::memory_order_relaxed);
+            wmNow.store(0, std::memory_order_relaxed);
+            targetActive.store(false, std::memory_order_relaxed);
+            static int offStreak = 0;
+            if ((offStreak++ % 25) == 0)
+                printf("[桥] ASIO Bridge 已关闭（系统音量已恢复），等待开启…\n");
+            {
+                ULONGLONG nowCfg = GetTickCount64();
+                if (nowCfg - lastCfgSave >= 5000) { saveConfig(); lastCfgSave = nowCfg; }
+            }
+            Sleep(200);
+            continue;
+        }
         // 速率锁采样计数（本会话，每次重建归零；比率基值跨会话保留）
         uint64_t capCb = 0, asioCb = 0, inTotS = 0, outTotS = 0;
         // 会话内环形缓冲写入计数（延迟实测用：环内前沿 → 写入时刻映射，
@@ -1518,7 +1536,9 @@ int wmain(int argc, wchar_t** argv) {
             capOk = pcap.open(pid, onData, oerr);
             if (capOk) {
                 targetPid.store(pid, std::memory_order_relaxed);
-                capCh = pcap.format().channels;
+                // 整条 DSP 链为立体声硬编码：多声道混音格式(5.1/7.1)下只取前 2 通道
+                // (前 L/R)，否则重采样器/ASIO 按 2 通道记账与采集通道数错位，音频错乱。
+                capCh = (uint16_t)std::min<uint16_t>(pcap.format().channels, 2);
                 // tap→redirect：静音目标所在渲染端点的终点主音量，消除双重声。
                 // 数值自检证明回环取点在终点主音量之前、会话静音之后：
                 // 终点静音不影响捕获（ASIO 不走 WDM 终点音量，同样不受影响）
@@ -1538,7 +1558,8 @@ int wmain(int argc, wchar_t** argv) {
             }
         }
         if (!capOk) {
-            if (first) { printf("采集打开失败: %s\n", oerr.c_str()); break; }
+            // 首次打开即失败：置 g_stop 再 break，否则 discoveryThread.join() 永久挂死
+            if (first) { printf("采集打开失败: %s\n", oerr.c_str()); g_stop.store(true); break; }
             printf("[自适应] 采集重开失败: %s（2 秒后重试）\n", oerr.c_str());
             targetPid.store(0, std::memory_order_relaxed);
             Sleep(2000);
@@ -1567,6 +1588,9 @@ int wmain(int argc, wchar_t** argv) {
         wMult.store(floorMult.load(std::memory_order_relaxed), std::memory_order_relaxed);
         lastFloorMult = floorMult.load(std::memory_order_relaxed);
         rs.reset();
+        // 在非回调线程预热 sinc 系数表（setup 首次调用算 8192 组 sin/cos），
+        // 否则首个 ASIO 回调内计算可能超时爆音。
+        rs.setup(256);
         rateLock.reset();
         wmAvg = 0.0;
 
@@ -1638,7 +1662,7 @@ int wmain(int argc, wchar_t** argv) {
                 size_t gotS = rb.read(rsIn_.data(), avail < wantS ? avail : wantS);
                 if (gotS < wantS && !cq) { underruns++; lastUnderrunAt.store(GetTickCount64(), std::memory_order_relaxed); }
                 rs.process(rsIn_.data(), gotS / 2, dst, frames);
-                // FET 染色(可选)+ 传递曲线 XY + 频谱累积(声道 0):重采样之后、浮转整之前
+                // FET 染色(可选)+ 频谱累积(声道 0):重采样之后、浮转整之前
                 {
                     if (tubeState.size() < ch) tubeState.resize(ch);
                     float w = tubeOn.load(std::memory_order_relaxed)
@@ -1657,14 +1681,8 @@ int wmain(int argc, wchar_t** argv) {
                                     g_where = "pull:fft";
                                     computeSpectrum(fftInBuf.data(), specIn.data(), fftRe.data(), fftIm.data(), kFftN);
                                     computeSpectrum(fftResBuf.data(), specRes.data(), fftRe.data(), fftIm.data(), kFftN);
-                                    specSeq.fetch_add(1, std::memory_order_relaxed);
+                                    specSeq.fetch_add(1, std::memory_order_release);
                                     fftPos = 0;
-                                }
-                                g_where = "pull:xy";
-                                if ((f & 3) == 0) {
-                                    size_t wi = tubeXYWrite.fetch_add(1, std::memory_order_relaxed);
-                                    tubeXY[wi % 256].x = x;
-                                    tubeXY[wi % 256].y = dst[i];
                                 }
                             }
                         }
