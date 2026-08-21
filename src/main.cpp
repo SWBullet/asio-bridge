@@ -109,6 +109,49 @@ static void usage() {
         "Ctrl+C 停止\n");
 }
 
+// ===== 频谱观察(瀑布图)FFT =====
+static constexpr int kFftN = 256;       // FFT 点数
+static constexpr int kFftBins = 128;    // 频率 bin 数(0..Nyquist)
+
+// 迭代 radix-2 复 FFT(就地)
+static void fftRadix2(float* re, float* im, int n) {
+    for (int i = 1, j = 0; i < n; ++i) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) { float tr = re[i]; re[i] = re[j]; re[j] = tr; float ti = im[i]; im[i] = im[j]; im[j] = ti; }
+    }
+    for (int len = 2; len <= n; len <<= 1) {
+        float ang = -6.28318530717958647692f / (float)len;
+        float wlr = cosf(ang), wli = sinf(ang);
+        for (int i = 0; i < n; i += len) {
+            float wr = 1.0f, wi = 0.0f;
+            for (int k = 0; k < len / 2; ++k) {
+                float ur = re[i + k], ui = im[i + k];
+                float vr = re[i + k + len / 2] * wr - im[i + k + len / 2] * wi;
+                float vi = re[i + k + len / 2] * wi + im[i + k + len / 2] * wr;
+                re[i + k] = ur + vr; im[i + k] = ui + vi;
+                re[i + k + len / 2] = ur - vr; im[i + k + len / 2] = ui - vi;
+                float nwr = wr * wlr - wi * wli;
+                float nwi = wr * wli + wi * wlr;
+                wr = nwr; wi = nwi;
+            }
+        }
+    }
+}
+
+// 计算频谱幅值(Hann 窗 + FFT + 幅值),mag 输出 n/2 个 bin
+static void computeSpectrum(const float* in, float* mag, float* re, float* im, int n) {
+    for (int i = 0; i < n; ++i) {
+        float wnd = 0.5f * (1.0f - cosf(6.28318530717958647692f * (float)i / (float)(n - 1)));
+        re[i] = in[i] * wnd;
+        im[i] = 0.0f;
+    }
+    fftRadix2(re, im, n);
+    for (int k = 0; k < n / 2; ++k)
+        mag[k] = sqrtf(re[k] * re[k] + im[k] * im[k]);
+}
+
 // 分数重采样器离线自检：正弦信号下验证直通精确性、速率偏移失真与饥饿行为。
 // 与真链路共用同一 FractionalResampler 实现——数值过关才允许上线。
 static int resamplerSelfTest() {
@@ -1030,6 +1073,12 @@ int wmain(int argc, wchar_t** argv) {
     std::vector<TubeWarmth> tubeState;   // 每声道一个 300B 染色实例(含 DC blocker 状态)
     std::vector<TubeXYPoint> tubeXY(256); // 传递曲线 XY 轨迹环形缓冲(256 点,供控制台观察窗)
     std::atomic<uint64_t> tubeXYWrite{0};// XY 轨迹写入计数
+    // 频谱观察(瀑布图):输入频谱(音乐原始)+ 残差频谱(新增谐波),各 kFftBins 个 bin
+    std::vector<float> specIn(kFftBins), specRes(kFftBins);
+    std::atomic<uint64_t> specSeq{0};    // 频谱更新序号
+    std::vector<float> fftInBuf(kFftN), fftResBuf(kFftN);  // 采样累积缓冲
+    std::vector<float> fftRe(kFftN), fftIm(kFftN);         // FFT 工作缓冲
+    int fftPos = 0;                      // 累积计数(ASIO 回调线程独占)
     double wmAvg = 0.0;                    // 平滑水位（主线程独占，约 20s 时间常数）
     // 时钟速率锁（双环前馈）：实测输入/输出设备速率 → ratio 基值
     RateLock rateLock;
@@ -1071,7 +1120,9 @@ int wmain(int argc, wchar_t** argv) {
         &g_stop, &asioRate, &asioBuffer, &asioType, &capRate, &wmNow,
         &totalLatencyMs,
         &histBuf, &histWrite, &ratioBase, &inRate, &outRate, &passthrough, &passthroughReq,
-        &srcTaps, &tubeOn, &tubeWarmth, &tubeXY, &tubeXYWrite, &targetPid, &targetActive
+        &srcTaps, &tubeOn, &tubeWarmth, &tubeXY, &tubeXYWrite,
+        &specIn, &specRes, &specSeq,
+        &targetPid, &targetActive
     };
     startWebConsole(web);
 
@@ -1355,24 +1406,35 @@ int wmain(int argc, wchar_t** argv) {
                 size_t gotS = rb.read(rsIn_.data(), avail < wantS ? avail : wantS);
                 if (gotS < wantS && !cq) { underruns++; lastUnderrunAt.store(GetTickCount64(), std::memory_order_relaxed); }
                 rs.process(rsIn_.data(), gotS / 2, dst, frames);
-                // 300B 电子管温暖染色(3/2 定律 + DC blocker):重采样之后、浮转整之前
-                if (tubeOn.load(std::memory_order_relaxed)) {
-                    float w = tubeWarmth.load(std::memory_order_relaxed);
-                    if (w > 0.0f) {
-                        if (tubeState.size() < ch) tubeState.resize(ch);
-                        for (size_t f = 0; f < frames; ++f)
-                            for (size_t c = 0; c < ch; ++c) {
-                                size_t i = f * ch + c;
-                                float x = dst[i];
-                                dst[i] = tubeState[c].process(x, w);
-                                // 采集声道 0 的 (x,y) 轨迹,每 4 帧采一个点(供控制台传递曲线观察窗)
-                                if (c == 0 && (f & 3) == 0) {
+                // FET 染色(可选)+ 传递曲线 XY + 频谱累积(声道 0):重采样之后、浮转整之前
+                {
+                    if (tubeState.size() < ch) tubeState.resize(ch);
+                    float w = tubeOn.load(std::memory_order_relaxed)
+                              ? tubeWarmth.load(std::memory_order_relaxed) : 0.0f;
+                    for (size_t f = 0; f < frames; ++f)
+                        for (size_t c = 0; c < ch; ++c) {
+                            size_t i = f * ch + c;
+                            float x = dst[i];
+                            if (w > 0.0f) dst[i] = tubeState[c].process(x, w);
+                            if (c == 0) {
+                                float r = dst[i] - x;   // 残差 = 新增谐波(染色关时=0)
+                                // 频谱累积(始终进行,染色关时残差为 0)
+                                fftInBuf[fftPos] = x;
+                                fftResBuf[fftPos] = r;
+                                if (++fftPos >= kFftN) {
+                                    computeSpectrum(fftInBuf.data(), specIn.data(), fftRe.data(), fftIm.data(), kFftN);
+                                    computeSpectrum(fftResBuf.data(), specRes.data(), fftRe.data(), fftIm.data(), kFftN);
+                                    specSeq.fetch_add(1, std::memory_order_relaxed);
+                                    fftPos = 0;
+                                }
+                                // 传递曲线 XY,每 4 帧采一个点
+                                if ((f & 3) == 0) {
                                     size_t wi = tubeXYWrite.fetch_add(1, std::memory_order_relaxed);
                                     tubeXY[wi % 256].x = x;
                                     tubeXY[wi % 256].y = dst[i];
                                 }
                             }
-                    }
+                        }
                 }
                 consumed += gotS;
             }

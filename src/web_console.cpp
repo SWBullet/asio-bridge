@@ -98,6 +98,9 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
 /* ===== 示波窗 ===== */
 #spark{background:#06080a;border:2px solid #5b626a;border-radius:8px;width:100%;height:220px;display:block;
   box-shadow:inset 0 3px 8px rgba(0,0,0,.85)}
+#wf{background:#06080a;border:2px solid #5b626a;border-radius:8px;width:100%;height:180px;display:block;
+  box-shadow:inset 0 3px 8px rgba(0,0,0,.85)}
+.wflegend{font-size:11px;color:#8b939c;margin-top:6px;font-family:Consolas,monospace;letter-spacing:.5px}
 #tip{position:absolute;background:rgba(20,22,26,.95);border:1px solid #565c64;border-radius:6px;padding:6px 10px;
   font-size:12px;display:none;pointer-events:none;z-index:5;line-height:1.7;font-family:Consolas,monospace}
 
@@ -164,6 +167,12 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
 <div class="panel">
   <div class="mtitle">300B TRANSFER CURVE</div>
   <div style="position:relative"><canvas id="spark"></canvas><div id="tip"></div></div>
+</div>
+
+<div class="panel">
+  <div class="mtitle">300B SPECTRUM · 谐波叠加</div>
+  <div style="position:relative"><canvas id="wf"></canvas></div>
+  <div class="wflegend"><span style="color:#ffbe50">■ 音乐原始</span> <span style="color:#4dd8e6">■ 新增谐波</span></div>
 </div>
 
 <div class="panel">
@@ -476,10 +485,47 @@ async function draw(){
     ctx.fillText('输出 y ↑',6,12);
   }catch(e){}
 }
+var wfRows=[];   // 频谱历史(每行 {in:[...], res:[...]},最多 120 行)
+async function drawWaterfall(){
+  try{
+    var r=await fetch('/api/spectrum');var s=await r.json();
+    if(!s['in']||!s['in'].length)return;
+    wfRows.push({in:s['in'],res:s['res']});
+    if(wfRows.length>120)wfRows.shift();
+    var cv=document.getElementById('wf'),ctx=cv.getContext('2d');
+    var dpr=window.devicePixelRatio||1;
+    var rect=cv.getBoundingClientRect();
+    if(cv.width!==Math.round(rect.width*dpr)){cv.width=Math.round(rect.width*dpr);cv.height=Math.round(rect.height*dpr);}
+    var W=rect.width,H=rect.height;ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.clearRect(0,0,W,H);
+    var bins=wfRows[0]['in'].length;
+    var rows=wfRows.length;
+    var rh=H/120;            // 行高
+    var bw=W/bins;           // bin 宽
+    // 从旧(上)到新(下)绘制
+    for(var ri=0;ri<rows;ri++){
+      var y=H-(rows-ri)*rh;
+      if(y<0)y=0;
+      for(var k=0;k<bins;k++){
+        var x=k*bw;
+        // 音乐原始:暖黄
+        var aIn=Math.min(1,wfRows[ri]['in'][k]/45);
+        if(aIn>0.015){ctx.fillStyle='rgba(255,190,80,'+aIn.toFixed(3)+')';ctx.fillRect(x,y,bw+0.5,rh+0.5);}
+        // 新增谐波:青,半透明叠加
+        var aRes=Math.min(1,wfRows[ri]['res'][k]/4.5);
+        if(aRes>0.015){ctx.fillStyle='rgba(77,216,230,'+aRes.toFixed(3)+')';ctx.fillRect(x,y,bw+0.5,rh+0.5);}
+      }
+    }
+    ctx.fillStyle='#6d747d';ctx.font='10px Consolas,monospace';
+    ctx.fillText('0 Hz',6,H-4);
+    ctx.fillText('Nyquist',W-46,H-4);
+  }catch(e){}
+}
 function roundRect(ctx,x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
 window.onresize=function(){draw()}
 setInterval(pollStatus,2000);   // 状态轮询(表头/LED)
 setInterval(draw,100);          // 传递曲线轨迹(快速刷新)
+setInterval(drawWaterfall,100); // 频谱瀑布(快速刷新)
 pollStatus();draw();
 </script></body></html>
 )HTML";
@@ -628,6 +674,21 @@ static void handleRequest(SOCKET s, char* req, int n) {
                             first ? "" : ",", p.x, p.y);
             first = false;
         }
+        off += snprintf(body + off, sizeof(body) - off, "]}");
+        sendResponse(s, "200 OK", "application/json; charset=utf-8", body, off);
+    } else if (strcmp(path, "/api/spectrum") == 0) {
+        // 频谱(瀑布图):输入频谱(音乐原始)+ 残差频谱(新增谐波),各 128 bin
+        char body[8192];
+        int off = 0;
+        off += snprintf(body + off, sizeof(body) - off, "{\"seq\":%llu,\"in\":[",
+                        (unsigned long long)g_p.specSeq->load(std::memory_order_acquire));
+        for (int k = 0; k < 128; ++k)
+            off += snprintf(body + off, sizeof(body) - off, "%s%.3f", k ? "," : "",
+                            (*g_p.specIn)[k]);
+        off += snprintf(body + off, sizeof(body) - off, "],\"res\":[");
+        for (int k = 0; k < 128; ++k)
+            off += snprintf(body + off, sizeof(body) - off, "%s%.4f", k ? "," : "",
+                            (*g_p.specRes)[k]);
         off += snprintf(body + off, sizeof(body) - off, "]}");
         sendResponse(s, "200 OK", "application/json; charset=utf-8", body, off);
     } else {

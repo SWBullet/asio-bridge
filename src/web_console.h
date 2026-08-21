@@ -50,6 +50,9 @@ struct BridgeStatsPtrs {
     std::atomic<float>* tubeWarmth;        // 染色量 0~1
     std::vector<TubeXYPoint>* tubeXY;      // 300B 传递曲线 XY 轨迹环形缓冲
     std::atomic<uint64_t>* tubeXYWrite;    // XY 轨迹写入计数
+    std::vector<float>* specIn;            // 输入频谱(音乐原始)
+    std::vector<float>* specRes;           // 残差频谱(新增谐波)
+    std::atomic<uint64_t>* specSeq;        // 频谱更新序号
     std::atomic<unsigned long>* targetPid; // Bridge 采集目标进程 PID
     std::atomic<bool>* targetActive;       // 目标进程活跃状态
 };
