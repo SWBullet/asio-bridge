@@ -10,6 +10,12 @@ struct HistPoint {
     uint32_t target;   // 目标
 };
 
+// 300B 传递曲线 XY 轨迹点（输入 x → 输出 y，供控制台观察窗）
+struct TubeXYPoint {
+    float x;
+    float y;
+};
+
 // 桥的共享状态指针集：HTTP 控制台线程只读写这些原子量，绝不接触 COM
 struct BridgeStatsPtrs {
     std::atomic<uint64_t>* written;
@@ -42,6 +48,8 @@ struct BridgeStatsPtrs {
     std::atomic<int>* srcTaps;             // 重采样质量档：0=线性 32=sinc
     std::atomic<bool>* tubeOn;             // 300B 电子管染色开关
     std::atomic<float>* tubeWarmth;        // 染色量 0~1
+    std::vector<TubeXYPoint>* tubeXY;      // 300B 传递曲线 XY 轨迹环形缓冲
+    std::atomic<uint64_t>* tubeXYWrite;    // XY 轨迹写入计数
     std::atomic<unsigned long>* targetPid; // Bridge 采集目标进程 PID
     std::atomic<bool>* targetActive;       // 目标进程活跃状态
 };

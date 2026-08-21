@@ -1028,6 +1028,8 @@ int wmain(int argc, wchar_t** argv) {
     FractionalResampler rs;
     std::vector<float> rsIn_;
     std::vector<TubeWarmth> tubeState;   // 每声道一个 300B 染色实例(含 DC blocker 状态)
+    std::vector<TubeXYPoint> tubeXY(256); // 传递曲线 XY 轨迹环形缓冲(256 点,供控制台观察窗)
+    std::atomic<uint64_t> tubeXYWrite{0};// XY 轨迹写入计数
     double wmAvg = 0.0;                    // 平滑水位（主线程独占，约 20s 时间常数）
     // 时钟速率锁（双环前馈）：实测输入/输出设备速率 → ratio 基值
     RateLock rateLock;
@@ -1069,7 +1071,7 @@ int wmain(int argc, wchar_t** argv) {
         &g_stop, &asioRate, &asioBuffer, &asioType, &capRate, &wmNow,
         &totalLatencyMs,
         &histBuf, &histWrite, &ratioBase, &inRate, &outRate, &passthrough, &passthroughReq,
-        &srcTaps, &tubeOn, &tubeWarmth, &targetPid, &targetActive
+        &srcTaps, &tubeOn, &tubeWarmth, &tubeXY, &tubeXYWrite, &targetPid, &targetActive
     };
     startWebConsole(web);
 
@@ -1309,8 +1311,17 @@ int wmain(int argc, wchar_t** argv) {
                     if (w > 0.0f) {
                         if (tubeState.size() < ch) tubeState.resize(ch);
                         for (size_t f = 0; f < frames; ++f)
-                            for (size_t c = 0; c < ch; ++c)
-                                dst[f * ch + c] = tubeState[c].process(dst[f * ch + c], w);
+                            for (size_t c = 0; c < ch; ++c) {
+                                size_t i = f * ch + c;
+                                float x = dst[i];
+                                dst[i] = tubeState[c].process(x, w);
+                                // 采集声道 0 的 (x,y) 轨迹,每 4 帧采一个点(供控制台传递曲线观察窗)
+                                if (c == 0 && (f & 3) == 0) {
+                                    size_t wi = tubeXYWrite.fetch_add(1, std::memory_order_relaxed);
+                                    tubeXY[wi % 256].x = x;
+                                    tubeXY[wi % 256].y = dst[i];
+                                }
+                            }
                     }
                 }
                 consumed += gotS;

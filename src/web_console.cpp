@@ -162,7 +162,7 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
 </div>
 
 <div class="panel">
-  <div class="mtitle">WATERMARK SCOPE</div>
+  <div class="mtitle">300B TRANSFER CURVE</div>
   <div style="position:relative"><canvas id="spark"></canvas><div id="tip"></div></div>
 </div>
 
@@ -223,6 +223,7 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
 <script>
 var firstInit=true;
 var range=600, scale=0;
+var tubeWarmthVal=0.3;   // 当前暖度(供传递曲线静态曲线计算)
 function fmt(n){return n.toLocaleString()}
 function setLed(el,on,amber){el.className='tube '+(on?(amber?'on dim':'on'):'bad')}
 function tubeSpan(id){return '<span class="tube" id="'+id+'"><span class="glass"></span><span class="getter"></span><span class="fil f1"></span><span class="fil f2"></span><span class="pin p1"></span><span class="pin p2"></span></span>'}
@@ -365,6 +366,7 @@ async function pollStatus(){
     gWm.mark=s.target;
     gWm.tgt=Math.min(gWm.max,Math.max(0,s.watermark));
     gLat.tgt=s.latencyMs>0?Math.min(300,s.latencyMs):0;
+    tubeWarmthVal=(typeof s.tubeWarmth==='number')?s.tubeWarmth:0.3;
     setLed(document.getElementById('h-asio'),s.asioRate>0);
     setLed(document.getElementById('h-cap'),s.targetActive,s.targetPid&&!s.targetActive);
     document.getElementById('leds').innerHTML=
@@ -423,72 +425,61 @@ document.getElementById('reset').onclick=function(){this.classList.add('flash');
 
 async function draw(){
   try{
-    var r=await fetch('/api/history?range='+range);var s=await r.json();
-    var pts=s.points;
+    var r=await fetch('/api/tubexy');var s=await r.json();
+    var xy=s.xy||[];
     var cv=document.getElementById('spark'),ctx=cv.getContext('2d');
     var dpr=window.devicePixelRatio||1;
     var rect=cv.getBoundingClientRect();
     if(cv.width!==Math.round(rect.width*dpr)){cv.width=Math.round(rect.width*dpr);cv.height=Math.round(rect.height*dpr);}
     var W=rect.width,H=rect.height;ctx.setTransform(dpr,0,0,dpr,0,0);
     ctx.clearRect(0,0,W,H);
-    var mx=scale;
-    if(!mx){ mx=1024; for(var i=0;i<pts.length;i++){ if(pts[i][1]>mx)mx=pts[i][1]; if(pts[i][2]>mx)mx=pts[i][2]; } }
-    var Y=function(v){return H-(v/mx)*H}
-    var px=function(i){return pts.length<2?W:i/(pts.length-1)*W}
-    var tg=pts.length?pts[pts.length-1][2]:0;
-    var danger=1024;
-    if(danger<mx){ctx.fillStyle='rgba(248,81,73,0.08)';ctx.fillRect(0,Y(danger),W,H-Y(danger));}
-    var hi=Math.min(tg*1.5,mx), lo=Math.min(danger,mx);
-    if(hi>lo){ctx.fillStyle='rgba(63,185,80,0.08)';ctx.fillRect(0,Y(hi),W,Y(lo)-Y(hi));}
-    ctx.strokeStyle='rgba(255,184,74,0.75)';ctx.setLineDash([5,5]);ctx.lineWidth=1;
-    ctx.beginPath();ctx.moveTo(0,Y(tg));ctx.lineTo(W,Y(tg));ctx.stroke();ctx.setLineDash([]);
-    if(pts.length>1){
-      ctx.beginPath();ctx.moveTo(px(0),Y(pts[0][1]));
-      for(var i=1;i<pts.length;i++)ctx.lineTo(px(i),Y(pts[i][1]));
-      var g=ctx.createLinearGradient(0,0,0,H);
-      g.addColorStop(0,'rgba(255,190,80,0.22)');g.addColorStop(1,'rgba(255,190,80,0)');
-      ctx.strokeStyle='#ffbe50';ctx.lineWidth=1.6;ctx.stroke();
-      ctx.lineTo(W,H);ctx.lineTo(px(0),H);ctx.closePath();ctx.fillStyle=g;ctx.fill();
-      var lv=pts[pts.length-1][1];
-      ctx.beginPath();ctx.arc(W,Y(lv),6,0,6.283);ctx.fillStyle='rgba(255,190,80,0.25)';ctx.fill();
-      ctx.beginPath();ctx.arc(W,Y(lv),3,0,6.283);ctx.fillStyle='#ffd27f';ctx.fill();
-      ctx.fillStyle='#b9c0c8';ctx.font='12px Consolas,monospace';
-      ctx.fillText(lv.toLocaleString(),W-64,Math.max(12,Y(lv)-8));
+    var LO=-1.2, HI=1.2;
+    var X=function(x){return (x-LO)/(HI-LO)*W};
+    var Y=function(y){return H-(y-LO)/(HI-LO)*H};
+    // 轴线
+    ctx.strokeStyle='rgba(154,162,172,0.15)';ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(X(0),0);ctx.lineTo(X(0),H);ctx.stroke();
+    ctx.beginPath();ctx.moveTo(0,Y(0));ctx.lineTo(W,Y(0));ctx.stroke();
+    // 对角线 y=x(线性参考)
+    ctx.strokeStyle='rgba(154,162,172,0.35)';ctx.setLineDash([4,4]);
+    ctx.beginPath();ctx.moveTo(X(LO),Y(LO));ctx.lineTo(X(HI),Y(HI));ctx.stroke();ctx.setLineDash([]);
+    // 静态 3/2 定律曲线
+    var bias=12.5/(1+4*tubeWarmthVal);
+    var b=Math.sqrt(bias);
+    ctx.strokeStyle='#ffd27f';ctx.lineWidth=2;
+    ctx.beginPath();
+    var firstP=true;
+    for(var xi=LO;xi<=HI;xi+=0.005){
+      var v=bias+xi;
+      var yi=(v<=0)?(-bias/1.5):((v*Math.sqrt(v)-bias*b)/(1.5*b));
+      var px=X(xi),py=Y(yi);
+      if(firstP){ctx.moveTo(px,py);firstP=false;}else ctx.lineTo(px,py);
     }
-    if(hoverX>=0 && pts.length>1){
-      var i=Math.round(hoverX/W*(pts.length-1));i=Math.max(0,Math.min(pts.length-1,i));
-      var x=px(i),p=pts[i];
-      ctx.strokeStyle='rgba(154,162,172,0.6)';ctx.setLineDash([3,3]);
-      ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();ctx.setLineDash([]);
-      var tip=document.getElementById('tip');
-      tip.style.display='block';
-      tip.style.left=Math.min(W-178,x+10)+'px';
-      tip.style.top='10px';
-      tip.innerHTML='<b>'+fmtAge(pts[pts.length-1][0]-p[0])+'</b><br>水位 '+p[1].toLocaleString()+'<br>目标 '+p[2].toLocaleString();
-    }else{var t2=document.getElementById('tip');if(t2)t2.style.display='none';}
-    var last=pts.length?pts[pts.length-1][1]:0;
-    var st,sc;
-    if(last<danger){st='水位过低';sc='#f85149'}
-    else if(last>tg*1.5){st='水位偏高';sc='#ffb84a'}
-    else{st='水位健康';sc='#3fb950'}
+    ctx.stroke();
+    // 实时轨迹(绿色散点,最新的更亮)
+    if(xy.length>=4){
+      var n=Math.floor(xy.length/2);
+      for(var i=0;i<n;i++){
+        var xv=xy[i*2], yv=xy[i*2+1];
+        var t=n>1?i/(n-1):1;
+        ctx.fillStyle='rgba(63,185,80,'+(0.12+0.72*t).toFixed(3)+')';
+        ctx.fillRect(X(xv)-1.5,Y(yv)-1.5,3,3);
+      }
+    }
+    // 状态标签
     ctx.fillStyle='rgba(10,12,14,0.8)';
-    roundRect(ctx,8,8,st.length*14+46,24,12);ctx.fill();
-    ctx.fillStyle=sc;ctx.beginPath();ctx.arc(20,20,4,0,6.283);ctx.fill();
-    ctx.fillStyle='#d8dde3';ctx.font='12px Segoe UI';ctx.fillText(st,32,24);
+    roundRect(ctx,8,8,118,24,12);ctx.fill();
+    ctx.fillStyle='#ffd27f';ctx.font='12px Segoe UI';
+    ctx.fillText(tubeWarmthVal>0?('染色 '+Math.round(tubeWarmthVal*100)+'%'):'染色关',18,24);
     ctx.fillStyle='#6d747d';ctx.font='11px Consolas,monospace';
-    ctx.fillText('-'+(range/60).toFixed(0)+' 分钟',8,H-8);
-    ctx.fillText('现在',W-36,H-8);
-    ctx.fillText('0',W-14,12);
-    ctx.fillText(mx.toLocaleString(),W-62,12);
+    ctx.fillText('输入 x →',W-64,H-8);
+    ctx.fillText('输出 y ↑',6,12);
   }catch(e){}
 }
 function roundRect(ctx,x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);ctx.arcTo(x+w,y,x+w,y+h,r);ctx.arcTo(x+w,y+h,x,y+h,r);ctx.arcTo(x,y+h,x,y,r);ctx.arcTo(x,y,x+w,y,r);ctx.closePath();}
-function fmtAge(sec){if(sec<60)return sec+' 秒前';if(sec<3600)return Math.floor(sec/60)+' 分钟前';return (sec/3600).toFixed(1)+' 小时前';}
-var hoverX=-1;
-document.getElementById('spark').onmousemove=function(e){var r=e.target.getBoundingClientRect();hoverX=e.clientX-r.left;draw()}
-document.getElementById('spark').onmouseleave=function(){hoverX=-1;draw()}
 window.onresize=function(){draw()}
-setInterval(function(){pollStatus();draw()},2000);
+setInterval(pollStatus,2000);   // 状态轮询(表头/LED)
+setInterval(draw,100);          // 传递曲线轨迹(快速刷新)
 pollStatus();draw();
 </script></body></html>
 )HTML";
@@ -621,6 +612,24 @@ static void handleRequest(SOCKET s, char* req, int n) {
         }
         body += "]}";
         sendResponse(s, "200 OK", "application/json; charset=utf-8", body.c_str(), (int)body.size());
+    } else if (strcmp(path, "/api/tubexy") == 0) {
+        // 300B 传递曲线 XY 轨迹(最近 128 点,从旧到新,扁平数组 [x1,y1,x2,y2,...])
+        char body[4096];
+        int off = 0;
+        uint64_t w = g_p.tubeXYWrite->load(std::memory_order_acquire);
+        int n = 128;
+        if (w < (uint64_t)n) n = (int)w;
+        off += snprintf(body + off, sizeof(body) - off, "{\"xy\":[");
+        bool first = true;
+        uint64_t start = (w >= (uint64_t)n) ? (w - (uint64_t)n) : 0;
+        for (uint64_t i = start; i < w; ++i) {
+            const TubeXYPoint& p = (*g_p.tubeXY)[i % 256];
+            off += snprintf(body + off, sizeof(body) - off, "%s%.4f,%.4f",
+                            first ? "" : ",", p.x, p.y);
+            first = false;
+        }
+        off += snprintf(body + off, sizeof(body) - off, "]}");
+        sendResponse(s, "200 OK", "application/json; charset=utf-8", body, off);
     } else {
         sendResponse(s, "200 OK", "text/html; charset=utf-8", HTML, (int)strlen(HTML));
     }
