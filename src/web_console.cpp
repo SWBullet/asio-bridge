@@ -236,6 +236,28 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
     <span id="tubewarmth-v" style="min-width:34px">30%</span>
   </div>
   <div class="ctlrow">
+    <span class="lbl">厚度与宽度</span>
+    <label class="switch"><input type="checkbox" id="thickness"><span class="track"><span class="knob"></span></span><span class="led"></span></label>
+    <span class="lbl" style="margin-left:12px">厚度</span>
+    <input type="range" id="thickness-delay" min="2" max="100" value="20" style="width:170px">
+  </div>
+  <div class="ctlrow">
+    <span class="lbl">火箭推进器</span>
+    <label class="switch"><input type="checkbox" id="booster"><span class="track"><span class="knob"></span></span><span class="led"></span></label>
+    <span class="lbl" style="margin-left:12px">增益</span>
+    <input type="range" id="booster-db" min="0" max="100" value="67" style="width:140px">
+    <span id="booster-db-v" style="min-width:44px">67%</span>
+  </div>
+  <div class="ctlrow">
+    <span class="lbl">宽度</span>
+    <span id="bank-width">
+      <button class="btn" data-v="0">关闭</button>
+      <button class="btn" data-v="1">俱乐部</button>
+      <button class="btn" data-v="2">音乐厅</button>
+      <button class="btn" data-v="3">太和殿</button>
+    </span>
+  </div>
+  <div class="ctlrow">
     <div class="launchwrap">
       <button class="launchbtn on" id="bridge"><span class="face"></span><span class="tag">BRIDGE</span></button>
       <span class="lblcap">ASIO Bridge</span>
@@ -407,14 +429,21 @@ async function pollStatus(){
     // 拨杆开关每次轮询同步实际状态（三态请求 2s 内生效，这里回读防漂移）
     document.getElementById('dither').checked=!!s.dither;
     document.getElementById('passthrough').checked=!!s.passthrough;
-    document.getElementById('bridge').classList.toggle('on',!!s.bridgeOn);
     if(firstInit){
       firstInit=false;
+      // 桥开关只初始化一次，之后由用户点击驱动（避免每 2s 轮询与点击竞争导致关不掉）
+      document.getElementById('bridge').classList.toggle('on',!!s.bridgeOn);
       document.getElementById('tube').checked=!!s.tubeOn;
       document.getElementById('tubewarmth').value=Math.round((s.tubeWarmth||0.3)*100);
       document.getElementById('tubewarmth-v').textContent=document.getElementById('tubewarmth').value+'%';
+      document.getElementById('thickness').checked=!!s.thicknessOn;
+      document.getElementById('thickness-delay').value=Math.round(s.thicknessDelay||20);
+      document.getElementById('booster').checked=!!s.boosterOn;
+      document.getElementById('booster-db').value=Math.round((s.boosterDb||12)/18*100);
+      document.getElementById('booster-db-v').textContent=document.getElementById('booster-db').value+'%';
       setBank('bank-floor',String(s.floor));
       setBank('bank-src',String(s.srcTaps||0));
+      setBank('bank-width',String(s.thicknessWidth||0));
     }
   }catch(e){}
 }
@@ -436,12 +465,18 @@ function bindBank(id,fn){
 }
 bindBank('bank-floor',function(v){ctl('action=floor&value='+v)});
 bindBank('bank-src',function(v){ctl('action=src&value='+v)});
+bindBank('bank-width',function(v){ctl('action=thicknesswidth&value='+v)});
 function ctl(body){if(!CSRF)return;fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body+'&token='+encodeURIComponent(CSRF)})}
 document.getElementById('dither').onchange=function(e){ctl('action=dither&value='+(e.target.checked?1:0))}
 document.getElementById('passthrough').onchange=function(e){ctl('action=passthrough&value='+(e.target.checked?1:0))}
 document.getElementById('tube').onchange=function(e){ctl('action=tube&value='+(e.target.checked?1:0))}
 document.getElementById('tubewarmth').oninput=function(e){document.getElementById('tubewarmth-v').textContent=e.target.value+'%'}
 document.getElementById('tubewarmth').onchange=function(e){ctl('action=tubewarmth&value='+e.target.value)}
+document.getElementById('thickness').onchange=function(e){ctl('action=thickness&value='+(e.target.checked?1:0))}
+document.getElementById('thickness-delay').onchange=function(e){ctl('action=thicknessdelay&value='+e.target.value)}
+document.getElementById('booster').onchange=function(e){ctl('action=booster&value='+(e.target.checked?1:0))}
+document.getElementById('booster-db').oninput=function(e){document.getElementById('booster-db-v').textContent=e.target.value+'%'}
+document.getElementById('booster-db').onchange=function(e){ctl('action=boosterdb&value='+e.target.value)}
 document.getElementById('bridge').onclick=function(){var on=!this.classList.contains('on');this.classList.toggle('on',on);ctl('action=bridge&value='+(on?1:0))}
 document.getElementById('reset').onclick=function(){ctl('action=reset&value=1')}
 
@@ -660,6 +695,8 @@ static void handleRequest(SOCKET s, char* req, int n) {
             "\"srcTaps\":%d,"
             "\"underRecent\":%d,"
             "\"tubeOn\":%d,\"tubeWarmth\":%.2f,"
+            "\"thicknessOn\":%d,\"thicknessDelay\":%.1f,\"thicknessWidth\":%d,"
+            "\"boosterOn\":%d,\"boosterDb\":%.1f,"
             "\"bridgeOn\":%d,"
             "\"targetPid\":%u,\"targetActive\":%d}",
             wm, target, (unsigned long long)floorM, (unsigned long long)wmMult,
@@ -679,6 +716,11 @@ static void handleRequest(SOCKET s, char* req, int n) {
             underRecent,
             g_p.tubeOn->load(std::memory_order_relaxed) ? 1 : 0,
             (double)g_p.tubeWarmth->load(std::memory_order_relaxed),
+            g_p.thicknessOn->load(std::memory_order_relaxed) ? 1 : 0,
+            (double)g_p.thicknessDelayMs->load(std::memory_order_relaxed),
+            (int)g_p.thicknessWidth->load(std::memory_order_relaxed),
+            g_p.boosterOn->load(std::memory_order_relaxed) ? 1 : 0,
+            (double)g_p.boosterDb->load(std::memory_order_relaxed),
             g_p.bridgeOn->load(std::memory_order_relaxed) ? 1 : 0,
             (unsigned)g_p.targetPid->load(std::memory_order_relaxed),
             g_p.targetActive->load(std::memory_order_relaxed) ? 1 : 0);
@@ -717,6 +759,27 @@ static void handleRequest(SOCKET s, char* req, int n) {
                 g_p.tubeWarmth->store(w, std::memory_order_relaxed);
             } else if (strstr(body, "action=tube")) {
                 g_p.tubeOn->store(v != 0, std::memory_order_relaxed);
+            } else if (strstr(body, "action=thicknessdelay")) {
+                // 必须排在 action=thickness 之前（前缀匹配）
+                float d = (float)v;
+                if (d < 2.0f) d = 2.0f;
+                if (d > 100.0f) d = 100.0f;
+                g_p.thicknessDelayMs->store(d, std::memory_order_relaxed);
+            } else if (strstr(body, "action=thicknesswidth")) {
+                int w = v;
+                if (w < 0) w = 0;
+                if (w > 3) w = 3;
+                g_p.thicknessWidth->store(w, std::memory_order_relaxed);
+            } else if (strstr(body, "action=thickness")) {
+                g_p.thicknessOn->store(v != 0, std::memory_order_relaxed);
+            } else if (strstr(body, "action=boosterdb")) {
+                // 必须排在 action=booster 之前（前缀匹配）；百分比(0~100) → dB(0~18)
+                float d = (float)v * 18.0f / 100.0f;
+                if (d < 0.0f) d = 0.0f;
+                if (d > 18.0f) d = 18.0f;
+                g_p.boosterDb->store(d, std::memory_order_relaxed);
+            } else if (strstr(body, "action=booster")) {
+                g_p.boosterOn->store(v != 0, std::memory_order_relaxed);
             } else if (strstr(body, "action=bridge")) {
                 // ASIO Bridge 开关：开=桥接(静音目标端点), 关=停止(恢复系统音量)
                 g_p.bridgeOn->store(v != 0, std::memory_order_relaxed);

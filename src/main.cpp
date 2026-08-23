@@ -2,6 +2,7 @@
 // 免虚拟声卡、免引擎混音/APO；自动静音目标端点消除双重声。
 #include "asio_render.h"
 #include "dsp_tube.h"
+#include "dsp_thickness.h"
 #include "rate_lock.h"
 #include "resampler.h"
 #include "ring_buffer.h"
@@ -1284,9 +1285,16 @@ int wmain(int argc, wchar_t** argv) {
     std::atomic<int> passthroughReq{0};              // 控制台切换请求：0=无 1=开 2=关
     std::atomic<bool> tubeOn{false};                 // 300B 电子管染色开关
     std::atomic<float> tubeWarmth{0.3f};             // 染色量 0~1(0=干净,1=明显暖)
+    std::atomic<bool> thicknessOn{false};            // 厚度与宽度开关
+    std::atomic<float> thicknessDelayMs{20.0f};      // 预延时 2~100ms
+    std::atomic<int> thicknessWidth{0};              // 宽度档位 0~3
+    std::atomic<bool> boosterOn{false};              // 火箭推进器开关(湿增益)
+    std::atomic<float> boosterDb{12.0f};             // 湿增益 0~18dB
     FractionalResampler rs;
     std::vector<float> rsIn_;
     std::vector<TubeWarmth> tubeState;   // 每声道一个 300B 染色实例(含 DC blocker 状态)
+    std::vector<ThicknessWidth> thicknessState;   // 每声道一个「厚度与宽度」(预延时+高低切)
+    float thicknessRate = 0.0f;                   // 上次滤波系数采样率(ASIO 回调独占)
     // 频谱观察(瀑布图):输入频谱(音乐原始)+ 残差频谱(新增谐波),各 kFftBins 个 bin
     std::vector<float> specIn(kFftBins), specRes(kFftBins);
     std::atomic<uint64_t> specSeq{0};    // 频谱更新序号
@@ -1335,6 +1343,8 @@ int wmain(int argc, wchar_t** argv) {
         &totalLatencyMs,
         &histBuf, &histWrite, &ratioBase, &inRate, &outRate, &passthrough, &passthroughReq,
         &srcTaps, &tubeOn, &tubeWarmth,
+        &thicknessOn, &thicknessDelayMs, &thicknessWidth,
+        &boosterOn, &boosterDb,
         &specIn, &specRes, &specSeq,
         &targetPid, &targetActive
     };
@@ -1361,6 +1371,11 @@ int wmain(int argc, wchar_t** argv) {
         if (!f) return;
         fprintf(f, "tube_on=%d\n", tubeOn.load(std::memory_order_relaxed) ? 1 : 0);
         fprintf(f, "tube_warmth=%.4f\n", tubeWarmth.load(std::memory_order_relaxed));
+        fprintf(f, "thickness_on=%d\n", thicknessOn.load(std::memory_order_relaxed) ? 1 : 0);
+        fprintf(f, "thickness_delay=%.1f\n", thicknessDelayMs.load(std::memory_order_relaxed));
+        fprintf(f, "thickness_width=%d\n", thicknessWidth.load(std::memory_order_relaxed));
+        fprintf(f, "booster_on=%d\n", boosterOn.load(std::memory_order_relaxed) ? 1 : 0);
+        fprintf(f, "booster_db=%.1f\n", boosterDb.load(std::memory_order_relaxed));
         fprintf(f, "passthrough=%d\n", passthrough.load(std::memory_order_relaxed) ? 1 : 0);
         fprintf(f, "floor=%zu\n", floorMult.load(std::memory_order_relaxed));
         fprintf(f, "src_taps=%d\n", srcTaps.load(std::memory_order_relaxed));
@@ -1381,6 +1396,26 @@ int wmain(int argc, wchar_t** argv) {
                     if (fv < 0.0f) fv = 0.0f;
                     if (fv > 1.0f) fv = 1.0f;
                     tubeWarmth.store(fv, std::memory_order_relaxed);
+                }
+                else if (!strcmp(key, "thickness_on")) thicknessOn.store(atoi(val) != 0, std::memory_order_relaxed);
+                else if (!strcmp(key, "thickness_delay")) {
+                    float fv = (float)atof(val);
+                    if (fv < 2.0f) fv = 2.0f;
+                    if (fv > 100.0f) fv = 100.0f;
+                    thicknessDelayMs.store(fv, std::memory_order_relaxed);
+                }
+                else if (!strcmp(key, "thickness_width")) {
+                    int v = atoi(val);
+                    if (v < 0) v = 0;
+                    if (v > 3) v = 3;
+                    thicknessWidth.store(v, std::memory_order_relaxed);
+                }
+                else if (!strcmp(key, "booster_on")) boosterOn.store(atoi(val) != 0, std::memory_order_relaxed);
+                else if (!strcmp(key, "booster_db")) {
+                    float bv = (float)atof(val);
+                    if (bv < 0.0f) bv = 0.0f;
+                    if (bv > 18.0f) bv = 18.0f;
+                    boosterDb.store(bv, std::memory_order_relaxed);
                 }
                 else if (!strcmp(key, "passthrough")) passthrough.store(atoi(val) != 0, std::memory_order_relaxed);
                 else if (!strcmp(key, "floor")) floorMult.store((size_t)atoi(val), std::memory_order_relaxed);
@@ -1591,6 +1626,10 @@ int wmain(int argc, wchar_t** argv) {
         // 在非回调线程预热 sinc 系数表（setup 首次调用算 8192 组 sin/cos），
         // 否则首个 ASIO 回调内计算可能超时爆音。
         rs.setup(256);
+        // 预热厚度与宽度（滤波系数 + 延时缓冲分配在回调外完成）
+        if (thicknessState.size() < capCh) thicknessState.resize(capCh);
+        for (size_t tc = 0; tc < thicknessState.size(); ++tc) thicknessState[tc].setup((float)capSr);
+        thicknessRate = (float)capSr;
         rateLock.reset();
         wmAvg = 0.0;
 
@@ -1662,18 +1701,41 @@ int wmain(int argc, wchar_t** argv) {
                 size_t gotS = rb.read(rsIn_.data(), avail < wantS ? avail : wantS);
                 if (gotS < wantS && !cq) { underruns++; lastUnderrunAt.store(GetTickCount64(), std::memory_order_relaxed); }
                 rs.process(rsIn_.data(), gotS / 2, dst, frames);
-                // FET 染色(可选)+ 频谱累积(声道 0):重采样之后、浮转整之前
+                // FET 染色(可选)+ 厚度与宽度(谐波预延时) + 频谱累积(声道 0)
                 {
                     if (tubeState.size() < ch) tubeState.resize(ch);
+                    if (thicknessState.size() < ch) thicknessState.resize(ch);
+                    // 采样率变化时重算滤波/延时系数(仅在 ASIO 回调线程)
+                    float ar = (float)asio.sampleRate();
+                    if (ar != thicknessRate) {
+                        thicknessRate = ar;
+                        for (size_t tc = 0; tc < thicknessState.size(); ++tc)
+                            thicknessState[tc].setup(ar);
+                    }
                     float w = tubeOn.load(std::memory_order_relaxed)
                               ? tubeWarmth.load(std::memory_order_relaxed) : 0.0f;
+                    bool thOn = thicknessOn.load(std::memory_order_relaxed) && w > 0.0f;
+                    float thDelay = thicknessDelayMs.load(std::memory_order_relaxed);
+                    float thOff = kWidthOffsets[thicknessWidth.load(std::memory_order_relaxed) & 3];
+                    // 火箭推进器：湿增益(0~18dB)只作用于延时谐波层，干信号不动
+                    float wetGain = 1.0f;
+                    if (thOn && boosterOn.load(std::memory_order_relaxed))
+                        wetGain = powf(10.0f, boosterDb.load(std::memory_order_relaxed) * 0.05f);
                     for (size_t f = 0; f < frames; ++f)
                         for (size_t c = 0; c < ch; ++c) {
                             size_t i = f * ch + c;
                             float x = dst[i];
-                            if (w > 0.0f) dst[i] = tubeState[c].process(x, w);
+                            float y = (w > 0.0f) ? tubeState[c].process(x, w) : x;
+                            if (thOn) {
+                                // 干信号不变：仅谐波残差经预延时(含宽度差)+高低切后混回
+                                float harm = y - x;
+                                float tgt = thDelay + (c == 0 ? thOff * 0.5f : -thOff * 0.5f);
+                                dst[i] = x + thicknessState[c].process(harm, tgt, ar) * wetGain;
+                            } else {
+                                dst[i] = y;
+                            }
                             if (c == 0) {
-                                float r = dst[i] - x;   // 残差 = 新增谐波(染色关时=0)
+                                float r = dst[i] - x;   // 残差 = 实际新增谐波
                                 // 频谱累积(始终进行,染色关时残差为 0)
                                 fftInBuf[fftPos] = x;
                                 fftResBuf[fftPos] = r;

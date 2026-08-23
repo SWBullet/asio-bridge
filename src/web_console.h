@@ -43,6 +43,11 @@ struct BridgeStatsPtrs {
     std::atomic<int>* srcTaps;             // 重采样质量档：0=线性 32=sinc
     std::atomic<bool>* tubeOn;             // 300B 电子管染色开关
     std::atomic<float>* tubeWarmth;        // 染色量 0~1
+    std::atomic<bool>* thicknessOn;        // 厚度与宽度开关
+    std::atomic<float>* thicknessDelayMs;  // 预延时 2~100ms
+    std::atomic<int>* thicknessWidth;      // 宽度档位 0~3(关闭/俱乐部/音乐厅/太和殿)
+    std::atomic<bool>* boosterOn;          // 火箭推进器开关(湿增益)
+    std::atomic<float>* boosterDb;         // 湿增益 0~18dB
     std::vector<float>* specIn;            // 输入频谱(音乐原始)
     std::vector<float>* specRes;           // 残差频谱(新增谐波)
     std::atomic<uint64_t>* specSeq;        // 频谱更新序号
