@@ -25,14 +25,14 @@ AppPublisher={#MyAppPublisher}
 DefaultDirName={localappdata}\ASIO Bridge
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
-OutputDir=packaging\output
+OutputDir=output
 OutputBaseFilename=asio_bridge_setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
-ArchitecturesAllowed=x64
-ArchitecturesInstallIn64BitMode=x64
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayName={#MyAppName}
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
