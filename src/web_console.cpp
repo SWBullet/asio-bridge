@@ -1,4 +1,5 @@
 #include "web_console.h"
+#include "device_scan.h"
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -8,6 +9,20 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+// wstring → UTF-8 JSON 安全串(转义引号/反斜杠)
+static std::string ws2json(const std::wstring& w) {
+    if (w.empty()) return "";
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s((size_t)n, 0);
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    std::string out;
+    for (char c : s) {
+        if (c == '"' || c == '\\') out += '\\';
+        out += c;
+    }
+    return out;
+}
 
 // 内嵌网页：复古金属控制台（拉丝金属表头 + 机械按键 + LED 指示灯 + LCD 表头）
 static const char* HTML = R"HTML(<!DOCTYPE html>
@@ -207,6 +222,11 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
 
 <div class="panel">
   <div class="mtitle">CONTROL DECK</div>
+  <div class="ctlrow">
+    <span class="lbl">输出设备</span>
+    <select id="bank-device" style="background:#1e2226;color:#d8dde3;border:1px solid #565c64;border-radius:5px;padding:6px 8px;font-size:12px;min-width:290px;font-family:inherit"></select>
+    <button class="btn" id="devscan">刷新</button>
+  </div>
   <div class="ctlrow">
     <span class="lbl">水位下限</span>
     <span id="bank-floor">
@@ -444,6 +464,7 @@ async function pollStatus(){
       setBank('bank-floor',String(s.floor));
       setBank('bank-src',String(s.srcTaps||0));
       setBank('bank-width',String(s.thicknessWidth||0));
+      document.getElementById('bank-device').value=String(s.selectedDevice);
     }
   }catch(e){}
 }
@@ -479,7 +500,27 @@ document.getElementById('booster-db').oninput=function(e){document.getElementByI
 document.getElementById('booster-db').onchange=function(e){ctl('action=boosterdb&value='+e.target.value)}
 document.getElementById('bridge').onclick=function(){var on=!this.classList.contains('on');this.classList.toggle('on',on);ctl('action=bridge&value='+(on?1:0))}
 document.getElementById('reset').onclick=function(){ctl('action=reset&value=1')}
-
+function loadDevices(){
+  try{
+    fetch('/api/devices').then(function(r){return r.json()}).then(function(s){
+      var sel=document.getElementById('bank-device');
+      var cur=sel.value;
+      sel.innerHTML='<option value="-1">自动 (默认 ASIO)</option>';
+      var devs=s.devices||[];
+      for(var i=0;i<devs.length;i++){
+        var opt=document.createElement('option');
+        opt.value=String(i);
+        opt.textContent=devs[i].name+' ['+(devs[i].asio?'ASIO':'WASAPI')+']';
+        sel.appendChild(opt);
+      }
+      if(cur)sel.value=cur;
+    });
+  }catch(e){}
+}
+document.getElementById('bank-device').onchange=function(){ctl('action=device&value='+this.value)}
+document.getElementById('devscan').onclick=function(){ctl('action=devscan&value=1');setTimeout(loadDevices,600)}
+loadDevices();
+)HTML" R"HTML(
 var harmGain=0;    // 谐波增益(dB):默认 0(正常比例),需要时放大残差频谱观测谐波覆盖范围
 function fmtFreq(hz){
   if(hz>=1000){var v=hz/1000;v=v>=10?Math.round(v):Math.round(v*10)/10;return v+'k'}
@@ -698,6 +739,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             "\"thicknessOn\":%d,\"thicknessDelay\":%.1f,\"thicknessWidth\":%d,"
             "\"boosterOn\":%d,\"boosterDb\":%.1f,"
             "\"bridgeOn\":%d,"
+            "\"selectedDevice\":%d,"
             "\"targetPid\":%u,\"targetActive\":%d}",
             wm, target, (unsigned long long)floorM, (unsigned long long)wmMult,
             u, d, (double)g_p.peak->load(std::memory_order_relaxed),
@@ -722,6 +764,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             g_p.boosterOn->load(std::memory_order_relaxed) ? 1 : 0,
             (double)g_p.boosterDb->load(std::memory_order_relaxed),
             g_p.bridgeOn->load(std::memory_order_relaxed) ? 1 : 0,
+            (int)g_p.selectedDevice->load(std::memory_order_relaxed),
             (unsigned)g_p.targetPid->load(std::memory_order_relaxed),
             g_p.targetActive->load(std::memory_order_relaxed) ? 1 : 0);
         sendResponse(s, "200 OK", "application/json; charset=utf-8", body, len);
@@ -784,6 +827,17 @@ static void handleRequest(SOCKET s, char* req, int n) {
                 // ASIO Bridge 开关：开=桥接(静音目标端点), 关=停止(恢复系统音量)
                 g_p.bridgeOn->store(v != 0, std::memory_order_relaxed);
                 if (v == 0) g_p.needRestart->store(true);   // 关闭时立即断开会话
+            } else if (strstr(body, "action=device")) {
+                // 输出设备选择：-1=自动, 0..N-1=设备索引；切换需重建链路
+                g_p.selectedDevice->store(v, std::memory_order_relaxed);
+                g_p.needRestart->store(true);
+            } else if (strstr(body, "action=devscan")) {
+                std::string scanErr;
+                auto devs = ScanOutputDevices(scanErr);
+                {
+                    std::lock_guard<std::mutex> lk(*g_p.devicesMutex);
+                    *g_p.devices = std::move(devs);
+                }
             } else if (strstr(body, "action=reset")) {
                 g_p.resetReq->store(true);
             }
@@ -837,6 +891,26 @@ static void handleRequest(SOCKET s, char* req, int n) {
                             (*g_p.specRes)[k]);
         off += snprintf(body + off, sizeof(body) - off, "]}");
         sendResponse(s, "200 OK", "application/json; charset=utf-8", body, off);
+    } else if (strcmp(path, "/api/devices") == 0) {
+        // 输出设备列表（名称 + 后端类型）
+        std::string body = "{\"devices\":[";
+        bool first = true;
+        {
+            std::lock_guard<std::mutex> lk(*g_p.devicesMutex);
+            for (size_t i = 0; i < g_p.devices->size(); ++i) {
+                const DeviceEntry& d = (*g_p.devices)[i];
+                char tmp[640];
+                snprintf(tmp, sizeof(tmp), "%s{\"name\":\"%s\",\"asio\":%d,\"driver\":\"%s\"}",
+                         first ? "" : ",",
+                         ws2json(d.name).c_str(),
+                         d.asio ? 1 : 0,
+                         d.asioDriver.c_str());
+                body += tmp;
+                first = false;
+            }
+        }
+        body += "]}";
+        sendResponse(s, "200 OK", "application/json; charset=utf-8", body.c_str(), (int)body.size());
     } else {
         // 首页：注入 CSRF Token（位于主脚本之后、</body> 之前，加载完成即可用）
         char inj[128];

@@ -248,6 +248,17 @@ void AsioRender::shutdown() {
     }
 }
 
+OutputInfo AsioRender::info() const {
+    OutputInfo oi;
+    oi.sampleRate = sampleRate_;
+    oi.bufferSize = bufferSize_;
+    oi.sampleType = sampleType_;
+    oi.latencyMs = sampleRate_ > 0.0
+                   ? (double)outputLatency_ * 1000.0 / sampleRate_
+                   : 0.0;
+    return oi;
+}
+
 void AsioRender::bufferSwitchCB(long doubleBufferIndex, ASIOBool directProcess) {
     (void)directProcess;
     if (AsioRender* s = g_self.load(std::memory_order_acquire)) s->render(doubleBufferIndex);

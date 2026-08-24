@@ -14,6 +14,8 @@ add_executable(asio_bridge
   src/main.cpp
   src/wasapi_process_capture.cpp
   src/asio_render.cpp
+  src/wasapi_output.cpp
+  src/device_scan.cpp
   src/web_console.cpp
   ${ASIO_SDK}/common/asio.cpp
   ${ASIO_SDK}/host/asiodrivers.cpp

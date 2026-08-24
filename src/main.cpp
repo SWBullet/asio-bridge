@@ -1,6 +1,9 @@
 // Bridge: 目标应用渲染流 → (进程回环按 PID 旁路取流) → RME MADIface ASIO → ADI-2 Pro
 // 免虚拟声卡、免引擎混音/APO；自动静音目标端点消除双重声。
 #include "asio_render.h"
+#include "audio_output.h"
+#include "device_scan.h"
+#include "wasapi_output.h"
 #include "dsp_tube.h"
 #include "dsp_thickness.h"
 #include "rate_lock.h"
@@ -22,6 +25,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -1290,6 +1295,13 @@ int wmain(int argc, wchar_t** argv) {
     std::atomic<int> thicknessWidth{0};              // 宽度档位 0~3
     std::atomic<bool> boosterOn{false};              // 火箭推进器开关(湿增益)
     std::atomic<float> boosterDb{12.0f};             // 湿增益 0~18dB
+    // 输出后端共享信息（由主循环在 backend init 后写入，DSP 链/统计读取）
+    std::atomic<double> outSampleRate{44100.0};      // 实际输出采样率
+    std::atomic<double> outDeviceLatencyMs{0.0};     // 输出设备延迟(毫秒)
+    // 设备选择（控制台扫描/选择，主循环按选择创建后端）
+    std::mutex g_devMutex;
+    std::vector<DeviceEntry> g_devices;
+    std::atomic<int> g_selectedDevice{-1};           // -1=自动(默认 ASIO)
     FractionalResampler rs;
     std::vector<float> rsIn_;
     std::vector<TubeWarmth> tubeState;   // 每声道一个 300B 染色实例(含 DC blocker 状态)
@@ -1346,9 +1358,19 @@ int wmain(int argc, wchar_t** argv) {
         &thicknessOn, &thicknessDelayMs, &thicknessWidth,
         &boosterOn, &boosterDb,
         &specIn, &specRes, &specSeq,
-        &targetPid, &targetActive
+        &targetPid, &targetActive,
+        &g_devices, &g_devMutex, &g_selectedDevice
     };
     startWebConsole(web);
+    // 扫描输出设备(ASIO/WASAPI 判定)，供控制台设备列表展示
+    {
+        std::string scanErr;
+        auto devs = ScanOutputDevices(scanErr);
+        std::lock_guard<std::mutex> lk(g_devMutex);
+        g_devices = std::move(devs);
+        printf("[设备] 扫描到 %zu 个输出设备%s\n", g_devices.size(),
+               scanErr.empty() ? "" : ("（" + scanErr + "）").c_str());
+    }
     g_bridgeLive = 1;   // 自愈拉起解锁:服务主体已启动,此后崩溃值得自动重启
     if (crashTest) {    // 故意崩溃:验证 crashFilter→relaunchSelf→--respawn 全链路
         volatile int* p = nullptr;
@@ -1633,16 +1655,25 @@ int wmain(int argc, wchar_t** argv) {
         rateLock.reset();
         wmAvg = 0.0;
 
-        AsioRender asio;
-        asio.setDither(ditherOn.load(std::memory_order_relaxed));   // 含配置/控制台上次请求
+        // 按控制台选择的设备创建输出后端（-1/默认 = ASIO）
+        std::unique_ptr<AudioOutput> out;
+        {
+            std::lock_guard<std::mutex> lk(g_devMutex);
+            int sel = g_selectedDevice.load(std::memory_order_relaxed);
+            if (sel >= 0 && sel < (int)g_devices.size()) {
+                const DeviceEntry& d = g_devices[(size_t)sel];
+                if (d.asio) out = std::make_unique<AsioRender>(d.asioDriver);
+                else out = std::make_unique<WasapiOutput>(d.id);
+            }
+        }
+        if (!out) out = std::make_unique<AsioRender>(driver);
+        out->setDither(ditherOn.load(std::memory_order_relaxed));   // 含配置/控制台上次请求
         // 会话启动淡入（无咔嗒切换）：每次重建后输出从 0 线性爬升
         const size_t kFadeSamples = 2048;   // ≈23ms @88.2k 采样/秒
         size_t fadePos = 0;
-        // ASIO 设备输出延迟（帧→毫秒，ASIOGetLatencies 上报，端到端延迟表用）
-        double asioLatMs = 0.0;
         // 采集包周期（WASAPI 事件驱动引擎默认 ~10ms 周期）：命名常量替代魔法数
         const double kCapturePeriodMs = 10.0;
-        asio.setPullCallback([&](float* dst, size_t frames, size_t ch) -> size_t {
+        out->setPullCallback([&](float* dst, size_t frames, size_t ch) -> size_t {
                 if (!g_tidPull) g_tidPull = GetCurrentThreadId();   // ASIO 回调线程身份
                 g_where = "pull:entry";
                 // 恢复重新 prime：暂停→恢复后先持稳输出，等缓冲回填到 4×ASIO 缓冲。
@@ -1706,7 +1737,7 @@ int wmain(int argc, wchar_t** argv) {
                     if (tubeState.size() < ch) tubeState.resize(ch);
                     if (thicknessState.size() < ch) thicknessState.resize(ch);
                     // 采样率变化时重算滤波/延时系数(仅在 ASIO 回调线程)
-                    float ar = (float)asio.sampleRate();
+                    float ar = (float)outSampleRate.load(std::memory_order_relaxed);
                     if (ar != thicknessRate) {
                         thicknessRate = ar;
                         for (size_t tc = 0; tc < thicknessState.size(); ++tc)
@@ -1771,8 +1802,8 @@ int wmain(int argc, wchar_t** argv) {
                             QueryPerformanceCounter(&qn);
                             double ms = (double)(qn.QuadPart - (LONGLONG)st.qpc) * 1000.0 / qpcFreq;
                             // 重采样器固有延迟（sinc 15 帧≈0.34ms，线性 0）——端到端延迟补全
-                            double resamplerLatMs = (double)rs.latencyFrames() * 1000.0 / asio.sampleRate();
-                            totalLatencyMs.store((int)(ms + asioLatMs + kCapturePeriodMs + resamplerLatMs),
+                            double resamplerLatMs = (double)rs.latencyFrames() * 1000.0 / outSampleRate.load(std::memory_order_relaxed);
+                            totalLatencyMs.store((int)(ms + outDeviceLatencyMs.load(std::memory_order_relaxed) + kCapturePeriodMs + resamplerLatMs),
                                                  std::memory_order_relaxed);
                             break;
                         }
@@ -1791,24 +1822,26 @@ int wmain(int argc, wchar_t** argv) {
             return frames;
         });
 
-        if (!asio.init(driver, (double)capSr, err, reqBuffer)) {
-            printf("ASIO 初始化失败: %s（2 秒后重试）\n", err.c_str());
+        if (!out->init((double)capSr, err, reqBuffer)) {
+            printf("输出后端初始化失败: %s（2 秒后重试）\n", err.c_str());
             pcap.close();
             if (g_stop.load()) break;
             Sleep(2000);
             continue;
         }
 
-        // 控制台快照
-        asioRate.store((long)asio.sampleRate(), std::memory_order_relaxed);
-        asioBuffer.store(asio.bufferSize(), std::memory_order_relaxed);
-        asioType.store(asio.sampleType(), std::memory_order_relaxed);
-        asioLatMs = (double)asio.outputLatency() * 1000.0 / (double)asio.sampleRate();
+        // 控制台快照 + 输出共享信息(DSP 链读取)
+        OutputInfo oi = out->info();
+        outSampleRate.store(oi.sampleRate, std::memory_order_relaxed);
+        outDeviceLatencyMs.store(oi.latencyMs, std::memory_order_relaxed);
+        asioRate.store((long)oi.sampleRate, std::memory_order_relaxed);
+        asioBuffer.store(oi.bufferSize, std::memory_order_relaxed);
+        asioType.store(oi.sampleType, std::memory_order_relaxed);
 
-        printf("== 桥接运行中: Bridge(目标 PID 显示于控制台) -> MADIface ASIO -> ADI-2 Pro @ %g Hz (%s) ==\n",
-               asio.sampleRate(),
+        printf("== 桥接运行中: Bridge -> 输出后端 @ %g Hz (%s) ==\n",
+               oi.sampleRate,
                passthrough.load(std::memory_order_relaxed) ? "直通, 重采样停用" : "分数重采样");
-        const size_t neededPerBuf = (size_t)asio.bufferSize() * capCh;
+        const size_t neededPerBuf = (size_t)oi.bufferSize * capCh;
 
         // 主线程（ASIO 的 STA）绝不做阻塞式 COM 调用——实测会饿死 MADIface
         // 的 STA 回调机制导致进程崩溃。
@@ -1890,7 +1923,7 @@ int wmain(int argc, wchar_t** argv) {
                     }
                 }
                 // 数据回调 SEH 捕获（设备掉线波及回调路径）→ 与停滞同策略：等 120 秒自恢复再重建
-                if (asio.callbackCrashed()) {
+                if (out->callbackCrashed()) {
                     if (crashAt == 0) {
                         crashAt = now;
                         printf("[自适应] ASIO 数据回调捕获异常（设备掉线？），等待自恢复...\n");
@@ -1977,11 +2010,11 @@ int wmain(int argc, wchar_t** argv) {
                 {
                     int dr = ditherReq.exchange(0, std::memory_order_relaxed);
                     if (dr == 1) {
-                        asio.setDither(true);
+                        out->setDither(true);
                         ditherOn.store(true, std::memory_order_relaxed);
                         printf("[抖动] 控制台切换: TPDF 抖动开启\n");
                     } else if (dr == 2) {
-                        asio.setDither(false);
+                        out->setDither(false);
                         ditherOn.store(false, std::memory_order_relaxed);
                         printf("[抖动] 控制台切换: TPDF 抖动关闭\n");
                     }
@@ -2117,8 +2150,8 @@ int wmain(int argc, wchar_t** argv) {
         rebuildCount.fetch_add(1, std::memory_order_relaxed);
         printf("[自适应] 关闭采集端...\n");
         pcap.close();
-        printf("[自适应] 关闭 ASIO 端...\n");
-        asio.shutdown();
+        printf("[自适应] 关闭输出端...\n");
+        out->shutdown();
         rb.reset();   // 换速率后清空缓冲，避免旧速率采样残留
         if (!g_stop.load())
             printf("[自适应] 链路重建...\n");

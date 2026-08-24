@@ -1,6 +1,8 @@
 #pragma once
+#include "device_scan.h"
 #include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <vector>
 
 // 历史水位采样点（2 秒一采样）
@@ -53,6 +55,9 @@ struct BridgeStatsPtrs {
     std::atomic<uint64_t>* specSeq;        // 频谱更新序号
     std::atomic<unsigned long>* targetPid; // Bridge 采集目标进程 PID
     std::atomic<bool>* targetActive;       // 目标进程活跃状态
+    std::vector<DeviceEntry>* devices;     // 输出设备列表(控制台展示)
+    std::mutex* devicesMutex;              // 保护 devices
+    std::atomic<int>* selectedDevice;      // 选中的设备索引(-1=自动)
 };
 
 constexpr size_t kHistCap = 3600;   // 2 秒一采样 × 3600 = 2 小时

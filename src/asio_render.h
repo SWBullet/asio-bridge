@@ -2,6 +2,7 @@
 // asiosys.h 必须先于 asio.h：定义平台宏与 IEEE754_64FLOAT（ASIOSampleRate=double）
 #include "asiosys.h"
 #include "asio.h"
+#include "audio_output.h"
 #include <atomic>
 #include <cstddef>
 #include <functional>
@@ -10,18 +11,25 @@
 
 // ASIO 渲染端：加载指定驱动，按给定采样率创建输出缓冲并启动；
 // 回调中从 PullCallback 拉取 float32 交错采样，转换为驱动的原生类型。
-class AsioRender {
+class AsioRender : public AudioOutput {
 public:
+    AsioRender() = default;
+    explicit AsioRender(std::string driverName) : driverName_(std::move(driverName)) {}
     // 返回实际写入的帧数（不足时渲染端用末样本填充）
     using PullCallback = std::function<size_t(float* interleaved, size_t frames, size_t channels)>;
 
     // bufferFrames > 0 时请求该 ASIO 缓冲帧数（自动对齐驱动 min/max/粒度），0 用驱动默认
     bool init(const std::string& driverName, double sampleRate, std::string& err, long bufferFrames = 0);
-    void shutdown();
-    void setPullCallback(PullCallback cb) { pull_ = std::move(cb); }
+    // AudioOutput 接口（driverName 由构造参数给定）
+    bool init(double sampleRate, std::string& err, long bufferFrames = 0) override {
+        return init(driverName_, sampleRate, err, bufferFrames);
+    }
+    OutputInfo info() const override;
+    void shutdown() override;
+    void setPullCallback(PullCallback cb) override { pull_ = std::move(cb); }
     // TPDF 抖动开关：float→整数转换时注入 ±1LSB 三角抖动（默认关，保持纯净）。
     // 回调线程读、主线程写——显式 relaxed 原子（避免依赖隐式转换的模糊写法）
-    void setDither(bool on) { dither_.store(on, std::memory_order_relaxed); }
+    void setDither(bool on) override { dither_.store(on, std::memory_order_relaxed); }
     bool ditherEnabled() const { return dither_.load(std::memory_order_relaxed); }
 
     double sampleRate() const { return sampleRate_; }
@@ -29,7 +37,7 @@ public:
     long sampleType() const { return sampleType_; }
     size_t channels() const { return channels_; }
     // ASIO 数据回调内发生过 SEH 捕获的 AV（设备掉线波及）→ 主循环应据此触发重建
-    bool callbackCrashed() const { return callbackCrashed_.load(std::memory_order_relaxed); }
+    bool callbackCrashed() const override { return callbackCrashed_.load(std::memory_order_relaxed); }
     // ASIOGetLatencies：驱动上报的输入/输出延迟（帧）
     long inputLatency() const { return inputLatency_; }
     long outputLatency() const { return outputLatency_; }
@@ -72,6 +80,7 @@ private:
     size_t histPos_ = 0;                           // hist_ 滚动写位置（最新样本的下一格）
     std::vector<ASIOBufferInfo> bufInfos_;
     std::vector<float> scratch_;
+    std::string driverName_;                    // AudioOutput 接口用的驱动名(构造时给定)
 };
 
 // 转换核自检（独立于实例，验证 quantizeSigned 的满刻度对称性与 double 域抖动）
