@@ -8,6 +8,7 @@ CMakeFiles/
 *.log
 *.cfg
 *.raw
+*.rar
 __pycache__/
 
 *.res
