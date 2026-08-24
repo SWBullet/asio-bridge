@@ -9,3 +9,5 @@ CMakeFiles/
 *.cfg
 *.raw
 __pycache__/
+
+*.res
