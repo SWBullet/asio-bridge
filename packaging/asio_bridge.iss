@@ -46,6 +46,8 @@ Name: "autostart"; Description: "开机自动启动(计划任务, 隐藏运行)"
 [Files]
 ; 主程序(单文件, 静态链接, 无 VC++ 运行库依赖)
 Source: "..\build\Release\asio_bridge.exe"; DestDir: "{app}"; Flags: ignoreversion
+; 一键干净卸载助手
+Source: "..\packaging\output\uninstall_helper.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; 工具脚本
 Source: "..\tools\install_autostart.ps1"; DestDir: "{app}\tools"; Flags: ignoreversion
 Source: "..\tools\start_hidden.vbs"; DestDir: "{app}\tools"; Flags: ignoreversion
