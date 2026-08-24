@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(MSVC)
   add_compile_options(/W3 /utf-8)
+  # 静态链接 MSVC 运行库(/MT): 产物免装 VC++ 运行库, 单文件自包含便于分发
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
 set(ASIO_SDK ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ASIOSDK2.3)
