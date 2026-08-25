@@ -148,7 +148,7 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
 .switch .led{width:8px;height:8px;border-radius:50%;background:#3a4047;box-shadow:inset 0 1px 2px #000}
 .switch input:checked + .track + .led{background:#3fb950;box-shadow:0 0 7px rgba(63,185,80,.9)}
 .foot{margin-top:14px;text-align:center;font-size:10px;letter-spacing:3px;color:#5d646d}
-</style></head><body>)HTML" R"HTML(
+</style></head><body>
 <div class="wrap">
 <div class="topbar">
   <span class="screw s1"></span><span class="screw s2"></span><span class="screw s3"></span><span class="screw s4"></span>
@@ -305,7 +305,7 @@ function zoneColor(o,v){
   for(var i=0;i<b.length;i++)if(v<=b[i].to)return b[i].c;
   return b.length?b[b.length-1].c:'#ffd27f';
 }
-)HTML" R"HTML(function drawDial(id,o,label,valText){
+function drawDial(id,o,label,valText){
   var cv=document.getElementById(id);if(!cv)return;
   var ctx=cv.getContext('2d');
   var dpr=window.devicePixelRatio||1;
@@ -526,7 +526,7 @@ loadDevices();
 // 设备热插拔自动刷新：每 3 秒轮询设备列表（服务端在设备事件时已自动重扫，
 // 此处仅把新声卡/驱动反映到下拉框；与 /api/status 轮询节奏独立，避免频繁刷新列表）
 setInterval(loadDevices,3000);
-)HTML" R"HTML(
+
 var harmGain=0;    // 谐波增益(dB):默认 0(正常比例),需要时放大残差频谱观测谐波覆盖范围
 function fmtFreq(hz){
   if(hz>=1000){var v=hz/1000;v=v>=10?Math.round(v):Math.round(v*10)/10;return v+'k'}
