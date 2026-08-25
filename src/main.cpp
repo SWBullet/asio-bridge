@@ -1227,38 +1227,46 @@ int wmain(int argc, wchar_t** argv) {
 
     if (tone) {
         // 测试模式: 1kHz 正弦直接进 ASIO，验证 ASIO 链路
-        // 未指定 --driver 时自动选第一个可用 ASIO 驱动（注册表枚举，不加载）
-        std::string toneDriver = driver;
-        if (toneDriver.empty()) {
-            auto names = ListAsioDriverNames();
-            if (!names.empty()) {
-                toneDriver = names[0];
-                printf("[设备] 未指定 --driver，自动选择 ASIO 驱动: %s\n", toneDriver.c_str());
-            } else {
-                printf("未找到任何 ASIO 驱动（--tone 需要 ASIO）\n");
-                CoUninitialize();
-                return 1;
-            }
+        // 未指定 --driver 时自动遍历注册表所有 ASIO 驱动，逐个尝试（坏的跳过）
+        std::vector<std::string> toneCands;
+        if (!driver.empty()) toneCands.push_back(driver);
+        else toneCands = ListAsioDriverNames();
+        if (toneCands.empty()) {
+            printf("未找到任何 ASIO 驱动（--tone 需要 ASIO）\n");
+            CoUninitialize();
+            return 1;
         }
         printf("== ASIO 测试模式: 1kHz 正弦 @ %g Hz ==\n", toneRate);
-        double phase = 0.0;
-        AsioRender asio;
-        asio.setDither(ditherFlag);
-        asio.setPullCallback([&](float* dst, size_t frames, size_t ch) -> size_t {
-            for (size_t f = 0; f < frames; ++f) {
-                float s = 0.25f * (float)sin(phase);
-                phase += 2.0 * 3.14159265358979323846 * 1000.0 / toneRate;
-                if (phase > 2.0 * 3.14159265358979323846) phase -= 2.0 * 3.14159265358979323846;
-                for (size_t c = 0; c < ch; ++c) dst[f * ch + c] = s;
+        std::string toneErr;
+        bool toneOk = false;
+        for (const auto& td : toneCands) {
+            printf("[设备] 尝试 ASIO: %s\n", td.c_str());
+            double phase = 0.0;
+            AsioRender asio;
+            asio.setDither(ditherFlag);
+            asio.setPullCallback([&](float* dst, size_t frames, size_t ch) -> size_t {
+                for (size_t f = 0; f < frames; ++f) {
+                    float s = 0.25f * (float)sin(phase);
+                    phase += 2.0 * 3.14159265358979323846 * 1000.0 / toneRate;
+                    if (phase > 2.0 * 3.14159265358979323846) phase -= 2.0 * 3.14159265358979323846;
+                    for (size_t c = 0; c < ch; ++c) dst[f * ch + c] = s;
+                }
+                return frames;
+            });
+            std::string e2;
+            if (asio.init(td, toneRate, e2, reqBuffer)) {
+                printf("正在播放 1kHz 测试音，DAC 屏幕应显示 %g kHz。Ctrl+C 停止。\n",
+                       asio.sampleRate() / 1000.0);
+                while (!g_stop.load()) Sleep(100);
+                asio.shutdown();
+                toneOk = true;
+                break;
             }
-            return frames;
-        });
-        if (!asio.init(toneDriver, toneRate, err, reqBuffer)) { printf("ASIO 初始化失败: %s\n", err.c_str()); CoUninitialize(); return 1; }
-        printf("正在播放 1kHz 测试音，ADI-2 Pro 屏幕应显示 %g kHz。Ctrl+C 停止。\n", asio.sampleRate() / 1000.0);
-        while (!g_stop.load()) Sleep(100);
-        asio.shutdown();
+            printf("     初始化失败: %s\n", e2.c_str());
+        }
+        if (!toneOk) printf("所有 ASIO 驱动初始化失败: %s\n", toneErr.empty() ? "(无)" : toneErr.c_str());
         CoUninitialize();
-        return 0;
+        return toneOk ? 0 : 1;
     }
 
     // ===== 正式桥接模式（含端点速率变更自适应）=====
@@ -1669,61 +1677,57 @@ int wmain(int argc, wchar_t** argv) {
         rateLock.reset();
         wmAvg = 0.0;
 
-        // 按控制台选择的设备创建输出后端。自动适配优先级：
-        //   1. 控制台显式选择的设备
-        //   2. 用户 --driver 显式指定的 ASIO 驱动
-        //   3. 设备列表中匹配到 ASIO 的设备（模糊名匹配 + 别名表）
-        //   4. 注册表枚举到的第一个 ASIO 驱动（纯 ASIO 声卡无 WASAPI 端点时）
-        //   5. 第一个 WASAPI 独占设备
-        // 自动模式(未显式指定)选中的 ASIO 若初始化失败，降级 WASAPI 独占重试。
-        std::unique_ptr<AudioOutput> out;
-        bool outAsio = false;    // 当前后端是否为 ASIO
-        bool outAuto = true;     // 是否自动选择（非控制台/--driver 显式指定）
+        // ===== 输出后端候选构建 + 逐个尝试初始化 =====
+        // 自动适配（通用发行版）：
+        //   显式选择(控制台/--driver) → 只试用户指定的那个，失败即报错重试
+        //   自动模式 → 候选列表按优先级逐个尝试，第一个 init 成功即用：
+        //     ① 设备列表中匹配到 ASIO 的端点
+        //     ② 注册表枚举到的全部 ASIO 驱动（逐个尝试——驱动可枚举但
+        //        可能初始化失败（残留/虚拟驱动），必须跳过继续试下一个）
+        //     ③ 全部 WASAPI 独占端点（逐个尝试，第一个可用即用）
+        struct BackendCand {
+            bool        asio = false;
+            std::string driver;      // asio=true 时的 ASIO 驱动名
+            std::wstring id, name;   // asio=false 时的 WASAPI 端点
+        };
+        std::vector<BackendCand> cands;
+        bool explicitPick = false;   // 用户显式指定（不自动换候选）
         {
             std::lock_guard<std::mutex> lk(g_devMutex);
             int sel = g_selectedDevice.load(std::memory_order_relaxed);
             if (sel >= 0 && sel < (int)g_devices.size()) {
                 const DeviceEntry& d = g_devices[(size_t)sel];
-                if (d.asio) { out = std::make_unique<AsioRender>(d.asioDriver); outAsio = true; }
-                else out = std::make_unique<WasapiOutput>(d.id);
-                outAuto = false;
+                BackendCand c; c.asio = d.asio; c.driver = d.asioDriver;
+                c.id = d.id; c.name = d.name;
+                cands.push_back(std::move(c));
+                explicitPick = true;
             }
         }
-        if (!out && !driver.empty()) {
-            out = std::make_unique<AsioRender>(driver);
-            outAsio = true;
-            outAuto = false;
-            printf("[设备] 使用 --driver 指定: %s\n", driver.c_str());
+        if (!explicitPick && !driver.empty()) {
+            BackendCand c; c.asio = true; c.driver = driver; c.name = L"(--driver)";
+            cands.push_back(std::move(c));
+            explicitPick = true;
         }
-        if (!out && outAuto) {
-            // 自动：列表 ASIO 优先
-            std::lock_guard<std::mutex> lk(g_devMutex);
-            for (size_t i = 0; i < g_devices.size(); ++i)
-                if (g_devices[i].asio) {
-                    out = std::make_unique<AsioRender>(g_devices[i].asioDriver);
-                    outAsio = true;
-                    printf("[设备] 自动选择 ASIO: %s\n", g_devices[i].asioDriver.c_str());
-                    break;
-                }
-        }
-        if (!out && outAuto) {
-            // 注册表枚举（纯 ASIO 声卡无 WASAPI 端点）：不加载驱动，纯读键
-            auto names = ListAsioDriverNames();
-            if (!names.empty()) {
-                out = std::make_unique<AsioRender>(names[0]);
-                outAsio = true;
-                printf("[设备] 自动选择注册表 ASIO: %s\n", names[0].c_str());
+        if (!explicitPick) {
+            // 自动：① 列表 ASIO → ② 注册表全部 ASIO → ③ 全部 WASAPI
+            {
+                std::lock_guard<std::mutex> lk(g_devMutex);
+                for (const auto& d : g_devices)
+                    if (d.asio) { BackendCand c; c.asio = true; c.driver = d.asioDriver; c.name = d.name; cands.push_back(std::move(c)); }
+            }
+            for (const auto& n : ListAsioDriverNames()) {
+                bool dup = false;
+                for (const auto& c : cands)
+                    if (c.asio && c.driver == n) { dup = true; break; }
+                if (!dup) { BackendCand c; c.asio = true; c.driver = n; cands.push_back(std::move(c)); }
+            }
+            {
+                std::lock_guard<std::mutex> lk(g_devMutex);
+                for (const auto& d : g_devices)
+                    if (!d.asio) { BackendCand c; c.asio = false; c.id = d.id; c.name = d.name; cands.push_back(std::move(c)); }
             }
         }
-        if (!out && outAuto) {
-            // 无 ASIO → WASAPI 独占回退（第一个端点）
-            std::lock_guard<std::mutex> lk(g_devMutex);
-            if (!g_devices.empty()) {
-                out = std::make_unique<WasapiOutput>(g_devices[0].id);
-                printf("[设备] 无 ASIO，回退 WASAPI 独占: %ls\n", g_devices[0].name.c_str());
-            }
-        }
-        if (!out) {
+        if (cands.empty()) {
             printf("输出后端初始化失败: 未找到任何可用的输出设备"
                    "（无 ASIO 驱动且无 WASAPI 渲染端点）\n");
             pcap.close();
@@ -1731,13 +1735,14 @@ int wmain(int argc, wchar_t** argv) {
             Sleep(2000);
             continue;
         }
-        out->setDither(ditherOn.load(std::memory_order_relaxed));   // 含配置/控制台上次请求
+
+        // ===== 会话启动状态 + DSP 拉取回调（先注册回调再 init：ASIOStart 即拉回调）=====
         // 会话启动淡入（无咔嗒切换）：每次重建后输出从 0 线性爬升
         const size_t kFadeSamples = 2048;   // ≈23ms @88.2k 采样/秒
         size_t fadePos = 0;
         // 采集包周期（WASAPI 事件驱动引擎默认 ~10ms 周期）：命名常量替代魔法数
         const double kCapturePeriodMs = 10.0;
-        out->setPullCallback([&](float* dst, size_t frames, size_t ch) -> size_t {
+        auto pullCb = [&](float* dst, size_t frames, size_t ch) -> size_t {
                 if (!g_tidPull) g_tidPull = GetCurrentThreadId();   // ASIO 回调线程身份
                 g_where = "pull:entry";
                 // 恢复重新 prime：暂停→恢复后先持稳输出，等缓冲回填到 4×ASIO 缓冲。
@@ -1884,36 +1889,38 @@ int wmain(int argc, wchar_t** argv) {
             }
             g_where = "pull:done";   // 已出 DSP，后续若炸则在驱动侧（ASIOOutputReady/转换）
             return frames;
-        });
+        };
 
-        if (!out->init((double)capSr, err, reqBuffer)) {
-            printf("输出后端初始化失败: %s\n", err.c_str());
-            // 自动模式选中的 ASIO 失败（驱动未装/设备未接等）→ 降级 WASAPI 独占重试
-            if (outAsio && outAuto) {
-                std::unique_ptr<AudioOutput> wasapiOut;
-                {
-                    std::lock_guard<std::mutex> lk(g_devMutex);
-                    for (size_t i = 0; i < g_devices.size(); ++i)
-                        if (!g_devices[i].asio) {
-                            wasapiOut = std::make_unique<WasapiOutput>(g_devices[i].id);
-                            printf("[设备] ASIO 不可用，自动降级 WASAPI 独占: %ls\n",
-                                   g_devices[i].name.c_str());
-                            break;
-                        }
-                }
-                if (wasapiOut && wasapiOut->init((double)capSr, err, reqBuffer)) {
-                    out = std::move(wasapiOut);
-                    outAsio = false;
+        // ===== 逐个尝试候选：创建 → setPullCallback → init，第一个成功即用 =====
+        std::unique_ptr<AudioOutput> out;
+        bool outAsio = false;
+        {
+            std::string lastErr;
+            for (const auto& c : cands) {
+                if (c.asio) {
+                    out = std::make_unique<AsioRender>(c.driver);
+                    outAsio = true;
+                    printf("[设备] 尝试 ASIO: %s\n", c.driver.c_str());
                 } else {
-                    if (!wasapiOut)
-                        printf("[设备] 无可用 WASAPI 设备可降级\n");
-                    else
-                        printf("[设备] WASAPI 降级失败: %s\n", err.c_str());
+                    out = std::make_unique<WasapiOutput>(c.id);
+                    outAsio = false;
+                    printf("[设备] 尝试 WASAPI 独占: %ls\n", c.name.c_str());
                 }
+                out->setDither(ditherOn.load(std::memory_order_relaxed));
+                out->setPullCallback(pullCb);
+                std::string e2;
+                if (out->init((double)capSr, e2, reqBuffer)) break;   // 成功
+                printf("     初始化失败: %s\n", e2.c_str());
+                out.reset();   // 失败候选释放，试下一个
+                lastErr = e2;
             }
-            if (outAsio) {
-                // 仍未成功（显式指定失败 / 降级也失败）：2 秒后重试
-                printf("输出后端初始化失败: %s（2 秒后重试）\n", err.c_str());
+            if (!out) {
+                err = lastErr.empty() ? "所有候选输出后端均初始化失败" : lastErr;
+                printf("输出后端初始化失败: %s\n", err.c_str());
+                if (explicitPick)
+                    printf("（--driver/控制台指定，2 秒后重试）\n");
+                else
+                    printf("（自动模式全部候选失败，2 秒后重试）\n");
                 pcap.close();
                 if (g_stop.load()) break;
                 Sleep(2000);
