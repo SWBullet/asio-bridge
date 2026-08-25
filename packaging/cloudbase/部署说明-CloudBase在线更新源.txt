@@ -2,6 +2,7 @@
  ASIO Bridge · 腾讯云 CloudBase 在线更新源部署指南
 ===============================================================================
 （支持国内在线更新：检查/下载/校验/静默升级全链路）
+★ 本环境已于 2026-08-25 部署完成，下列 URL 可直接使用 ★
 
 一、为什么用 CloudBase 静态托管
 ------------------------------------------------------------------------------
@@ -10,7 +11,7 @@
   · 免费额度足够（静态托管每月免费流量 + 存储）
   · 浏览器控制台上传文件即可，无需维护服务器
 
-二、一次性部署步骤
+二、一次性部署步骤（已完成，留作新环境参考）
 ------------------------------------------------------------------------------
 1) 开通 CloudBase
    腾讯云控制台 → 云开发 CloudBase → 开通环境（选「按量付费」或免费套餐）
@@ -18,7 +19,10 @@
 
 2) 启用静态网站托管
    环境 → 静态网站托管 → 开通（若未开通）
-   得到默认域名：https://<环境ID>.tcloudbaseapp.com
+   注意：实际访问域名带 AppID 后缀，格式为
+     https://<环境ID>-<AppID>.tcloudbaseapp.com
+   本环境即 tuncloud-9933-d8gf22m5w52d15d13-1416124613.tcloudbaseapp.com
+   （不带 AppID 后缀的域名会返回 418，不可用）
 
 3) 上传两个文件（静态托管 → 文件管理 → 上传）
    · asio_bridge_setup.exe        （安装包，本仓库 packaging\output\ 下）
@@ -26,20 +30,20 @@
 
 4) 修改 version.json 中的 url 为你的真实域名
    本仓库已预填环境 ID tuncloud-9933-d8gf22m5w52d15d13：
-     https://tuncloud-9933-d8gf22m5w52d15d13.tcloudbaseapp.com/asio_bridge_setup.exe
+     https://tuncloud-9933-d8gf22m5w52d15d13-1416124613.tcloudbaseapp.com/asio_bridge_setup.exe
    如使用其他环境，替换环境 ID 即可。
    （JSON 中不能有注释；改完重新上传覆盖）
 
 5) 配置客户端
    在桥的 asio_bridge.cfg（安装目录下）加一行：
-     update_url=https://tuncloud-9933-d8gf22m5w52d15d13.tcloudbaseapp.com/version.json
+     update_url=https://tuncloud-9933-d8gf22m5w52d15d13-1416124613.tcloudbaseapp.com/version.json
    重启桥 → 控制台底部出现「检查更新」→ 点一下应显示
    「已是最新版本 v1.0.1」（无报错即链路通）
 
    完整 URL 速查：
-     exe  下载: https://tuncloud-9933-d8gf22m5w52d15d13.tcloudbaseapp.com/asio_bridge_setup.exe
-     清单访问: https://tuncloud-9933-d8gf22m5w52d15d13.tcloudbaseapp.com/version.json
-     cfg 配置: update_url=https://tuncloud-9933-d8gf22m5w52d15d13.tcloudbaseapp.com/version.json
+     exe  下载: https://tuncloud-9933-d8gf22m5w52d15d13-1416124613.tcloudbaseapp.com/asio_bridge_setup.exe
+     清单访问: https://tuncloud-9933-d8gf22m5w52d15d13-1416124613.tcloudbaseapp.com/version.json
+     cfg 配置: update_url=https://tuncloud-9933-d8gf22m5w52d15d13-1416124613.tcloudbaseapp.com/version.json
 
 三、发布新版本流程（以后每次更新）
 ------------------------------------------------------------------------------
@@ -55,7 +59,7 @@
   $json = @"
   {
     "version": "1.0.1",
-    "url": "https://tuncloud-9933-d8gf22m5w52d15d13.tcloudbaseapp.com/asio_bridge_setup.exe",
+    "url": "https://tuncloud-9933-d8gf22m5w52d15d13-1416124613.tcloudbaseapp.com/asio_bridge_setup.exe",
     "sha256": "$sha"
   }
   "@
@@ -63,13 +67,18 @@
 
 四、验证清单（浏览器打开即可看到）
 ------------------------------------------------------------------------------
-  https://tuncloud-9933-d8gf22m5w52d15d13.tcloudbaseapp.com/version.json
+  https://tuncloud-9933-d8gf22m5w52d15d13-1416124613.tcloudbaseapp.com/version.json
   应显示 JSON：{ "version": "...", "url": "...", "sha256": "..." }
 
 五、常见问题
 ------------------------------------------------------------------------------
 Q: 上传后访问 version.json 返回 404？
    A: 确认文件在静态托管根目录，且文件名完全一致（小写）。
+
+Q: 访问域名返回 HTTP 418？
+   A: 域名格式不对。CloudBase 静态托管实际域名带 AppID 后缀：
+     https://<环境ID>-<AppID>.tcloudbaseapp.com
+   去控制台「静态网站托管」页查看完整域名。
 
 Q: 桥显示「检查更新失败」？
    A: 先浏览器直接访问 update_url 看是否可达；确认 cfg 行无多余空格。
