@@ -49,11 +49,12 @@ static const char* tidName(DWORD t) {
 }
 
 // 设备事件监听（Core Audio 属性监听模型）：渲染设备增删/状态变化/默认设备
-// 变化 → 触发链路重建。回调在 MTA 线程池线程上执行，只写原子量、零 COM。
+// 变化 → 触发链路重建 + 设备列表重扫标记。回调在 MTA 线程池线程上执行，
+// 只写原子量、零 COM。
 class DeviceNotifier : public IMMNotificationClient {
 public:
-    DeviceNotifier(std::atomic<bool>* restart, std::atomic<bool>* stop)
-        : ref_(1), restart_(restart), stop_(stop) {}
+    DeviceNotifier(std::atomic<bool>* restart, std::atomic<bool>* devicesDirty, std::atomic<bool>* stop)
+        : ref_(1), restart_(restart), devicesDirty_(devicesDirty), stop_(stop) {}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
         if (riid == __uuidof(IMMNotificationClient) || riid == __uuidof(IUnknown)) {
             *ppv = static_cast<IMMNotificationClient*>(this);
@@ -96,11 +97,13 @@ public:
 private:
     void bump() {
         if (!g_tidDevNote) g_tidDevNote = GetCurrentThreadId();   // 回调线程池线程身份
-        if (!stop_->load(std::memory_order_relaxed))
-            restart_->store(true, std::memory_order_relaxed);
+        if (stop_->load(std::memory_order_relaxed)) return;
+        restart_->store(true, std::memory_order_relaxed);          // 重建链路
+        devicesDirty_->store(true, std::memory_order_relaxed);     // 设备列表待重扫
     }
     LONG ref_;
     std::atomic<bool>* restart_;
+    std::atomic<bool>* devicesDirty_;
     std::atomic<bool>* stop_;
 };
 
@@ -1287,6 +1290,7 @@ int wmain(int argc, wchar_t** argv) {
     std::atomic<uint64_t> drainEvent{0};   // 快排丢弃量（监视线程消费打印后清零）
     std::atomic<float> peak{0.0f};
     std::atomic<bool> needRestart{false};
+    std::atomic<bool> devicesDirty{false};   // 设备事件触发：设备列表待重扫(热插拔/驱动安装)
     std::atomic<bool> bridgeOn{true};   // ASIO Bridge 开关：true=桥接(端点静音), false=关闭(系统音量恢复)
 
     // 桥内延迟实测（Core Audio AudioTimeStamp 模型）：
@@ -1484,7 +1488,7 @@ int wmain(int argc, wchar_t** argv) {
         HRESULT hrc = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         if (FAILED(hrc)) return;
         IMMDeviceEnumerator* devEnum = nullptr;
-        DeviceNotifier* notifier = new DeviceNotifier(&needRestart, &g_stop);
+        DeviceNotifier* notifier = new DeviceNotifier(&needRestart, &devicesDirty, &g_stop);
         bool registered = false;
         if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
                                        __uuidof(IMMDeviceEnumerator), (void**)&devEnum)) && devEnum &&
@@ -1511,8 +1515,31 @@ int wmain(int argc, wchar_t** argv) {
     });
 
     bool first = true;
+    ULONGLONG lastDevScan = 0;   // 设备重扫节流(秒)：插入风暴时只重扫一次
     while (!g_stop.load()) {
         needRestart.store(false);
+        // 设备事件（热插拔/新驱动安装/默认设备变化）→ 重扫设备列表：
+        // 新声卡驱动加入后自动出现在控制台选择列表，并自动判定是否支持 ASIO
+        if (devicesDirty.load(std::memory_order_relaxed)) {
+            ULONGLONG now = GetTickCount64();
+            if (now - lastDevScan >= 1000) {
+                lastDevScan = now;
+                devicesDirty.store(false, std::memory_order_relaxed);
+                std::string scanErr;
+                auto devs = ScanOutputDevices(scanErr);
+                {
+                    std::lock_guard<std::mutex> lk(g_devMutex);
+                    g_devices = std::move(devs);
+                    // 选中设备被拔出 → 回退自动选择
+                    int sel = g_selectedDevice.load(std::memory_order_relaxed);
+                    if (sel >= (int)g_devices.size())
+                        g_selectedDevice.store(-1, std::memory_order_relaxed);
+                }
+                printf("[设备] 设备变化，重新扫描到 %zu 个输出设备%s\n", g_devices.size(),
+                       scanErr.empty() ? "" : ("（" + scanErr + "）").c_str());
+            }
+            // 未到节流间隔：保持标记，下一轮再重扫
+        }
         // 恢复上一会话静音的目标端点（模式切换/重建/失败重试前必须先还原，
         // 否则目标端点会一直被静音）
         if (!endpointMutes.empty()) {

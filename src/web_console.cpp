@@ -505,7 +505,7 @@ function loadDevices(){
     fetch('/api/devices').then(function(r){return r.json()}).then(function(s){
       var sel=document.getElementById('bank-device');
       var cur=sel.value;
-      sel.innerHTML='<option value="-1">自动 (默认 ASIO)</option>';
+      sel.innerHTML='<option value="-1">自动 (ASIO 优先, 无则 WASAPI)</option>';
       var devs=s.devices||[];
       for(var i=0;i<devs.length;i++){
         var opt=document.createElement('option');
@@ -520,6 +520,9 @@ function loadDevices(){
 document.getElementById('bank-device').onchange=function(){ctl('action=device&value='+this.value)}
 document.getElementById('devscan').onclick=function(){ctl('action=devscan&value=1');setTimeout(loadDevices,600)}
 loadDevices();
+// 设备热插拔自动刷新：每 3 秒轮询设备列表（服务端在设备事件时已自动重扫，
+// 此处仅把新声卡/驱动反映到下拉框；与 /api/status 轮询节奏独立，避免频繁刷新列表）
+setInterval(loadDevices,3000);
 )HTML" R"HTML(
 var harmGain=0;    // 谐波增益(dB):默认 0(正常比例),需要时放大残差频谱观测谐波覆盖范围
 function fmtFreq(hz){
