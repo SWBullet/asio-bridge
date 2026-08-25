@@ -180,6 +180,12 @@ bool parseManifest(const std::string& body, std::string& ver, std::string& url, 
         }
         return true;
     }
+    // 自建 JSON 清单：{"version":"...","url":"...","sha256":"..."}
+    if (jsonString(body, "version", ver)) {
+        jsonString(body, "url", url);
+        jsonString(body, "sha256", sha);
+        return true;
+    }
     // 自建清单：INI 风格
     std::string line, kv;
     for (char ch : body) {

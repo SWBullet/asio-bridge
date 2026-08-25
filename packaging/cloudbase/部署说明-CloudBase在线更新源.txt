@@ -51,24 +51,27 @@
 2) 修改 src\update_check.h 里的 kAppVersion 为新版本号（如 1.0.1）
    重新编译、重新打包
 3) 上传新 asio_bridge_setup.exe 到 CloudBase 静态托管（覆盖旧文件）
-4) 重新生成 version.json（版本号 + SHA256 用下面命令算）并上传覆盖
+4) 重新生成 version.json（INI 格式，版本号 + SHA256 用下面命令算）并上传覆盖
 5) 用户端桥启动时自动发现新版本，控制台点「下载并升级」即可一键更新
 
-生成 version.json 的 PowerShell 命令：
+★ 清单格式（重要）：v1.0.1 只认 INI 格式与 GitHub Releases JSON 格式；
+  普通 JSON 清单解析在下一版本（≥1.0.2）才支持（parseManifest 已修复入库）。
+  当前线上 version.json 内容为 INI（文件名保留 .json 只是习惯）：
+    version=1.0.1
+    url=https://<域名>/asio_bridge_setup.exe
+    sha256=<64位十六进制>
+  INI 格式必须无 BOM（BOM 会让首行 version= 解析失败）。
+
+生成 version.json 的 PowerShell 命令（INI 格式，无 BOM）：
   $sha = (Get-FileHash .\asio_bridge_setup.exe -Algorithm SHA256).Hash.ToLower()
-  $json = @"
-  {
-    "version": "1.0.1",
-    "url": "https://tuncloud-9933-d8gf22m5w52d15d13-1416124613.tcloudbaseapp.com/asio_bridge_setup.exe",
-    "sha256": "$sha"
-  }
-  "@
-  [System.IO.File]::WriteAllText(".\version.json", $json, [System.Text.Encoding]::UTF8)
+  $ini = "version=1.0.2`nurl=https://tuncloud-9933-d8gf22m5w52d15d13-1416124613.tcloudbaseapp.com/asio_bridge_setup.exe`nsha256=$sha"
+  [System.IO.File]::WriteAllText(".\version.json", $ini, (New-Object System.Text.UTF8Encoding $false))
 
 四、验证清单（浏览器打开即可看到）
 ------------------------------------------------------------------------------
   https://tuncloud-9933-d8gf22m5w52d15d13-1416124613.tcloudbaseapp.com/version.json
-  应显示 JSON：{ "version": "...", "url": "...", "sha256": "..." }
+  应显示 INI：version=... / url=... / sha256=...
+  （CDN 缓存最长 10 分钟；加 ?cb=1 参数可强刷验证源站新内容）
 
 五、常见问题
 ------------------------------------------------------------------------------
@@ -80,8 +83,12 @@ Q: 访问域名返回 HTTP 418？
      https://<环境ID>-<AppID>.tcloudbaseapp.com
    去控制台「静态网站托管」页查看完整域名。
 
+Q: 上传了新 version.json 但桥还检查到旧版本？
+   A: CDN 缓存最长 10 分钟（s-maxage=600），稍等后重试。
+
 Q: 桥显示「检查更新失败」？
-   A: 先浏览器直接访问 update_url 看是否可达；确认 cfg 行无多余空格。
+   A: 先浏览器直接访问 update_url 看是否可达；确认 cfg 行无多余空格；
+      v1.0.1 客户端清单必须是 INI 格式（JSON 需 ≥1.0.2 客户端）。
 
 Q: 想隐藏安装包直链？
    A: CloudBase 支持静态托管自定义域名 + 访问控制，可加防盗链；

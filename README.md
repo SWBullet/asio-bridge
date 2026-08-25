@@ -128,8 +128,10 @@ DSP 链（可选逐级开关）：
   （支持国内服务器 / Gitee / 自建），未配置时默认 GitHub Releases API；
   **国内推荐 CloudBase 静态托管**（部署指南见 `packaging/cloudbase/`），
   自带 HTTPS + CDN 加速，详见使用教程第十四章；
-- **清单格式**（HTTP GET 返回，JSON 或 INI 均可）：
-  `{"version":"1.0.1","url":"https://…/setup.exe","sha256":"<64hex>"}`
+- **清单格式**（HTTP GET 返回，三种均可）：
+  INI（全版本兼容，线上现行格式）：
+  `version=1.0.1` / `url=https://…/setup.exe` / `sha256=<64hex>`；
+  JSON（≥1.0.2 客户端）：`{"version":"1.0.1","url":"https://…/setup.exe","sha256":"<64hex>"}`；
   （GitHub Releases API 的 JSON 自动适配其字段名）；
 - **一键升级**：控制台点「下载并升级」→ 下载安装包 → SHA256 校验
   （清单提供时）→ 静默运行安装程序 → 桥自动退出；
