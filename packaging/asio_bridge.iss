@@ -57,6 +57,7 @@ Source: "..\tools\watch_bridge.ps1"; DestDir: "{app}\tools"; Flags: ignoreversio
 ; 文档
 Source: "..\docs\使用教程.txt"; DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "..\docs\Bug修复说明-驱动自动适配.txt"; DestDir: "{app}\docs"; Flags: ignoreversion
+Source: "..\docs\更新说明-设备自动适配强化.txt"; DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
