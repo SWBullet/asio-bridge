@@ -187,15 +187,6 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
   </div>
 </div>
 
-<div id="updbar" style="display:none;margin:10px 0;padding:10px 14px;background:linear-gradient(180deg,#2a2410,#1a150a);
-  border:1px solid #8a6d2b;border-radius:6px;font-size:13px;color:#ffd27f;align-items:center;gap:10px;flex-wrap:wrap">
-  <span id="updmsg">正在检查更新…</span>
-  <span style="flex:1"></span>
-  <button class="btn" id="updcheck" style="display:none">检查更新</button>
-  <button class="btn" id="updgo" style="display:none;background:linear-gradient(180deg,#8a2b2b,#571717);border-color:#c05050">下载并升级</button>
-  <button class="btn" id="upddismiss" style="display:none">知道了</button>
-</div>
-
 <div class="panel">
   <div class="mtitle">TELEMETRY</div>
   <div class="grid" id="meters">
@@ -298,7 +289,15 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
   </div>
 </div>
 
-<div class="foot">BRIDGE · PROCESS LOOPBACK RELAY · RME ADI-2 PRO</div>
+<div id="updbar" style="display:none;margin:14px 0 8px;padding:9px 14px;background:linear-gradient(180deg,#262a2f,#171a1e);
+  border:1px solid #565c64;border-radius:6px;font-size:12px;color:#aab2bc;align-items:center;gap:10px;flex-wrap:wrap">
+  <span id="updmsg">检查更新</span>
+  <span style="flex:1"></span>
+  <button class="btn" id="updcheck" style="display:none;padding:4px 12px">检查更新</button>
+  <button class="btn" id="updgo" style="display:none;padding:4px 12px;background:linear-gradient(180deg,#8a2b2b,#571717);border-color:#c05050">下载并升级</button>
+</div>
+
+<div class="foot">BRIDGE · PROCESS LOOPBACK RELAY</div>
 </div>
 <script>
 var firstInit=true;
@@ -475,14 +474,24 @@ async function pollStatus(){
       setBank('bank-width',String(s.thicknessWidth||0));
       document.getElementById('bank-device').value=String(s.selectedDevice);
     }
-    // ===== 在线升级横幅 =====
+    // ===== 在线升级（底部状态条）：检查更新（当前版本号）=====
     var ub=document.getElementById('updbar');
     if(s.appVer){
       var msgEl=document.getElementById('updmsg');
-      msgEl.textContent=(s.updateMsg||'')+'（当前 v'+s.appVer+'）';
+      // 常态文案：检查更新（当前版本号）；有动态状态时展示状态
+      if(s.updateAvailable){
+        msgEl.textContent='发现新版本 v'+s.updateVer+'（当前 v'+s.appVer+'）';
+      } else if(s.updateChecking){
+        msgEl.textContent='正在检查更新…';
+      } else if(s.updateDownloading){
+        msgEl.textContent='正在下载并升级…';
+      } else if(s.updateError){
+        msgEl.textContent='检查更新失败（当前 v'+s.appVer+'）';
+      } else {
+        msgEl.textContent='检查更新（当前 v'+s.appVer+'）';
+      }
       document.getElementById('updcheck').style.display=s.updateChecking?'none':'inline-block';
       document.getElementById('updgo').style.display=s.updateAvailable?'inline-block':'none';
-      document.getElementById('upddismiss').style.display=s.updateAvailable?'inline-block':'none';
       ub.style.display='flex';
     }
   }catch(e){}
@@ -521,7 +530,6 @@ document.getElementById('bridge').onclick=function(){var on=!this.classList.cont
 document.getElementById('reset').onclick=function(){ctl('action=reset&value=1')}
 document.getElementById('updcheck').onclick=function(){ctl('action=updatecheck&value=1')}
 document.getElementById('updgo').onclick=function(){ctl('action=updatedownload&value=1')}
-document.getElementById('upddismiss').onclick=function(){document.getElementById('updbar').style.display='none'}
 function loadDevices(){
   try{
     fetch('/api/devices').then(function(r){return r.json()}).then(function(s){

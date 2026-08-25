@@ -1,4 +1,4 @@
-// Bridge: 目标应用渲染流 → (进程回环按 PID 旁路取流) → RME MADIface ASIO → ADI-2 Pro
+// Bridge: 目标应用渲染流 → (进程回环按 PID 旁路取流) → ASIO/WASAPI 独占输出
 // 免虚拟声卡、免引擎混音/APO；自动静音目标端点消除双重声。
 #include "asio_render.h"
 #include "audio_output.h"

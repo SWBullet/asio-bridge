@@ -18,7 +18,7 @@ DSP 链（可选逐级开关）：
    │  300B 电子管染色 → 厚度与宽度（谐波预延时 + 高低切）→ 火箭推进器（湿增益）
    ▼
 输出后端（自动选择）
-   ├─ RME MADIface ASIO（ASIOSTFloat32LSB）→ ADI-2 Pro DAC
+   ├─ ASIO 驱动（ASIOSTFloat32LSB）→ 专业声卡 / DAC
    └─ 其他设备 → WASAPI 独占渲染（事件驱动线程 + 候选格式探测）
 ```
 
