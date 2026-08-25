@@ -41,8 +41,6 @@ struct BridgeStatsPtrs {
     std::atomic<double>* ratioBase;        // 时钟速率锁基值（inHz/outHz）
     std::atomic<double>* inRate;           // 实测输入设备速率 Hz
     std::atomic<double>* outRate;          // 实测输出设备速率 Hz
-    std::atomic<bool>* passthrough;        // 直通模式（重采样停用）
-    std::atomic<int>* passthroughReq;      // 控制台切换请求：0=无 1=开 2=关
     std::atomic<int>* srcTaps;             // 重采样质量档：0=线性 32=sinc
     std::atomic<bool>* tubeOn;             // 300B 电子管染色开关
     std::atomic<float>* tubeWarmth;        // 染色量 0~1

@@ -238,8 +238,6 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
   <div class="ctlrow">
     <span class="lbl">TPDF 抖动</span>
     <label class="switch"><input type="checkbox" id="dither"><span class="track"><span class="knob"></span></span><span class="led"></span></label>
-    <span class="lbl" style="margin-left:14px">直通模式</span>
-    <label class="switch"><input type="checkbox" id="passthrough"><span class="track"><span class="knob"></span></span><span class="led"></span></label>
   </div>
   <div class="ctlrow">
     <span class="lbl">重采样质量</span>
@@ -456,7 +454,6 @@ async function pollStatus(){
     setLed(document.getElementById('l-drift'),Math.abs(dr)<100,dr===0);
     // 拨杆开关每次轮询同步实际状态（三态请求 2s 内生效，这里回读防漂移）
     document.getElementById('dither').checked=!!s.dither;
-    document.getElementById('passthrough').checked=!!s.passthrough;
     if(firstInit){
       firstInit=false;
       // 桥开关只初始化一次，之后由用户点击驱动（避免每 2s 轮询与点击竞争导致关不掉）
@@ -518,7 +515,6 @@ bindBank('bank-src',function(v){ctl('action=src&value='+v)});
 bindBank('bank-width',function(v){ctl('action=thicknesswidth&value='+v)});
 function ctl(body){if(!CSRF)return;fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body+'&token='+encodeURIComponent(CSRF)})}
 document.getElementById('dither').onchange=function(e){ctl('action=dither&value='+(e.target.checked?1:0))}
-document.getElementById('passthrough').onchange=function(e){ctl('action=passthrough&value='+(e.target.checked?1:0))}
 document.getElementById('tube').onchange=function(e){ctl('action=tube&value='+(e.target.checked?1:0))}
 document.getElementById('tubewarmth').oninput=function(e){document.getElementById('tubewarmth-v').textContent=e.target.value+'%'}
 document.getElementById('tubewarmth').onchange=function(e){ctl('action=tubewarmth&value='+e.target.value)}
@@ -796,7 +792,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             "\"asioRate\":%ld,\"asioBuffer\":%ld,\"asioType\":%ld,\"capRate\":%u,\"uptime\":%llu,"
             "\"dither\":%d,"
             "\"latencyMs\":%d,"
-            "\"ratioBase\":%.7f,\"inRate\":%.1f,\"outRate\":%.1f,\"passthrough\":%d,"
+            "\"ratioBase\":%.7f,\"inRate\":%.1f,\"outRate\":%.1f,"
             "\"srcTaps\":%d,"
             "\"underRecent\":%d,"
             "\"tubeOn\":%d,\"tubeWarmth\":%.2f,"
@@ -819,7 +815,6 @@ static void handleRequest(SOCKET s, char* req, int n) {
             (double)g_p.ratioBase->load(std::memory_order_relaxed),
             (double)g_p.inRate->load(std::memory_order_relaxed),
             (double)g_p.outRate->load(std::memory_order_relaxed),
-            g_p.passthrough->load(std::memory_order_relaxed) ? 1 : 0,
             (int)g_p.srcTaps->load(std::memory_order_relaxed),
             underRecent,
             g_p.tubeOn->load(std::memory_order_relaxed) ? 1 : 0,
@@ -862,8 +857,6 @@ static void handleRequest(SOCKET s, char* req, int n) {
             } else if (strstr(body, "action=dither")) {
                 // 三态请求：主循环 2s 节拍实时应用（无需重建链路）
                 g_p.ditherReq->store(v != 0 ? 1 : 2, std::memory_order_relaxed);
-            } else if (strstr(body, "action=passthrough")) {
-                g_p.passthroughReq->store(v != 0 ? 1 : 2, std::memory_order_relaxed);
             } else if (strstr(body, "action=src")) {
                 g_p.srcTaps->store(v == 32 ? 32 : 0, std::memory_order_relaxed);
             } else if (strstr(body, "action=tubewarmth")) {

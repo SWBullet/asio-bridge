@@ -6,6 +6,7 @@
 #include "wasapi_output.h"
 #include "dsp_tube.h"
 #include "dsp_thickness.h"
+#include "dsp_softclip.h"   // 末端软过载限幅器（电子管软过载特性，永不超过 0.999）
 #include "rate_lock.h"
 #include "resampler.h"
 #include "ring_buffer.h"
@@ -129,8 +130,6 @@ static void usage() {
         "  asio_bridge --buffer <帧数>    ASIO 缓冲帧数 (默认驱动值, 低延迟可试 128/64)\n"
         "  asio_bridge --log <文件>      输出追加写入日志文件（后台/自启运行用）\n"
         "  asio_bridge --no-dither      关闭 TPDF 抖动（默认开启）\n"
-        "  asio_bridge --passthrough    直通模式：停用重采样（ratio 恒 1.0，逐位直通），\n"
-        "                              两时钟漂移由环形缓冲吸收，极限时才动作一次\n"
         "  asio_bridge --resampler-test  重采样器正弦离线自检（数值验证）\n"
         "  asio_bridge --pll-test        速率锁+水位闭环联合仿真自检（数值验证）\n"
         "  asio_bridge --capture-test    Bridge 采集正弦自检（渲染→按 PID 回环自采比对）\n"
@@ -1178,7 +1177,6 @@ int wmain(int argc, wchar_t** argv) {
     long reqBuffer = 0;
     bool ditherFlag = true;   // TPDF 抖动默认开启；优先级:命令行 > 配置文件 > 默认
     bool ditherArgGiven = false;   // 命令行是否显式指定 --dither/--no-dither
-    bool passthroughArg = false;   // 直通模式：停用重采样
     bool noMute = false;           // 诊断：跳过端点静音 hack（鉴别 RME 驱动崩溃触发源）
 
     for (int i = 1; i < argc; ++i) {
@@ -1193,7 +1191,6 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--no-mute") noMute = true;
         else if (a == L"--hidden") hidden = true;
         else if (a == L"--crash-test") crashTest = true;
-        else if (a == L"--passthrough") passthroughArg = true;
         else if (a == L"--resampler-test") { return resamplerSelfTest(); }
         else if (a == L"--tube-test") { return tubeSelfTest(); }
         else if (a == L"--pll-test") { return pllSelfTest(); }
@@ -1320,8 +1317,6 @@ int wmain(int argc, wchar_t** argv) {
     // 分数重采样器状态（桥作用域，每次重建复位）
     std::atomic<double> ratio{1.0};
     std::atomic<int> srcTaps{32};    // 重采样质量档：0=线性（低延迟）32=sinc（高精度，默认）
-    std::atomic<bool> passthrough{passthroughArg};   // 直通模式：ratio 恒 1.0，逐位直通
-    std::atomic<int> passthroughReq{0};              // 控制台切换请求：0=无 1=开 2=关
     std::atomic<bool> tubeOn{false};                 // 300B 电子管染色开关
     std::atomic<float> tubeWarmth{0.3f};             // 染色量 0~1(0=干净,1=明显暖)
     std::atomic<bool> thicknessOn{false};            // 厚度与宽度开关
@@ -1390,7 +1385,7 @@ int wmain(int argc, wchar_t** argv) {
         &wMult, &floorMult, &driftPpm, &needRestart, &ditherReq, &ditherOn, &resetReq,
         &bridgeOn, &g_stop, &asioRate, &asioBuffer, &asioType, &capRate, &wmNow,
         &totalLatencyMs,
-        &histBuf, &histWrite, &ratioBase, &inRate, &outRate, &passthrough, &passthroughReq,
+        &histBuf, &histWrite, &ratioBase, &inRate, &outRate,
         &srcTaps, &tubeOn, &tubeWarmth,
         &thicknessOn, &thicknessDelayMs, &thicknessWidth,
         &boosterOn, &boosterDb,
@@ -1420,7 +1415,7 @@ int wmain(int argc, wchar_t** argv) {
     }
 
     // ===== 配置持久化:加载/保存控制台设置(exe 同目录 asio_bridge.cfg)=====
-    // 下次服务重启时恢复上次操作(染色开关/暖度/直通/水位下限/重采样档)。
+    // 下次服务重启时恢复上次操作(染色开关/暖度/水位下限/重采样档)。
     auto configPath = []() -> std::wstring {
         wchar_t buf[MAX_PATH];
         GetModuleFileNameW(nullptr, buf, MAX_PATH);
@@ -1440,7 +1435,6 @@ int wmain(int argc, wchar_t** argv) {
         fprintf(f, "thickness_width=%d\n", thicknessWidth.load(std::memory_order_relaxed));
         fprintf(f, "booster_on=%d\n", boosterOn.load(std::memory_order_relaxed) ? 1 : 0);
         fprintf(f, "booster_db=%.1f\n", boosterDb.load(std::memory_order_relaxed));
-        fprintf(f, "passthrough=%d\n", passthrough.load(std::memory_order_relaxed) ? 1 : 0);
         fprintf(f, "floor=%zu\n", floorMult.load(std::memory_order_relaxed));
         fprintf(f, "src_taps=%d\n", srcTaps.load(std::memory_order_relaxed));
         fprintf(f, "dither=%d\n", ditherOn.load(std::memory_order_relaxed) ? 1 : 0);
@@ -1483,7 +1477,6 @@ int wmain(int argc, wchar_t** argv) {
                     if (bv > 18.0f) bv = 18.0f;
                     boosterDb.store(bv, std::memory_order_relaxed);
                 }
-                else if (!strcmp(key, "passthrough")) passthrough.store(atoi(val) != 0, std::memory_order_relaxed);
                 else if (!strcmp(key, "floor")) floorMult.store((size_t)atoi(val), std::memory_order_relaxed);
                 else if (!strcmp(key, "src_taps")) srcTaps.store(atoi(val), std::memory_order_relaxed);
                 else if (!strcmp(key, "dither") && !ditherArgGiven)
@@ -1726,9 +1719,8 @@ int wmain(int argc, wchar_t** argv) {
         printf("[采集] %u Hz / %u 通道 / %u bit (%s)  模式: Bridge 进程回环\n",
                capSr, capCh, capBits, capFloat ? "float32" : "PCM");
 
-        // 预填充：重采样模式 ~46ms（够 ASIO 启动初期即可）；
-        // 直通模式加大到 ~186ms，由缓冲吸收两时钟漂移（±1.1 采样/秒 ≈ 4 小时余量）
-        const size_t prefill = passthrough.load(std::memory_order_relaxed) ? 16384 : 2048;
+        // 预填充：~46ms（够 ASIO 启动初期即可；环形缓冲吸收两时钟漂移）
+        const size_t prefill = 2048;
         while (rb.available() < prefill && !g_stop.load() && !needRestart.load()) Sleep(10);
 
         // 自适应水位目标倍数（v2 预判式，声明于桥作用域；每次重建重置为下限）：
@@ -1931,6 +1923,11 @@ int wmain(int argc, wchar_t** argv) {
                     ++fadePos;
                 }
             }
+            // 末端软过载限幅器（电子管软过载特性）：DSP 链末端、淡入之后无条件生效。
+            // 把可能超过 ±1.0 的峰值柔化回 0.999 内，杜绝 DAC 硬削波/破音。默认开启，无开关。
+            for (size_t i = 0; i < frames * ch; ++i) {
+                dst[i] = TubeSoftLimiter::process(dst[i]);
+            }
             // 端到端延迟实测：环内驻留 + ASIO 设备延迟 + 采集包周期
             {
                 uint64_t sw = stampWrite.load(std::memory_order_acquire);
@@ -2010,7 +2007,7 @@ int wmain(int argc, wchar_t** argv) {
 
         printf("== 桥接运行中: Bridge -> 输出后端 @ %g Hz (%s) ==\n",
                oi.sampleRate,
-               passthrough.load(std::memory_order_relaxed) ? "直通, 重采样停用" : "分数重采样");
+               "分数重采样");
         const size_t neededPerBuf = (size_t)oi.bufferSize * capCh;
 
         // 主线程（ASIO 的 STA）绝不做阻塞式 COM 调用——实测会饿死 MADIface
@@ -2189,20 +2186,7 @@ int wmain(int argc, wchar_t** argv) {
                         printf("[抖动] 控制台切换: TPDF 抖动关闭\n");
                     }
                 }
-                // 控制台 A/B 切换：直通 ↔ 重采样（实时生效，无需重建链路）
-                {
-                    int pr = passthroughReq.exchange(0, std::memory_order_relaxed);
-                    if (pr == 1) {
-                        passthrough.store(true, std::memory_order_relaxed);
-                        printf("[直通] 控制台切换: 直通模式（重采样停用，逐位直通）\n");
-                    } else if (pr == 2) {
-                        passthrough.store(false, std::memory_order_relaxed);
-                        wmAvg = (double)rb.available();   // 回切时重置平滑水位，避免陈旧值
-                        printf("[直通] 控制台切换: 分数重采样（速率锁+水位闭环）\n");
-                    }
-                }
-                // 时钟速率锁（前馈基值）：实测输入/输出设备速率比。
-                // 直通模式下仍持续测量（控制台可见两时钟漂移量），但不作用于 ratio
+                // 时钟速率锁（前馈基值）：实测输入/输出设备速率比，始终作用于 ratio
                 {
                     double ih = 0.0, oh = 0.0;
                     // Bridge 采集交付易受暂停/恢复突发污染：
@@ -2217,28 +2201,22 @@ int wmain(int argc, wchar_t** argv) {
                         outRate.store(oh, std::memory_order_relaxed);
                     }
                 }
-                if (passthrough.load(std::memory_order_relaxed)) {
-                    // 直通模式：ratio 恒 1.0（重采样器逐位直通，自检 1 已证 0 误差），
-                    // 漂移交给环形缓冲，欠载/溢出时才由既有守护机制动作一次
-                    ratio.store(1.0, std::memory_order_relaxed);
-                } else {
-                    // 平滑水位（约 20 秒时间常数）：水位闭环只在基值上做微调
-                    if (wmAvg <= 0.0) wmAvg = (double)wm;
-                    else wmAvg += ((double)wm - wmAvg) * 0.1;
-                    {
-                        int64_t setpoint = (int64_t)(wMult.load(std::memory_order_relaxed) * neededPerBuf);
-                        double err = wmAvg - (double)setpoint;
-                        double base = ratioBase.load(std::memory_order_relaxed);
-                        // 误差分档限幅：稳态微调 0.0003；中等偏差 0.001；
-                        // 大偏差（快排阈值以下残留 + 突发回流）0.004 —— 恢复提速
-                        // 但不会超过 0.4%（听感不可察，且只出现在恢复瞬态）
-                        double ea = fabs(err);
-                        double cap = ea > 2048.0 ? 0.004 : (ea > 1024.0 ? 0.001 : 0.0003);
-                        double r = base + err * 5e-7;
-                        if (r > base + cap) r = base + cap;
-                        if (r < base - cap) r = base - cap;
-                        ratio.store(r, std::memory_order_relaxed);
-                    }
+                // 平滑水位（约 20 秒时间常数）：水位闭环只在基值上做微调
+                if (wmAvg <= 0.0) wmAvg = (double)wm;
+                else wmAvg += ((double)wm - wmAvg) * 0.1;
+                {
+                    int64_t setpoint = (int64_t)(wMult.load(std::memory_order_relaxed) * neededPerBuf);
+                    double err = wmAvg - (double)setpoint;
+                    double base = ratioBase.load(std::memory_order_relaxed);
+                    // 误差分档限幅：稳态微调 0.0003；中等偏差 0.001；
+                    // 大偏差（快排阈值以下残留 + 突发回流）0.004 —— 恢复提速
+                    // 但不会超过 0.4%（听感不可察，且只出现在恢复瞬态）
+                    double ea = fabs(err);
+                    double cap = ea > 2048.0 ? 0.004 : (ea > 1024.0 ? 0.001 : 0.0003);
+                    double r = base + err * 5e-7;
+                    if (r > base + cap) r = base + cap;
+                    if (r < base - cap) r = base - cap;
+                    ratio.store(r, std::memory_order_relaxed);
                 }
 
                 // 历史水位采样（发布到环形缓冲，供 Web 控制台回看）
