@@ -19,7 +19,7 @@
 // ============================================================================
 
 // 软件当前版本（打包/发布时同步修改）
-static const char* kAppVersion = "1.0.0";
+static const char* kAppVersion = "1.0.1";
 
 // 更新检查状态（控制台只读，检查线程写）
 struct UpdateState {

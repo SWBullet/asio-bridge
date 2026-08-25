@@ -402,8 +402,8 @@ Q: 想低延迟?
 5) 配置客户端
    在桥的 asio_bridge.cfg(安装目录下)加一行:
      update_url=https://tuncloud-9933-d8gf22m5w52d15d13.tcloudbaseapp.com/version.json
-   重启桥 → 控制台顶部出现「检查更新」按钮 → 点击应显示
-   「已是最新版本 v1.0.0」(无报错即链路通)
+   重启桥 → 控制台底部出现「检查更新」→ 点击应显示
+   「已是最新版本 v1.0.1」(无报错即链路通)
 
    当前仓库已预填真实环境 ID, 部署后直接可用:
      exe  下载地址: https://tuncloud-9933-d8gf22m5w52d15d13.tcloudbaseapp.com/asio_bridge_setup.exe
