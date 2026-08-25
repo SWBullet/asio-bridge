@@ -25,15 +25,21 @@
    · version.json                 （清单，本仓库 packaging\cloudbase\ 下）
 
 4) 修改 version.json 中的 url 为你的真实域名
-   例如环境 ID 是 abc123xyz789：
-     https://abc123xyz789.tcloudbaseapp.com/asio_bridge_setup.exe
+   本仓库已预填环境 ID tuncloud-9933-d8gf22m5w52d15d13：
+     https://tuncloud-9933-d8gf22m5w52d15d13.tcloudbaseapp.com/asio_bridge_setup.exe
+   如使用其他环境，替换环境 ID 即可。
    （JSON 中不能有注释；改完重新上传覆盖）
 
 5) 配置客户端
    在桥的 asio_bridge.cfg（安装目录下）加一行：
-     update_url=https://abc123xyz789.tcloudbaseapp.com/version.json
+     update_url=https://tuncloud-9933-d8gf22m5w52d15d13.tcloudbaseapp.com/version.json
    重启桥 → 控制台顶部出现「检查更新」按钮 → 点一下应显示
    「已是最新版本 v1.0.0」（无报错即链路通）
+
+   完整 URL 速查：
+     exe  下载: https://tuncloud-9933-d8gf22m5w52d15d13.tcloudbaseapp.com/asio_bridge_setup.exe
+     清单访问: https://tuncloud-9933-d8gf22m5w52d15d13.tcloudbaseapp.com/version.json
+     cfg 配置: update_url=https://tuncloud-9933-d8gf22m5w52d15d13.tcloudbaseapp.com/version.json
 
 三、发布新版本流程（以后每次更新）
 ------------------------------------------------------------------------------
@@ -49,7 +55,7 @@
   $json = @"
   {
     "version": "1.0.1",
-    "url": "https://<环境ID>.tcloudbaseapp.com/asio_bridge_setup.exe",
+    "url": "https://tuncloud-9933-d8gf22m5w52d15d13.tcloudbaseapp.com/asio_bridge_setup.exe",
     "sha256": "$sha"
   }
   "@
@@ -57,7 +63,7 @@
 
 四、验证清单（浏览器打开即可看到）
 ------------------------------------------------------------------------------
-  https://<环境ID>.tcloudbaseapp.com/version.json
+  https://tuncloud-9933-d8gf22m5w52d15d13.tcloudbaseapp.com/version.json
   应显示 JSON：{ "version": "...", "url": "...", "sha256": "..." }
 
 五、常见问题
