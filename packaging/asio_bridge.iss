@@ -59,6 +59,8 @@ Source: "..\docs\使用教程.txt"; DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "..\docs\Bug修复说明-驱动自动适配.txt"; DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "..\docs\更新说明-设备自动适配强化.txt"; DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
+; Web 控制台 UI(磁盘版优先于内嵌, 可即时修改刷新浏览器生效; 删除后自动回退内嵌版)
+Source: "..\web\index.html"; DestDir: "{app}\web"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--hidden"
