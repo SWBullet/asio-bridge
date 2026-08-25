@@ -164,8 +164,9 @@ std::string sha256File(const std::wstring& path) {
     return hex;
 }
 
-// 解析清单 → (version, url, sha256)。返回 true 表示清单有效
-bool parseManifest(const std::string& body, std::string& ver, std::string& url, std::string& sha) {
+// 解析清单 → (version, url, sha256, mirror)。返回 true 表示清单有效
+bool parseManifest(const std::string& body, std::string& ver, std::string& url,
+                   std::string& sha, std::string& mirror) {
     // GitHub Releases API JSON：tag_name / assets[].browser_download_url
     if (jsonString(body, "tag_name", ver)) {
         jsonString(body, "browser_download_url", url);
@@ -180,12 +181,13 @@ bool parseManifest(const std::string& body, std::string& ver, std::string& url, 
                     if (hexok) sha = t; }
             }
         }
-        return true;
+        return true;   // GitHub 源无 mirror
     }
-    // 自建 JSON 清单：{"version":"...","url":"...","sha256":"..."}
+    // 自建 JSON 清单：{"version":"...","url":"...","sha256":"...","mirror":"..."}
     if (jsonString(body, "version", ver)) {
         jsonString(body, "url", url);
         jsonString(body, "sha256", sha);
+        jsonString(body, "mirror", mirror);
         return true;
     }
     // 自建清单：INI 风格
@@ -194,6 +196,7 @@ bool parseManifest(const std::string& body, std::string& ver, std::string& url, 
         if (ch == '\n') {
             if (iniValue(line, "version", kv)) ver = kv;
             else if (iniValue(line, "url", kv)) url = kv;
+            else if (iniValue(line, "mirror", kv)) mirror = kv;
             else if (iniValue(line, "sha256", kv)) sha = kv;
             line.clear();
         } else line += ch;
@@ -201,6 +204,7 @@ bool parseManifest(const std::string& body, std::string& ver, std::string& url, 
     if (!line.empty()) {
         if (iniValue(line, "version", kv)) ver = kv;
         else if (iniValue(line, "url", kv)) url = kv;
+        else if (iniValue(line, "mirror", kv)) mirror = kv;
         else if (iniValue(line, "sha256", kv)) sha = kv;
     }
     return !ver.empty();
@@ -220,10 +224,11 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop,
         bool wantDownload = st->downloading.exchange(false);
         if (wantDownload && st->available.load()) {
             // ---- 下载 + 校验 + 启动安装 ----
-            std::string url, ver, sha, msg;
+            std::string url, ver, sha, mirror, msg;
             {
                 std::lock_guard<std::mutex> lk(*st->mutex);
-                url = st->downloadUrl; ver = st->latestVersion; sha = st->sha256;
+                url = st->downloadUrl; ver = st->latestVersion;
+                sha = st->sha256; mirror = st->mirrorUrl;
             }
             if (url.empty()) {
                 { std::lock_guard<std::mutex> lk(*st->mutex); st->message = "清单缺少下载地址"; }
@@ -240,6 +245,12 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop,
             }
             // URLDownloadToFile 需要 wininet；此处用 WinHTTP 写文件避免引入依赖
             std::string body = httpGet(url, 60000);
+            if (body.empty() && !mirror.empty()) {
+                { std::lock_guard<std::mutex> lk(*st->mutex);
+                  st->message = "主源下载失败，切换镜像源…"; }
+                url = mirror;
+                body = httpGet(url, 60000);
+            }
             if (body.empty()) {
                 { std::lock_guard<std::mutex> lk(*st->mutex); st->message = "下载失败（网络错误或超时）"; }
                 st->error.store(true, std::memory_order_relaxed);
@@ -285,18 +296,30 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop,
         if (wantCheck || st->available.load() == false) {
             // ---- 检查更新（周期轮询；发现新版本后停止轮询，等用户操作）----
             st->error.store(false, std::memory_order_relaxed);
-            std::string source = cfgUrl.empty() ? kGitHubApi : cfgUrl;
+            // 双线路：主源(cfgUrl=CloudBase 国内) → 备源(GitHub 国际/本机可达)
+            std::string sources[2];
+            int nSrc = 0;
+            if (!cfgUrl.empty()) sources[nSrc++] = cfgUrl;   // 主源
+            sources[nSrc++] = kGitHubApi;                    // 备源（始终尝试）
             {
                 std::lock_guard<std::mutex> lk(*st->mutex);
                 st->message = "正在检查更新…";
             }
-            std::string body = httpGet(source);
-            std::string ver, url, sha;
-            bool ok = !body.empty() && parseManifest(body, ver, url, sha);
+            std::string ver, url, sha, mirror;
+            bool ok = false;
+            for (int i = 0; i < nSrc; ++i) {
+                std::string body = httpGet(sources[i]);
+                if (body.empty()) continue;                 // 该源不可达 → 试下一个
+                std::string v, u, s, m;
+                if (parseManifest(body, v, u, s, m)) {
+                    ver = v; url = u; sha = s; mirror = m; ok = true; break;
+                }
+            }
             if (ok) {
                 std::lock_guard<std::mutex> lk(*st->mutex);
                 st->latestVersion = ver;
                 st->downloadUrl = url;
+                st->mirrorUrl = mirror;
                 st->sha256 = sha;
                 bool newer = versionGreater(ver, kAppVersion);
                 st->available.store(newer, std::memory_order_relaxed);

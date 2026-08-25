@@ -1,3 +1,4 @@
-version=1.0.2
+version=1.0.3
 url=https://tuncloud-9933-d8gf22m5w52d15d13-1416124613.tcloudbaseapp.com/asio_bridge_setup.exe
-sha256=ad988606c9eeaaf8f3ad5402e35a9831a2d799474191118d31e6711565d97667
+mirror=https://github.com/SWBullet/asio-bridge/releases/download/v1.0.3/asio_bridge_setup.exe
+sha256=c85478c9126dd3bb69886c5e569b78968cd70bb531372b6524588078a03cd337
