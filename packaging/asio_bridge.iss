@@ -13,7 +13,7 @@
 ;   - 可选勾选「开机自动启动」「桌面快捷方式」
 ; ============================================================================
 #define MyAppName "ASIO Bridge"
-#define MyAppVersion "1.0.3"
+#define MyAppVersion "1.0.4"
 #define MyAppPublisher "文超工作室"
 #define MyAppExeName "asio_bridge.exe"
 
