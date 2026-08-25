@@ -69,6 +69,10 @@ DSP 链（可选逐级开关）：
 - **设备扫描**：枚举 WASAPI 端点 ↔ ASIO 驱动，模糊名匹配 + 别名表
   （MADIface→RME/ADI-2、Realtek、Focusrite、Scarlett 等）；
 - **按所选设备自动决定后端**：匹配到 ASIO 驱动走 ASIO，否则 WASAPI 独占；
+- **启动自动适配（通用发行版，无需配置）**——未手动选择设备时按优先级自动选：
+  ① 设备列表中匹配到 ASIO 的端点 → ② 注册表枚举到的第一个 ASIO 驱动
+  （纯 ASIO 声卡无 WASAPI 端点时）→ ③ 第一个 WASAPI 独占端点；
+  自动选中的 ASIO 初始化失败（驱动未装 / 设备未接）自动降级 WASAPI 独占；
 - WASAPI 独占渲染：事件驱动线程，`AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED` 自动重试，
   float32 / int16 / int32 × 48k / 44.1k / 32k 候选格式探测；
 - 运行中可通过 Web 控制台切换设备、重新扫描。
@@ -141,8 +145,8 @@ cmake --build build --config Release
 # 列出 ASIO 驱动
 .\build\Release\asio_bridge.exe --list
 
-# 指定 ASIO 驱动 / 测试 ASIO 链路（1kHz 正弦直出）
-.\build\Release\asio_bridge.exe --driver "ASIO MADIface USB" --tone --rate 44100
+# 测试 ASIO 链路（1kHz 正弦直出，自动选第一个可用 ASIO 驱动）
+.\build\Release\asio_bridge.exe --tone --rate 44100
 
 # 数值自检（渲染→回环自采比对，含静音语义）
 .\build\Release\asio_bridge.exe --capture-test
@@ -157,7 +161,7 @@ cmake --build build --config Release
 | --- | --- |
 | `--list` | 列出 ASIO 驱动 |
 | `--tone` | 1kHz 正弦直接经 ASIO 输出（验证 ASIO 链路） |
-| `--driver <名字>` | 指定 ASIO 驱动（默认 ASIO MADIface USB） |
+| `--driver <名字>` | 指定 ASIO 驱动（默认自动选择：设备匹配 ASIO → 注册表首个 → WASAPI 独占） |
 | `--rate <Hz>` | `--tone` 模式采样率（默认 44100） |
 | `--buffer <帧数>` | ASIO 缓冲帧数（默认驱动值，低延迟可试 128 / 64） |
 | `--log <文件>` | 追加写入日志文件（后台 / 自启运行用） |
