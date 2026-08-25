@@ -451,17 +451,18 @@ async function pollStatus(){
     var ub=document.getElementById('updbar');
     if(s.appVer){
       var msgEl=document.getElementById('updmsg');
-      // 常态文案：检查更新（当前版本号）；有动态状态时展示状态
+      // 常态文案：检查更新（版本号）；有动态状态时展示状态
       if(s.updateAvailable){
-        msgEl.textContent='发现新版本 v'+s.updateVer+'（当前 v'+s.appVer+'）';
+        msgEl.textContent='发现新版本 V'+s.updateVer+'（版本：V'+s.appVer+'）';
       } else if(s.updateChecking){
         msgEl.textContent='正在检查更新…';
       } else if(s.updateDownloading){
         msgEl.textContent='正在下载并升级…';
       } else if(s.updateError){
-        msgEl.textContent='检查更新失败（当前 v'+s.appVer+'）';
+        // 检查失败不提示失败字样，静默回到常态文案
+        msgEl.textContent='检查更新（版本：V'+s.appVer+'）';
       } else {
-        msgEl.textContent='检查更新（当前 v'+s.appVer+'）';
+        msgEl.textContent='检查更新（版本：V'+s.appVer+'）';
       }
       document.getElementById('updcheck').style.display=s.updateChecking?'none':'inline-block';
       document.getElementById('updgo').style.display=s.updateAvailable?'inline-block':'none';

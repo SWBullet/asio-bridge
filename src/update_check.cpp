@@ -94,6 +94,8 @@ std::string httpGet(const std::string& url, int timeoutMs = 10000) {
     HINTERNET hInt = WinHttpOpen(L"asio-bridge-updater/1.0",
                                  WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, nullptr, nullptr, 0);
     if (!hInt) return result;
+    // 超时生效：解析用系统默认(0)，连接/发送/接收受 timeoutMs 控制
+    WinHttpSetTimeouts(hInt, 0, timeoutMs, timeoutMs, timeoutMs);
     HINTERNET hConn = WinHttpConnect(hInt, host, uc.nPort, 0);
     if (hConn) {
         std::wstring verb(L"GET");
