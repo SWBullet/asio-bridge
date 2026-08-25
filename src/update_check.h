@@ -22,13 +22,14 @@
 // ============================================================================
 
 // 软件当前版本（打包/发布时同步修改）
-static const char* kAppVersion = "1.0.4";
+static const char* kAppVersion = "1.0.5";
 
 // 更新检查状态（控制台只读，检查线程写）
 struct UpdateState {
     std::atomic<bool>  checking{false};   // 正在检查
     std::atomic<bool>  available{false};  // 发现新版本
-    std::atomic<bool>  downloading{false};// 正在下载
+    std::atomic<bool>  downloading{false};// 下载请求（一次性，由检查线程消费）
+    std::atomic<bool>  active{false};     // 正在下载（含网络拉取+写盘+校验），UI 状态用
     std::atomic<bool>  error{false};      // 检查/下载出错
     std::atomic<bool>  quitRequested{false}; // 升级安装已启动，主程序应退出
     // 以下字符串由检查线程写、控制台线程读：用简单互斥保护，避免撕裂

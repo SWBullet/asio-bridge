@@ -235,6 +235,7 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop,
                 st->error.store(true, std::memory_order_relaxed);
                 continue;
             }
+            st->active.store(true, std::memory_order_relaxed);   // 进入下载态：UI 显示「正在下载」
             wchar_t tmp[MAX_PATH];
             GetTempPathW(MAX_PATH, tmp);
             std::wstring file = std::wstring(tmp) + L"asio_bridge_setup_" +
@@ -254,6 +255,7 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop,
             if (body.empty()) {
                 { std::lock_guard<std::mutex> lk(*st->mutex); st->message = "下载失败（网络错误或超时）"; }
                 st->error.store(true, std::memory_order_relaxed);
+                st->active.store(false, std::memory_order_relaxed);
                 continue;
             }
             // 注意：安装包是二进制，httpGet 的 std::string 可容纳，但 WinHTTP ReadData
@@ -264,6 +266,7 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop,
                 if (h == INVALID_HANDLE_VALUE) {
                     { std::lock_guard<std::mutex> lk(*st->mutex); st->message = "写入临时文件失败"; }
                     st->error.store(true, std::memory_order_relaxed);
+                    st->active.store(false, std::memory_order_relaxed);
                     continue;
                 }
                 DWORD w = 0;
@@ -279,13 +282,17 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop,
                     DeleteFileW(file.c_str());
                     { std::lock_guard<std::mutex> lk(*st->mutex); st->message = "安装包校验失败（SHA256 不符）"; }
                     st->error.store(true, std::memory_order_relaxed);
+                    st->active.store(false, std::memory_order_relaxed);
                     continue;
                 }
             }
             // 静默启动安装程序
+            st->active.store(false, std::memory_order_relaxed);
+            // 安装器可见（/SILENT 显示进度、SW_SHOWNORMAL 不隐藏），强制关闭运行实例，
+            // 让用户确认真的在下载、且升级真正生效
             ShellExecuteW(nullptr, L"open", file.c_str(),
-                          L"/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /FORCECLOSEAPPLICATIONS",
-                          nullptr, SW_HIDE);
+                          L"/SILENT /FORCECLOSEAPPLICATIONS /NORESTART",
+                          nullptr, SW_SHOWNORMAL);
             {
                 std::lock_guard<std::mutex> lk(*st->mutex);
                 st->message = "升级安装已启动，程序即将退出…";

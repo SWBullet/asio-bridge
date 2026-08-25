@@ -471,22 +471,26 @@ async function pollStatus(){
       setBank('bank-width',String(s.thicknessWidth||0));
       document.getElementById('bank-device').value=String(s.selectedDevice);
     }
-    // ===== 在线升级（底部状态条）：检查更新（当前版本号）=====
+    // ===== 在线升级（底部状态条）=====
     var ub=document.getElementById('updbar');
     if(s.appVer){
       var msgEl=document.getElementById('updmsg');
-      // 常态文案：检查更新（版本号）；有动态状态时展示状态
-      if(s.updateAvailable){
-        msgEl.textContent='发现新版本 V'+s.updateVer+'（版本：V'+s.appVer+'）';
+      // 真实状态优先，失败必须可见（不再静默回退），按钮保留可重试
+      if(s.updateDownloading){
+        msgEl.textContent='正在下载并升级 V'+s.updateVer+' …';
+        msgEl.style.color='#ffb84a';
+      } else if(s.updateError){
+        msgEl.textContent=(s.updateMsg||'操作失败')+'（版本：V'+s.appVer+'）';
+        msgEl.style.color='#f85149';
       } else if(s.updateChecking){
         msgEl.textContent='正在检查更新…';
-      } else if(s.updateDownloading){
-        msgEl.textContent='正在下载并升级…';
-      } else if(s.updateError){
-        // 检查失败不提示失败字样，静默回到常态文案
-        msgEl.textContent='检查更新（版本：V'+s.appVer+'）';
+        msgEl.style.color='#aab2bc';
+      } else if(s.updateAvailable){
+        msgEl.textContent='发现新版本 V'+s.updateVer+'，可下载并升级（当前 V'+s.appVer+'）';
+        msgEl.style.color='#aab2bc';
       } else {
         msgEl.textContent='检查更新（版本：V'+s.appVer+'）';
+        msgEl.style.color='#aab2bc';
       }
       document.getElementById('updcheck').style.display=s.updateChecking?'none':'inline-block';
       document.getElementById('updgo').style.display=s.updateAvailable?'inline-block':'none';
@@ -831,7 +835,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             kAppVersion,
             (g_p.update && g_p.update->available.load(std::memory_order_relaxed)) ? 1 : 0,
             (g_p.update && g_p.update->checking.load(std::memory_order_relaxed)) ? 1 : 0,
-            (g_p.update && g_p.update->downloading.load(std::memory_order_relaxed)) ? 1 : 0,
+            (g_p.update && g_p.update->active.load(std::memory_order_relaxed)) ? 1 : 0,
             (g_p.update && g_p.update->error.load(std::memory_order_relaxed)) ? 1 : 0,
             updMsg.c_str(),
             updVer.c_str());
