@@ -17,10 +17,15 @@ if ($Remove) {
 }
 
 # Derive paths from this script's location instead of hardcoding E:\Harness
+# 自适应：优先安装版(脚本父目录\asio_bridge.exe)，回退开发版(父目录\build\Release)
 $root = Split-Path -Parent $PSScriptRoot
-$exe = Join-Path $root 'build\Release\asio_bridge.exe'
-if (-not (Test-Path $exe)) {
-    Write-Output "Bridge not found: $exe (build it first)"
+$instExe = Join-Path $root 'asio_bridge.exe'
+$devExe = Join-Path $root 'build\Release\asio_bridge.exe'
+$exe = $null
+if (Test-Path $instExe) { $exe = $instExe }
+elseif (Test-Path $devExe) { $exe = $devExe }
+else {
+    Write-Output "Bridge not found (tried: $instExe / $devExe; build it first)"
     exit 1
 }
 $logFile = Join-Path $env:USERPROFILE 'asio_bridge.log'
@@ -33,9 +38,18 @@ $vbsContent = 'Set fso = CreateObject("Scripting.FileSystemObject")' + "`r`n" +
     'Set ws = CreateObject("Wscript.Shell")' + "`r`n" +
     'here = fso.GetParentFolderName(fso.GetAbsolutePathName(WScript.ScriptFullName))' + "`r`n" +
     'root = fso.GetParentFolderName(here)' + "`r`n" +
-    'exe = root & "\build\Release\asio_bridge.exe"' + "`r`n" +
+    'instExe = root & "\asio_bridge.exe"' + "`r`n" +
+    'devExe  = root & "\build\Release\asio_bridge.exe"' + "`r`n" +
+    'If fso.FileExists(instExe) Then' + "`r`n" +
+    '    exe = instExe' + "`r`n" +
+    'ElseIf fso.FileExists(devExe) Then' + "`r`n" +
+    '    exe = devExe' + "`r`n" +
+    'Else' + "`r`n" +
+    '    WScript.Echo "asio_bridge.exe not found (tried: " & instExe & " / " & devExe & ")"' + "`r`n" +
+    '    WScript.Quit 1' + "`r`n" +
+    'End If' + "`r`n" +
     'logFile = ws.ExpandEnvironmentStrings("%USERPROFILE%") & "\asio_bridge.log"' + "`r`n" +
-    'ws.Run """" & exe & """ --log """ & logFile & """'
+    'ws.Run """" & exe & """ --log """ & logFile & """ --hidden'
 if ($Buffer -gt 0) { $vbsContent += ' --buffer ' + $Buffer }
 if ($Dither) { $vbsContent += ' --dither' }
 $vbsContent += '", 0, False' + "`r`n"

@@ -1172,6 +1172,7 @@ int wmain(int argc, wchar_t** argv) {
 
     bool list = false, tone = false;
     bool crashTest = false;   // --crash-test:服务启动后故意空指针崩溃,验证自愈拉起链路
+    bool hidden = false;      // --hidden:启动后立即隐藏控制台窗口(后台服务/自启/快捷方式用)
     std::string driver;       // 空=自动选择(优先 ASIO, 无则 WASAPI 独占); --driver 显式指定
     double toneRate = 44100.0;
     long reqBuffer = 0;
@@ -1190,6 +1191,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--dither") { ditherFlag = true; ditherArgGiven = true; }
         else if (a == L"--no-dither") { ditherFlag = false; ditherArgGiven = true; }
         else if (a == L"--no-mute") noMute = true;
+        else if (a == L"--hidden") hidden = true;
         else if (a == L"--crash-test") crashTest = true;
         else if (a == L"--passthrough") passthroughArg = true;
         else if (a == L"--resampler-test") { return resamplerSelfTest(); }
@@ -1212,6 +1214,11 @@ int wmain(int argc, wchar_t** argv) {
             }
         }
         else if (a == L"--help" || a == L"-h") { usage(); return 0; }
+    }
+
+    if (hidden) {   // --hidden:隐藏控制台窗口(后台服务/自启/快捷方式双击)
+        HWND hw = GetConsoleWindow();
+        if (hw) ShowWindow(hw, SW_HIDE);
     }
 
     // 必须 STA：RME MADIface ASIO 的 COM 对象(ThreadingModel=Apartment)

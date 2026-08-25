@@ -61,12 +61,12 @@ Source: "..\docs\更新说明-设备自动适配强化.txt"; DestDir: "{app}\doc
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--hidden"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--hidden"; Tasks: desktopicon
 
 [Run]
-; 安装完可选择直接启动桥
-Filename: "{app}\{#MyAppExeName}"; Description: "立即运行 ASIO Bridge"; Flags: nowait postinstall skipifsilent
+; 安装完可选择直接启动桥(隐藏窗口)
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--hidden"; Description: "立即运行 ASIO Bridge"; Flags: nowait postinstall skipifsilent
 ; 勾选「开机自动启动」时安装计划任务(隐藏窗口)
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\install_autostart.ps1"""; Tasks: autostart; Flags: runhidden
 
