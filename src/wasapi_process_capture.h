@@ -88,3 +88,8 @@ struct EndpointMuteEntry {
 };
 std::vector<EndpointMuteEntry> MuteTargetEndpoints(DWORD pid);
 void RestoreEndpointMutes(std::vector<EndpointMuteEntry>& entries);
+
+// 崩溃自愈：启动时消费 mute_flag.txt（上次异常退出残留的静音端点记录），
+// 按端点 ID 解除残留静音。返回恢复的端点数；-1 = 无残留标志（上次正常退出）；
+// 0 = 标志存在但无匹配端点（设备已拔出/禁用）。必须在首个会话建立前调用。
+int RecoverOrphanMutes();

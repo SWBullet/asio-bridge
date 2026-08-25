@@ -324,10 +324,23 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop,
 }
 
 // ============================================================================
+// 文件级静态锁：UpdateState::mutex 的唯一指向。
+// 关键时序：必须在 startWebConsole() 之前由 primeUpdateState() 完成装配——
+// Web 线程从启动第一毫秒起就可能响应 /api/status（浏览器 UI 轮询），
+// 若 mutex 仍为 nullptr，lock_guard(*nullptr) 会在 mtx_do_lock 内解引用
+// 空指针崩溃（0xC0000005，崩溃签名固定于 mtx_do_lock+0x2F）。
+// startWebConsole 与 startUpdateChecker 之间隔着设备扫描/loadConfig/静音
+// 自愈等耗时步骤，该窗口若不提前装配，UI 轮询一旦撞上即崩。
+// ============================================================================
+static std::mutex sUpdateMutex;
+
+void primeUpdateState(UpdateState* st) {
+    st->mutex = &sUpdateMutex;   // 幂等：与 startUpdateChecker 赋同一把锁
+}
+
 void startUpdateChecker(UpdateState* st, std::atomic<bool>* stopFlag,
                         const std::string& cfgUpdateUrl) {
-    static std::mutex sMutex;   // 字符串保护区（控制台读同一把锁）
-    st->mutex = &sMutex;
+    st->mutex = &sUpdateMutex;   // 字符串保护区（控制台读同一把锁）
     std::thread t([st, stopFlag, cfgUpdateUrl] {
         updateLoop(st, stopFlag, cfgUpdateUrl);
     });

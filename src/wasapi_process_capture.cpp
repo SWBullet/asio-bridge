@@ -587,9 +587,32 @@ DWORD FindActiveAudioPid(const wchar_t* preferredSubstr, float* outPeak) {
 // 因此静音目标进程（含进程树，与 INCLUDE_TARGET_PROCESS_TREE 对齐）所在
 // 渲染端点的终点主音量，既消除双重声又完全不影响捕获；ASIO 不走 WDM
 // 终点音量，桥输出不受影响。
+//
+// 静音状态持久化（崩溃自愈）：静音成功即把端点 ID 写入 exe 旁 mute_flag.txt，
+// 正常恢复后删除。进程被强杀/崩溃时优雅退出不会执行、文件残留——下次启动
+// RecoverOrphanMutes() 据此识别残留静音并解除。否则新进程会话走到
+// 「本来已静音，无需记录」分支（不记录恢复责任），桥开关关闭时恢复列表为空、
+// 系统音量卡死在静音态——表现为「开关联动系统音量失效」。
 // ---------------------------------------------------------------------------
+static std::wstring MuteFlagPath() {
+    wchar_t buf[MAX_PATH];
+    GetModuleFileNameW(nullptr, buf, MAX_PATH);
+    std::wstring p(buf);
+    size_t slash = p.find_last_of(L"\\/");
+    return (slash == std::wstring::npos) ? std::wstring(L"mute_flag.txt")
+                                         : p.substr(0, slash + 1) + L"mute_flag.txt";
+}
+
+// 端点 ID 为全 ASCII（形如 {0.0.0.00000000}.{GUID}），宽→窄逐字符截断即可
+static std::string NarrowAscii(const wchar_t* w) {
+    std::string s;
+    for (; *w; ++w) s.push_back((char)(*w & 0x7F));
+    return s;
+}
+
 static std::vector<EndpointMuteEntry> MuteTargetEndpointsInner(DWORD pid) {
     std::vector<EndpointMuteEntry> out;
+    std::vector<std::string> mutedIds;   // 本次新增静音的端点 ID（写崩溃自愈标志）
     if (!pid) return out;
 
     // 进程树成员判定：收集父链，判断会话 PID 是否为目标或其任意后代
@@ -663,6 +686,11 @@ static std::vector<EndpointMuteEntry> MuteTargetEndpointsInner(DWORD pid) {
                         ev->Release();   // 本来已静音，无需记录
                     } else if (SUCCEEDED(ev->SetMute(TRUE, nullptr))) {
                         out.push_back({ ev, FALSE });
+                        LPWSTR devId = nullptr;
+                        if (SUCCEEDED(dev->GetId(&devId)) && devId) {
+                            mutedIds.push_back(NarrowAscii(devId));
+                            CoTaskMemFree(devId);
+                        }
                     } else {
                         ev->Release();
                     }
@@ -673,6 +701,19 @@ static std::vector<EndpointMuteEntry> MuteTargetEndpointsInner(DWORD pid) {
         coll->Release();
     }
     en->Release();
+    // 崩溃自愈标志：本批新增静音的端点 ID 落盘。恢复路径
+    // (RestoreEndpointMutes) 成功后删除；进程若被强杀则文件残留，
+    // 下次启动由 RecoverOrphanMutes() 消费。
+    if (!mutedIds.empty()) {
+        FILE* f = _wfopen(MuteFlagPath().c_str(), L"w");
+        if (f) {
+            for (auto& id : mutedIds) {
+                fwrite(id.data(), 1, id.size(), f);
+                fputc('\n', f);
+            }
+            fclose(f);
+        }
+    }
     return out;
 }
 
@@ -694,6 +735,66 @@ void RestoreEndpointMutes(std::vector<EndpointMuteEntry>& entries) {
         if (e.ev) { e.ev->Release(); e.ev = nullptr; }
     }
     entries.clear();
+    _wremove(MuteFlagPath().c_str());   // 本批静音已恢复：清除崩溃自愈标志
+}
+
+// 消费崩溃自愈标志：按 mute_flag.txt 记录的端点 ID 解除残留静音。
+// 返回恢复的端点数；-1 = 无标志文件（上次正常退出）；0 = 标志存在但
+// 无匹配端点（设备已拔出/禁用——标志一次性消费，同样删除）。
+static int RecoverOrphanMutesInner() {
+    std::wstring path = MuteFlagPath();
+    FILE* f = _wfopen(path.c_str(), L"r");
+    if (!f) return -1;
+    std::vector<std::string> ids;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char* nl = strpbrk(line, "\r\n");
+        if (nl) *nl = 0;
+        if (line[0]) ids.push_back(line);
+    }
+    fclose(f);
+    if (ids.empty()) { _wremove(path.c_str()); return 0; }
+
+    int recovered = 0;
+    IMMDeviceEnumerator* en = nullptr;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                   __uuidof(IMMDeviceEnumerator), (void**)&en)) && en) {
+        IMMDeviceCollection* coll = nullptr;
+        if (SUCCEEDED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &coll)) && coll) {
+            UINT count = 0;
+            coll->GetCount(&count);
+            for (UINT i = 0; i < count; ++i) {
+                IMMDevice* dev = nullptr;
+                if (FAILED(coll->Item(i, &dev))) continue;
+                LPWSTR devId = nullptr;
+                if (SUCCEEDED(dev->GetId(&devId)) && devId) {
+                    std::string id = NarrowAscii(devId);
+                    CoTaskMemFree(devId);
+                    for (auto& want : ids) {
+                        if (want != id) continue;
+                        IAudioEndpointVolume* ev = nullptr;
+                        if (SUCCEEDED(dev->Activate(__uuidof(IAudioEndpointVolume),
+                                                    CLSCTX_ALL, nullptr, (void**)&ev)) && ev) {
+                            // 标志中的端点均为静音前非静音态（prevMute=FALSE 才会
+                            // 被记录），残留恢复 = 解除静音
+                            if (SUCCEEDED(ev->SetMute(FALSE, nullptr))) ++recovered;
+                            ev->Release();
+                        }
+                        break;
+                    }
+                }
+                dev->Release();
+            }
+            coll->Release();
+        }
+        en->Release();
+    }
+    _wremove(path.c_str());
+    return recovered;
+}
+
+int RecoverOrphanMutes() {
+    return RunComOnMta([] { return RecoverOrphanMutesInner(); });
 }
 
 std::vector<EndpointMuteEntry> MuteTargetEndpoints(DWORD pid) {

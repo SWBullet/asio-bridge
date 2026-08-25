@@ -1399,6 +1399,10 @@ int wmain(int argc, wchar_t** argv) {
         &g_devices, &g_devMutex, &g_selectedDevice,
         &updateState
     };
+    // 装配升级状态锁：Web 线程启动第一毫秒就可能读 update 状态（UI 轮询
+    // /api/status 会 lock(*update->mutex)），锁必须先于 startWebConsole 就位，
+    // 否则窗口期轮询会解引用 nullptr 崩溃（mtx_do_lock 内 0xC0000005）。
+    primeUpdateState(&updateState);
     startWebConsole(web);
     // 扫描输出设备(ASIO/WASAPI 判定)，供控制台设备列表展示
     {
@@ -1493,6 +1497,17 @@ int wmain(int argc, wchar_t** argv) {
         fclose(f);
     };
     loadConfig();
+    // 静音残留自愈：上次进程被强杀/崩溃时，被静音端点的记录文件（mute_flag.txt）
+    // 会残留。必须赶在首个会话建立前按记录解除静音——否则新会话会走到
+    // 「本来已静音，无需记录」分支，桥关闭时恢复列表为空，系统音量卡死在
+    // 静音态（即「开关联动系统音量失效」的根因）。
+    {
+        int recovered = RecoverOrphanMutes();
+        if (recovered > 0)
+            printf("[静音] 检测到上次异常退出的残留静音，已恢复 %d 个端点的音量\n", recovered);
+        else if (recovered == 0)
+            printf("[静音] 上次残留记录的端点已不可用（可能已拔出），清除残留标志\n");
+    }
     ditherOn.store(ditherFlag, std::memory_order_relaxed);   // 控制台在首个会话前即显示正确状态
     // 在线升级检查线程（后台常驻，网络失败静默；cfg update_url 可覆盖默认 GitHub 源）
     // 必须在 loadConfig 之后：updateUrl 来自配置文件
@@ -1569,10 +1584,11 @@ int wmain(int argc, wchar_t** argv) {
         }
         // 恢复上一会话静音的目标端点（模式切换/重建/失败重试前必须先还原，
         // 否则目标端点会一直被静音）
+        size_t restoredThisPass = 0;
         if (!endpointMutes.empty()) {
-            size_t n = endpointMutes.size();
+            restoredThisPass = endpointMutes.size();
             RestoreEndpointMutes(endpointMutes);
-            printf("[静音] 已恢复 %zu 个端点的原音量\n", n);
+            printf("[静音] 已恢复 %zu 个端点的原音量\n", restoredThisPass);
         }
         // ASIO Bridge 关闭：系统音量已恢复，静默等待重新开启
         if (!bridgeOn.load(std::memory_order_relaxed)) {
@@ -1585,7 +1601,9 @@ int wmain(int argc, wchar_t** argv) {
             targetActive.store(false, std::memory_order_relaxed);
             static int offStreak = 0;
             if ((offStreak++ % 25) == 0)
-                printf("[桥] ASIO Bridge 已关闭（系统音量已恢复），等待开启…\n");
+                printf(restoredThisPass > 0
+                           ? "[桥] ASIO Bridge 已关闭（系统音量已恢复），等待开启…\n"
+                           : "[桥] ASIO Bridge 已关闭，等待开启…\n");
             {
                 ULONGLONG nowCfg = GetTickCount64();
                 if (nowCfg - lastCfgSave >= 5000) { saveConfig(); lastCfgSave = nowCfg; }
@@ -1685,7 +1703,7 @@ int wmain(int argc, wchar_t** argv) {
                                (unsigned long)pid, endpointMutes.size());
                     else
                         printf("[静音] 目标进程 %lu 所在端点：无新增静音"
-                               "（可能已处于静音态，或获取终点音量失败）\n",
+                               "（端点已是静音态或获取音量失败——桥关闭时不会恢复此端点）\n",
                                (unsigned long)pid);
                 }
             }

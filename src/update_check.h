@@ -36,6 +36,11 @@ struct UpdateState {
     std::string        message;           // 人读信息（错误/状态）
 };
 
+// 装配 UpdateState::mutex（指向文件级静态锁）。必须在 startWebConsole()
+// 之前调用：Web 线程启动第一毫秒就可能读 update 状态（UI 轮询 /api/status），
+// 锁未装配时 lock_guard(*nullptr) 会崩溃。幂等，可重复调用。
+void primeUpdateState(UpdateState* st);
+
 // 启动后台检查线程（常驻，周期轮询）。stopFlag 置位后退出。
 // cfgUpdateUrl: 配置文件里的 update_url（空=用内置 GitHub 源）
 void startUpdateChecker(UpdateState* st, std::atomic<bool>* stopFlag,
