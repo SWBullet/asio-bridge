@@ -1,5 +1,6 @@
 #pragma once
 #include "device_scan.h"
+#include "update_check.h"
 #include <atomic>
 #include <cstdint>
 #include <mutex>
@@ -58,6 +59,7 @@ struct BridgeStatsPtrs {
     std::vector<DeviceEntry>* devices;     // 输出设备列表(控制台展示)
     std::mutex* devicesMutex;              // 保护 devices
     std::atomic<int>* selectedDevice;      // 选中的设备索引(-1=自动)
+    UpdateState* update;                   // 在线升级状态（可空=未启用）
 };
 
 constexpr size_t kHistCap = 3600;   // 2 秒一采样 × 3600 = 2 小时

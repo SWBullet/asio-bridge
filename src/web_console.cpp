@@ -187,6 +187,15 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
   </div>
 </div>
 
+<div id="updbar" style="display:none;margin:10px 0;padding:10px 14px;background:linear-gradient(180deg,#2a2410,#1a150a);
+  border:1px solid #8a6d2b;border-radius:6px;font-size:13px;color:#ffd27f;align-items:center;gap:10px;flex-wrap:wrap">
+  <span id="updmsg">正在检查更新…</span>
+  <span style="flex:1"></span>
+  <button class="btn" id="updcheck" style="display:none">检查更新</button>
+  <button class="btn" id="updgo" style="display:none;background:linear-gradient(180deg,#8a2b2b,#571717);border-color:#c05050">下载并升级</button>
+  <button class="btn" id="upddismiss" style="display:none">知道了</button>
+</div>
+
 <div class="panel">
   <div class="mtitle">TELEMETRY</div>
   <div class="grid" id="meters">
@@ -466,6 +475,16 @@ async function pollStatus(){
       setBank('bank-width',String(s.thicknessWidth||0));
       document.getElementById('bank-device').value=String(s.selectedDevice);
     }
+    // ===== 在线升级横幅 =====
+    var ub=document.getElementById('updbar');
+    if(s.appVer){
+      var msgEl=document.getElementById('updmsg');
+      msgEl.textContent=(s.updateMsg||'')+'（当前 v'+s.appVer+'）';
+      document.getElementById('updcheck').style.display=s.updateChecking?'none':'inline-block';
+      document.getElementById('updgo').style.display=s.updateAvailable?'inline-block':'none';
+      document.getElementById('upddismiss').style.display=s.updateAvailable?'inline-block':'none';
+      ub.style.display='flex';
+    }
   }catch(e){}
 }
 function setBank(id,val){
@@ -500,6 +519,9 @@ document.getElementById('booster-db').oninput=function(e){document.getElementByI
 document.getElementById('booster-db').onchange=function(e){ctl('action=boosterdb&value='+e.target.value)}
 document.getElementById('bridge').onclick=function(){var on=!this.classList.contains('on');this.classList.toggle('on',on);ctl('action=bridge&value='+(on?1:0))}
 document.getElementById('reset').onclick=function(){ctl('action=reset&value=1')}
+document.getElementById('updcheck').onclick=function(){ctl('action=updatecheck&value=1')}
+document.getElementById('updgo').onclick=function(){ctl('action=updatedownload&value=1')}
+document.getElementById('upddismiss').onclick=function(){document.getElementById('updbar').style.display='none'}
 function loadDevices(){
   try{
     fetch('/api/devices').then(function(r){return r.json()}).then(function(s){
@@ -719,6 +741,13 @@ static void handleRequest(SOCKET s, char* req, int n) {
         unsigned long long c = g_p.consumed->load(std::memory_order_relaxed);
         unsigned long long d = g_p.dropped->load(std::memory_order_relaxed);
         unsigned long long u = g_p.underruns->load(std::memory_order_relaxed);
+        // 升级状态字符串快照（检查线程写，此处加锁防撕裂）
+        std::string updMsg, updVer;
+        if (g_p.update) {
+            std::lock_guard<std::mutex> lk(*g_p.update->mutex);
+            updMsg = g_p.update->message;
+            updVer = g_p.update->latestVersion;
+        }
         // 滑动窗口：最近 10 分钟内是否发生过真欠载（LED 用，不随历史累计永久变红）
         unsigned long long lastUnder = g_p.lastUnderrunAt->load(std::memory_order_relaxed);
         int underRecent = (lastUnder && (GetTickCount64() - lastUnder < 600000)) ? 1 : 0;
@@ -743,7 +772,9 @@ static void handleRequest(SOCKET s, char* req, int n) {
             "\"boosterOn\":%d,\"boosterDb\":%.1f,"
             "\"bridgeOn\":%d,"
             "\"selectedDevice\":%d,"
-            "\"targetPid\":%u,\"targetActive\":%d}",
+            "\"targetPid\":%u,\"targetActive\":%d,"
+            "\"appVer\":\"%s\",\"updateAvailable\":%d,\"updateChecking\":%d,"
+            "\"updateDownloading\":%d,\"updateError\":%d,\"updateMsg\":\"%s\",\"updateVer\":\"%s\"}",
             wm, target, (unsigned long long)floorM, (unsigned long long)wmMult,
             u, d, (double)g_p.peak->load(std::memory_order_relaxed),
             (double)g_p.driftPpm->load(std::memory_order_relaxed),
@@ -769,7 +800,14 @@ static void handleRequest(SOCKET s, char* req, int n) {
             g_p.bridgeOn->load(std::memory_order_relaxed) ? 1 : 0,
             (int)g_p.selectedDevice->load(std::memory_order_relaxed),
             (unsigned)g_p.targetPid->load(std::memory_order_relaxed),
-            g_p.targetActive->load(std::memory_order_relaxed) ? 1 : 0);
+            g_p.targetActive->load(std::memory_order_relaxed) ? 1 : 0,
+            kAppVersion,
+            (g_p.update && g_p.update->available.load(std::memory_order_relaxed)) ? 1 : 0,
+            (g_p.update && g_p.update->checking.load(std::memory_order_relaxed)) ? 1 : 0,
+            (g_p.update && g_p.update->downloading.load(std::memory_order_relaxed)) ? 1 : 0,
+            (g_p.update && g_p.update->error.load(std::memory_order_relaxed)) ? 1 : 0,
+            updMsg.c_str(),
+            updVer.c_str());
         sendResponse(s, "200 OK", "application/json; charset=utf-8", body, len);
     } else if (strcmp(path, "/api/control") == 0 && strcmp(method, "POST") == 0) {
         // CSRF Token 校验（跨站防护第二道：恶意页面猜不到本进程随机生成的 Token）
@@ -843,6 +881,10 @@ static void handleRequest(SOCKET s, char* req, int n) {
                 }
             } else if (strstr(body, "action=reset")) {
                 g_p.resetReq->store(true);
+            } else if (strstr(body, "action=updatecheck") && g_p.update) {
+                requestUpdateCheck(g_p.update);
+            } else if (strstr(body, "action=updatedownload") && g_p.update) {
+                requestUpdateDownload(g_p.update);
             }
         }
         const char* okBody = "{\"ok\":true}";

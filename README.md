@@ -111,7 +111,6 @@ DSP 链（可选逐级开关）：
   自检 / 故障排查）。
 
 ### 10. 数值自检（先测后上线）
-
 | 自检 | 验证内容 |
 | --- | --- |
 | `--resampler-test` | 重采样器正弦离线数值验证 |
@@ -120,6 +119,20 @@ DSP 链（可选逐级开关）：
 | `--capture-test` | 渲染 997Hz 正弦 → 按 PID 回环自采 → RMS / 峰值 / 频率比对 + 静音语义验证 |
 | `--limiter-test` | 采集限幅器位置实测 |
 | `--conv-test` | ASIO 格式转换离线验证 |
+
+### 11. 在线升级（预留接口 + 完整链路）
+
+- **版本检查**：启动时后台线程检查更新源，控制台顶部横幅显示
+  「发现新版本 vX.X.X」；也可点「检查更新」手动触发；
+- **更新源可配置**：`asio_bridge.cfg` 的 `update_url` 指向清单文件
+  （支持国内服务器 / Gitee / 自建），未配置时默认 GitHub Releases API；
+- **清单格式**（HTTP GET 返回，JSON 或 INI 均可）：
+  `{"version":"1.0.1","url":"https://…/setup.exe","sha256":"<64hex>"}`
+  （GitHub Releases API 的 JSON 自动适配其字段名）；
+- **一键升级**：控制台点「下载并升级」→ 下载安装包 → SHA256 校验
+  （清单提供时）→ 静默运行安装程序 → 桥自动退出；
+- **网络失败静默**：检查/下载失败仅横幅提示，绝不影响音频主功能；
+  出错 30 分钟重试，已是最新 6 小时重查一次。
 
 ---
 
@@ -195,6 +208,7 @@ cmake --build build --config Release
 | `passthrough` | 直通模式 |
 | `floor` / `src_taps` | 水位下限 / 重采样抽头数 |
 | `dither` | TPDF 抖动开关 |
+| `update_url` | 在线升级清单地址（可选；空=内置 GitHub Releases） |
 
 ---
 

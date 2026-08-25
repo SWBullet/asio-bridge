@@ -19,6 +19,7 @@ add_executable(asio_bridge
   src/wasapi_output.cpp
   src/device_scan.cpp
   src/web_console.cpp
+  src/update_check.cpp
   ${ASIO_SDK}/common/asio.cpp
   ${ASIO_SDK}/host/asiodrivers.cpp
   ${ASIO_SDK}/host/pc/asiolist.cpp
@@ -31,7 +32,7 @@ target_include_directories(asio_bridge PRIVATE
   ${ASIO_SDK}/host/pc
 )
 
-target_link_libraries(asio_bridge PRIVATE ole32 oleaut32 uuid avrt ws2_32 mmdevapi)
+target_link_libraries(asio_bridge PRIVATE ole32 oleaut32 uuid avrt ws2_32 mmdevapi winhttp bcrypt)
 
 # 供 MSVC 命令行环境使用
 if(MSVC)

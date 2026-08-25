@@ -11,6 +11,7 @@
 #include "ring_buffer.h"
 #include "wasapi_process_capture.h"
 #include "util.h"
+#include "update_check.h"
 #include "web_console.h"
 #include <windows.h>
 #include <wrl/client.h>   // Microsoft::WRL::ComPtr：RAII COM 指针，消灭手写 Release
@@ -1328,6 +1329,9 @@ int wmain(int argc, wchar_t** argv) {
     std::mutex g_devMutex;
     std::vector<DeviceEntry> g_devices;
     std::atomic<int> g_selectedDevice{-1};           // -1=自动(默认 ASIO)
+    // 在线升级（可选：cfg update_url 指定更新源；空=内置 GitHub Releases）
+    UpdateState updateState;
+    std::string updateUrl;   // cfg 读入（主线程独占，启动检查线程前设置）
     FractionalResampler rs;
     std::vector<float> rsIn_;
     std::vector<TubeWarmth> tubeState;   // 每声道一个 300B 染色实例(含 DC blocker 状态)
@@ -1385,7 +1389,8 @@ int wmain(int argc, wchar_t** argv) {
         &boosterOn, &boosterDb,
         &specIn, &specRes, &specSeq,
         &targetPid, &targetActive,
-        &g_devices, &g_devMutex, &g_selectedDevice
+        &g_devices, &g_devMutex, &g_selectedDevice,
+        &updateState
     };
     startWebConsole(web);
     // 扫描输出设备(ASIO/WASAPI 判定)，供控制台设备列表展示
@@ -1428,6 +1433,8 @@ int wmain(int argc, wchar_t** argv) {
         fprintf(f, "floor=%zu\n", floorMult.load(std::memory_order_relaxed));
         fprintf(f, "src_taps=%d\n", srcTaps.load(std::memory_order_relaxed));
         fprintf(f, "dither=%d\n", ditherOn.load(std::memory_order_relaxed) ? 1 : 0);
+        if (!updateUrl.empty())
+            fprintf(f, "update_url=%s\n", updateUrl.c_str());   // 保留在线升级更新源配置
         fclose(f);
     };
     auto loadConfig = [&]() {
@@ -1470,12 +1477,19 @@ int wmain(int argc, wchar_t** argv) {
                 else if (!strcmp(key, "src_taps")) srcTaps.store(atoi(val), std::memory_order_relaxed);
                 else if (!strcmp(key, "dither") && !ditherArgGiven)
                     ditherFlag = (atoi(val) != 0);   // 配置次之：命令行显式指定则忽略
+                else if (!strcmp(key, "update_url")) {
+                    // 更新源（可指向国内服务器/Gitee/自建）；空值视为未配置
+                    if (val[0]) updateUrl = val;
+                }
             }
         }
         fclose(f);
     };
     loadConfig();
     ditherOn.store(ditherFlag, std::memory_order_relaxed);   // 控制台在首个会话前即显示正确状态
+    // 在线升级检查线程（后台常驻，网络失败静默；cfg update_url 可覆盖默认 GitHub 源）
+    // 必须在 loadConfig 之后：updateUrl 来自配置文件
+    startUpdateChecker(&updateState, &g_stop, updateUrl);
     ULONGLONG lastCfgSave = GetTickCount64();   // 配置定期保存节流(每 5 秒)
 
     // 目标发现线程（独立 MTA）：每 10 秒重新扫描「最响渲染进程」，
@@ -1517,6 +1531,12 @@ int wmain(int argc, wchar_t** argv) {
     bool first = true;
     ULONGLONG lastDevScan = 0;   // 设备重扫节流(秒)：插入风暴时只重扫一次
     while (!g_stop.load()) {
+        // 在线升级：安装程序已启动 → 优雅退出（保留互斥锁释放/静音恢复流程）
+        if (updateState.quitRequested.load(std::memory_order_acquire)) {
+            printf("[升级] 升级安装已启动，桥退出中…\n");
+            g_stop.store(true);
+            break;
+        }
         needRestart.store(false);
         // 设备事件（热插拔/新驱动安装/默认设备变化）→ 重扫设备列表：
         // 新声卡驱动加入后自动出现在控制台选择列表，并自动判定是否支持 ASIO

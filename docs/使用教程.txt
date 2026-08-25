@@ -302,6 +302,9 @@ tools\rebuild.cmd                  命令行 cl.exe 重建
   floor=8               # 水位下限倍数
   src_taps=32           # 重采样档 0/32
   dither=1              # TPDF 抖动
+  # 在线升级（可选）: 指向清单文件(JSON/INI), 留空=内置 GitHub Releases。
+  # 国内网络请配置为可达地址, 如 https://你的服务器/asio_bridge_version.json
+  # update_url=
 
 ================================================================================
 第十二章 常见问题
