@@ -121,8 +121,9 @@ static void usage() {
     printf(
         "ASIO Bridge - 应用 PCM 直通 ASIO / WASAPI 独占输出\n"
         "用法:\n"
-        "  asio_bridge                    默认: 进程回环采集 -> 自动选择输出设备\n"
+        "  asio_bridge                    默认(后台隐藏): 进程回环采集 -> 自动选择输出设备\n"
         "                                (优先 ASIO, 无则 WASAPI 独占; 控制台可切换)\n"
+        "  asio_bridge --show            显示控制台窗口（默认后台隐藏，调试/看日志用）\n"
         "  asio_bridge --list             列出 ASIO 驱动\n"
         "  asio_bridge --tone             1kHz 正弦测试: 直接经 ASIO 输出(验证 ASIO 链路)\n"
         "  asio_bridge --driver <名字>    指定 ASIO 驱动 (默认自动选择第一个可用驱动)\n"
@@ -1171,7 +1172,7 @@ int wmain(int argc, wchar_t** argv) {
 
     bool list = false, tone = false;
     bool crashTest = false;   // --crash-test:服务启动后故意空指针崩溃,验证自愈拉起链路
-    bool hidden = false;      // --hidden:启动后立即隐藏控制台窗口(后台服务/自启/快捷方式用)
+    bool showConsole = false;   // 默认后台隐藏控制台窗口；--show/--console 显式显示（调试用）
     std::string driver;       // 空=自动选择(优先 ASIO, 无则 WASAPI 独占); --driver 显式指定
     double toneRate = 44100.0;
     long reqBuffer = 0;
@@ -1189,7 +1190,8 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--dither") { ditherFlag = true; ditherArgGiven = true; }
         else if (a == L"--no-dither") { ditherFlag = false; ditherArgGiven = true; }
         else if (a == L"--no-mute") noMute = true;
-        else if (a == L"--hidden") hidden = true;
+        else if (a == L"--hidden") { /* 默认即隐藏，保留兼容（旧脚本/看门狗仍传此参） */ }
+        else if (a == L"--show" || a == L"--console") showConsole = true;
         else if (a == L"--crash-test") crashTest = true;
         else if (a == L"--resampler-test") { return resamplerSelfTest(); }
         else if (a == L"--tube-test") { return tubeSelfTest(); }
@@ -1213,7 +1215,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (a == L"--help" || a == L"-h") { usage(); return 0; }
     }
 
-    if (hidden) {   // --hidden:隐藏控制台窗口(后台服务/自启/快捷方式双击)
+    if (!showConsole) {   // 默认隐藏控制台窗口：后台服务/自启/手动双击均生效；--show 才显示
         HWND hw = GetConsoleWindow();
         if (hw) ShowWindow(hw, SW_HIDE);
     }
