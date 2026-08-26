@@ -1442,11 +1442,12 @@ int wmain(int argc, wchar_t** argv) {
         fprintf(f, "dither=%d\n", ditherOn.load(std::memory_order_relaxed) ? 1 : 0);
         if (!updateUrl.empty())
             fprintf(f, "update_url=%s\n", updateUrl.c_str());   // 保留在线升级更新源配置
+        fprintf(f, "bridge_on=%d\n", bridgeOn.load(std::memory_order_relaxed) ? 1 : 0);  // 桥开关状态（首次运行默认待机）
         fclose(f);
     };
-    auto loadConfig = [&]() {
+    auto loadConfig = [&]() -> bool {
         FILE* f = _wfopen(configPath().c_str(), L"r");
-        if (!f) return;   // 首次运行,用默认值
+        if (!f) return false;   // 首次运行：下方置待机
         char line[128];
         while (fgets(line, sizeof(line), f)) {
             char key[64] = {0};
@@ -1487,11 +1488,23 @@ int wmain(int argc, wchar_t** argv) {
                     // 更新源（可指向国内服务器/Gitee/自建）；空值视为未配置
                     if (val[0]) updateUrl = val;
                 }
+                else if (!strcmp(key, "bridge_on")) {
+                    // 桥开关状态：恢复上次操作（首次运行无此项，保持默认待机）
+                    bridgeOn.store(atoi(val) != 0, std::memory_order_relaxed);
+                }
             }
         }
         fclose(f);
+        return true;
     };
-    loadConfig();
+    bool hasCfg = loadConfig();
+    if (!hasCfg) {
+        // 首次运行（无 cfg）：默认待机，不主动初始化 ASIO/WASAPI 后端，
+        // 避免新用户在尚未安装声卡驱动时看到一堆驱动初始化失败日志而误以为安装失败。
+        // 用户装好驱动后，在 Web 控制台点击「开启桥」即可自动识别并工作。
+        bridgeOn.store(false, std::memory_order_relaxed);
+        printf("[桥] 首次运行：默认待机，请在 Web 控制台点击「开启桥」后自动识别驱动\n");
+    }
     // 静音残留自愈：上次进程被强杀/崩溃时，被静音端点的记录文件（mute_flag.txt）
     // 会残留。必须赶在首个会话建立前按记录解除静音——否则新会话会走到
     // 「本来已静音，无需记录」分支，桥关闭时恢复列表为空，系统音量卡死在

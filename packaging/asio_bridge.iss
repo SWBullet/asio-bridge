@@ -68,7 +68,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameter
 
 [Run]
 ; 安装完可选择直接启动桥(隐藏窗口)
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--hidden"; Description: "立即运行 ASIO Bridge"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyAppExeName}"; Parameters: "--hidden"; Description: "立即运行 ASIO Bridge"; Flags: nowait postinstall skipifsilent unchecked
 ; 勾选「开机自动启动」时安装计划任务(隐藏窗口)
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\install_autostart.ps1"""; Tasks: autostart; Flags: runhidden
 
