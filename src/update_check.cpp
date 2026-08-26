@@ -17,6 +17,8 @@ namespace {
 
 const char* kGitHubApi =
     "https://api.github.com/repos/SWBullet/asio-bridge/releases/latest";
+const char* kGiteeApi =
+    "https://gitee.com/api/v5/repos/tuncloud/asio-bridge/releases/latest";
 
 // ---- 小工具 ----
 
@@ -224,13 +226,15 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop,
         bool wantDownload = st->downloading.exchange(false);
         if (wantDownload && st->available.load()) {
             // ---- 下载 + 校验 + 启动安装 ----
-            std::string url, ver, sha, mirror, msg;
+            std::string ver;
+            std::vector<std::string> urls, shas;
             {
                 std::lock_guard<std::mutex> lk(*st->mutex);
-                url = st->downloadUrl; ver = st->latestVersion;
-                sha = st->sha256; mirror = st->mirrorUrl;
+                ver = st->latestVersion;
+                urls = st->downloadUrls;   // 候选直链（按可达源排序）
+                shas = st->downloadShas;   // 对应 SHA256（并行）
             }
-            if (url.empty()) {
+            if (urls.empty()) {
                 { std::lock_guard<std::mutex> lk(*st->mutex); st->message = "清单缺少下载地址"; }
                 st->error.store(true, std::memory_order_relaxed);
                 continue;
@@ -240,20 +244,23 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop,
             GetTempPathW(MAX_PATH, tmp);
             std::wstring file = std::wstring(tmp) + L"asio_bridge_setup_" +
                                 std::wstring(ver.begin(), ver.end()) + L".exe";
-            {
-                std::lock_guard<std::mutex> lk(*st->mutex);
-                st->message = "正在下载 v" + ver + " …";
-            }
-            // URLDownloadToFile 需要 wininet；此处用 WinHTTP 写文件避免引入依赖
-            std::string body = httpGet(url, 60000);
-            if (body.empty() && !mirror.empty()) {
+            std::string body;
+            std::string usedSha;
+            bool got = false;
+            for (size_t i = 0; i < urls.size(); ++i) {
+                {
+                    std::lock_guard<std::mutex> lk(*st->mutex);
+                    st->message = "正在下载 v" + ver + "（源 " + std::to_string(i + 1) +
+                                  "/" + std::to_string(urls.size()) + "）…";
+                }
+                body = httpGet(urls[i], 60000);
+                if (!body.empty()) { usedSha = (i < shas.size()) ? shas[i] : ""; got = true; break; }
+                // 该源失败 → 试下一个候选源
                 { std::lock_guard<std::mutex> lk(*st->mutex);
-                  st->message = "主源下载失败，切换镜像源…"; }
-                url = mirror;
-                body = httpGet(url, 60000);
+                  st->message = "源 " + std::to_string(i + 1) + " 下载失败，切换下一个…"; }
             }
-            if (body.empty()) {
-                { std::lock_guard<std::mutex> lk(*st->mutex); st->message = "下载失败（网络错误或超时）"; }
+            if (!got) {
+                { std::lock_guard<std::mutex> lk(*st->mutex); st->message = "下载失败（所有源均不可达/超时）"; }
                 st->error.store(true, std::memory_order_relaxed);
                 st->active.store(false, std::memory_order_relaxed);
                 continue;
@@ -274,9 +281,9 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop,
                 CloseHandle(h);
             }
             // 校验
-            if (!sha.empty()) {
+            if (!usedSha.empty()) {
                 std::string got = sha256File(file);
-                std::string low = sha;
+                std::string low = usedSha;
                 for (auto& c : low) c = (char)tolower((unsigned char)c);
                 if (got != low) {
                     DeleteFileW(file.c_str());
@@ -303,31 +310,35 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop,
         if (wantCheck || st->available.load() == false) {
             // ---- 检查更新（周期轮询；发现新版本后停止轮询，等用户操作）----
             st->error.store(false, std::memory_order_relaxed);
-            // 双线路：主源(cfgUrl=CloudBase 国内) → 备源(GitHub 国际/本机可达)
-            std::string sources[2];
+            // 三线路：主源(cfgUrl=CloudBase) → 备源1(GitHub) → 备源2(Gitee)
+            std::string sources[3];
             int nSrc = 0;
-            if (!cfgUrl.empty()) sources[nSrc++] = cfgUrl;   // 主源
-            sources[nSrc++] = kGitHubApi;                    // 备源（始终尝试）
+            if (!cfgUrl.empty()) sources[nSrc++] = cfgUrl;   // 主源 CloudBase
+            sources[nSrc++] = kGitHubApi;                    // 备源1 GitHub
+            sources[nSrc++] = kGiteeApi;                     // 备源2 Gitee
             {
                 std::lock_guard<std::mutex> lk(*st->mutex);
                 st->message = "正在检查更新…";
             }
-            std::string ver, url, sha, mirror;
-            bool ok = false;
+            std::string ver;                  // 最高版本号（多源取最大）
+            std::vector<std::string> candUrls, candShas;   // 收集所有可达源的下载直链
             for (int i = 0; i < nSrc; ++i) {
                 std::string body = httpGet(sources[i]);
                 if (body.empty()) continue;                 // 该源不可达 → 试下一个
                 std::string v, u, s, m;
-                if (parseManifest(body, v, u, s, m)) {
-                    ver = v; url = u; sha = s; mirror = m; ok = true; break;
-                }
+                if (!parseManifest(body, v, u, s, m)) continue;
+                if (!u.empty()) { candUrls.push_back(u); candShas.push_back(s); }
+                if (!m.empty()) { candUrls.push_back(m); candShas.push_back(s); }
+                if (ver.empty() || versionGreater(v, ver)) ver = v;
             }
-            if (ok) {
+            if (!ver.empty()) {
                 std::lock_guard<std::mutex> lk(*st->mutex);
                 st->latestVersion = ver;
-                st->downloadUrl = url;
-                st->mirrorUrl = mirror;
-                st->sha256 = sha;
+                st->downloadUrl = candUrls.empty() ? "" : candUrls.front();
+                st->mirrorUrl = "";     // 兼容旧字段；实际回退走 downloadUrls 列表
+                st->sha256 = candShas.empty() ? "" : candShas.front();
+                st->downloadUrls = candUrls;   // 下载时按序尝试全部候选源
+                st->downloadShas = candShas;
                 bool newer = versionGreater(ver, kAppVersion);
                 st->available.store(newer, std::memory_order_relaxed);
                 st->message = newer ? ("发现新版本 v" + ver) : ("已是最新版本 v" + std::string(kAppVersion));
