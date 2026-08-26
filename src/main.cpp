@@ -1485,8 +1485,10 @@ int wmain(int argc, wchar_t** argv) {
                 else if (!strcmp(key, "dither") && !ditherArgGiven)
                     ditherFlag = (atoi(val) != 0);   // 配置次之：命令行显式指定则忽略
                 else if (!strcmp(key, "update_url")) {
-                    // 更新源（可指向国内服务器/Gitee/自建）；空值视为未配置
-                    if (val[0]) updateUrl = val;
+                    // 更新源现已固定为 GitHub + Gitee 双源（CloudBase 已退出更新链路）。
+                    // 旧 cfg 中的 CloudBase 地址在此过滤掉，保存时不再写回，实现配置自动净化。
+                    if (val[0] && !strstr(val, "tcloudbaseapp.com"))
+                        updateUrl = val;
                 }
                 else if (!strcmp(key, "bridge_on")) {
                     // 桥开关状态：恢复上次操作（首次运行无此项，保持默认待机）
@@ -1517,9 +1519,8 @@ int wmain(int argc, wchar_t** argv) {
             printf("[静音] 上次残留记录的端点已不可用（可能已拔出），清除残留标志\n");
     }
     ditherOn.store(ditherFlag, std::memory_order_relaxed);   // 控制台在首个会话前即显示正确状态
-    // 在线升级检查线程（后台常驻，网络失败静默；cfg update_url 可覆盖默认 GitHub 源）
-    // 必须在 loadConfig 之后：updateUrl 来自配置文件
-    startUpdateChecker(&updateState, &g_stop, updateUrl);
+    // 在线升级检查线程（后台常驻，网络失败静默；更新源固定为 GitHub + Gitee 双源）
+    startUpdateChecker(&updateState, &g_stop);
     ULONGLONG lastCfgSave = GetTickCount64();   // 配置定期保存节流(每 5 秒)
 
     // 目标发现线程（独立 MTA）：每 10 秒重新扫描「最响渲染进程」，

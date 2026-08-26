@@ -217,8 +217,7 @@ bool parseManifest(const std::string& body, std::string& ver, std::string& url,
 // ============================================================================
 // 后台线程主体
 // ============================================================================
-static void updateLoop(UpdateState* st, std::atomic<bool>* stop,
-                       const std::string& cfgUrl) {
+static void updateLoop(UpdateState* st, std::atomic<bool>* stop) {
     std::string lastMsg;
     while (!stop->load(std::memory_order_relaxed)) {
         // 待办请求：手动检查 / 手动升级
@@ -310,12 +309,11 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop,
         if (wantCheck || st->available.load() == false) {
             // ---- 检查更新（周期轮询；发现新版本后停止轮询，等用户操作）----
             st->error.store(false, std::memory_order_relaxed);
-            // 三线路：主源(cfgUrl=CloudBase) → 备源1(GitHub) → 备源2(Gitee)
-            std::string sources[3];
+            // 双线路：主源 GitHub → 备源 Gitee（CloudBase 已退出更新链路）
+            std::string sources[2];
             int nSrc = 0;
-            if (!cfgUrl.empty()) sources[nSrc++] = cfgUrl;   // 主源 CloudBase
-            sources[nSrc++] = kGitHubApi;                    // 备源1 GitHub
-            sources[nSrc++] = kGiteeApi;                     // 备源2 Gitee
+            sources[nSrc++] = kGitHubApi;   // 主源 GitHub
+            sources[nSrc++] = kGiteeApi;    // 备源 Gitee
             {
                 std::lock_guard<std::mutex> lk(*st->mutex);
                 st->message = "正在检查更新…";
@@ -379,11 +377,10 @@ void primeUpdateState(UpdateState* st) {
     st->mutex = &sUpdateMutex;   // 幂等：与 startUpdateChecker 赋同一把锁
 }
 
-void startUpdateChecker(UpdateState* st, std::atomic<bool>* stopFlag,
-                        const std::string& cfgUpdateUrl) {
+void startUpdateChecker(UpdateState* st, std::atomic<bool>* stopFlag) {
     st->mutex = &sUpdateMutex;   // 字符串保护区（控制台读同一把锁）
-    std::thread t([st, stopFlag, cfgUpdateUrl] {
-        updateLoop(st, stopFlag, cfgUpdateUrl);
+    std::thread t([st, stopFlag] {
+        updateLoop(st, stopFlag);
     });
     t.detach();
 }

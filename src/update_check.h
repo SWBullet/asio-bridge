@@ -7,11 +7,10 @@
 // ============================================================================
 // 在线升级检查（预留接口 + 完整链路）
 // ----------------------------------------------------------------------------
-// 更新源（三线路自动回退）：
-//   主源：asio_bridge.cfg 的 update_url（默认 CloudBase 国内加速）
-//   备源1：内置 GitHub Releases API（海外/通用可达，本机 DNS 污染时也能用）
-//   备源2：内置 Gitee Releases API（国内可达，GitHub 被挡时的兜底）
-//   检查顺序：先主源，WinHTTP 不可达/解析失败 → 依次改拉 GitHub → Gitee。
+// 更新源（双线路自动回退，CloudBase 已退出更新链路不再使用）：
+//   主源：内置 GitHub Releases API（海外/通用可达，本机 DNS 污染时也能用）
+//   备源：内置 Gitee Releases API（国内可达，GitHub 被挡时的兜底）
+//   检查顺序：先 GitHub，WinHTTP 不可达/解析失败 → 改拉 Gitee。
 //   下载顺序：清单里所有可达源的直链按序尝试，任一成功即升级，最大化可达性。
 // 清单格式（HTTP GET 返回文本，均可解析）：
 //   JSON:  {"version":"1.0.1","url":"https://.../setup.exe","sha256":"<64hex>","mirror":"https://.../mirror.exe"}
@@ -25,7 +24,7 @@
 // ============================================================================
 
 // 软件当前版本（打包/发布时同步修改）
-static const char* kAppVersion = "1.0.7";
+static const char* kAppVersion = "1.0.8";
 
 // 更新检查状态（控制台只读，检查线程写）
 struct UpdateState {
@@ -53,9 +52,8 @@ struct UpdateState {
 void primeUpdateState(UpdateState* st);
 
 // 启动后台检查线程（常驻，周期轮询）。stopFlag 置位后退出。
-// cfgUpdateUrl: 配置文件里的 update_url（空=用内置 GitHub 源）
-void startUpdateChecker(UpdateState* st, std::atomic<bool>* stopFlag,
-                        const std::string& cfgUpdateUrl);
+// 更新源固定为 GitHub + Gitee 双源（不再读取 cfg 的 update_url 作为源）。
+void startUpdateChecker(UpdateState* st, std::atomic<bool>* stopFlag);
 
 // 手动立即检查一次（控制台「检查更新」按钮）——在检查线程内执行
 void requestUpdateCheck(UpdateState* st);
