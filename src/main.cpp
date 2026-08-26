@@ -122,7 +122,7 @@ static void usage() {
         "ASIO Bridge - 应用 PCM 直通 ASIO / WASAPI 独占输出\n"
         "用法:\n"
         "  asio_bridge                    默认(后台隐藏): 进程回环采集 -> 自动选择输出设备\n"
-        "                                (优先 ASIO, 无则 WASAPI 独占; 控制台可切换)\n"
+        "                                (全手动选择输出设备: ASIO 优先, 控制台下拉指定; 无 ASIO 时可选 WASAPI 独占)\n"
         "  asio_bridge --show            显示控制台窗口（默认后台隐藏，调试/看日志用）\n"
         "  asio_bridge --list             列出 ASIO 驱动\n"
         "  asio_bridge --tone             1kHz 正弦测试: 直接经 ASIO 输出(验证 ASIO 链路)\n"
@@ -1173,7 +1173,7 @@ int wmain(int argc, wchar_t** argv) {
     bool list = false, tone = false;
     bool crashTest = false;   // --crash-test:服务启动后故意空指针崩溃,验证自愈拉起链路
     bool showConsole = false;   // 默认后台隐藏控制台窗口；--show/--console 显式显示（调试用）
-    std::string driver;       // 空=自动选择(优先 ASIO, 无则 WASAPI 独占); --driver 显式指定
+    std::string driver;       // 空=未指定(需控制台手动选择); --driver 显式指定 ASIO 驱动名
     double toneRate = 44100.0;
     long reqBuffer = 0;
     bool ditherFlag = true;   // TPDF 抖动默认开启；优先级:命令行 > 配置文件 > 默认
@@ -1332,7 +1332,7 @@ int wmain(int argc, wchar_t** argv) {
     // 设备选择（控制台扫描/选择，主循环按选择创建后端）
     std::mutex g_devMutex;
     std::vector<DeviceEntry> g_devices;
-    std::atomic<int> g_selectedDevice{-1};           // -1=自动(默认 ASIO)
+    std::atomic<int> g_selectedDevice{-1};           // -1=未选择(全手动，需在控制台指定)
     // 在线升级（可选：cfg update_url 指定更新源；空=内置 GitHub Releases）
     UpdateState updateState;
     std::string updateUrl;   // cfg 读入（主线程独占，启动检查线程前设置）
@@ -1443,6 +1443,7 @@ int wmain(int argc, wchar_t** argv) {
         if (!updateUrl.empty())
             fprintf(f, "update_url=%s\n", updateUrl.c_str());   // 保留在线升级更新源配置
         fprintf(f, "bridge_on=%d\n", bridgeOn.load(std::memory_order_relaxed) ? 1 : 0);  // 桥开关状态（首次运行默认待机）
+        fprintf(f, "selected_device=%d\n", g_selectedDevice.load(std::memory_order_relaxed));  // 手动选定的输出设备索引(-1=未选择)
         fclose(f);
     };
     auto loadConfig = [&]() -> bool {
@@ -1490,6 +1491,11 @@ int wmain(int argc, wchar_t** argv) {
                     if (val[0] && !strstr(val, "tcloudbaseapp.com"))
                         updateUrl = val;
                 }
+                else if (!strcmp(key, "selected_device")) {
+                    // 手动选定的输出设备索引（重启保持用户选择；越界/负数视为未选择）
+                    int v = atoi(val);
+                    g_selectedDevice.store(v >= 0 ? v : -1, std::memory_order_relaxed);
+                }
                 else if (!strcmp(key, "bridge_on")) {
                     // 桥开关状态：恢复上次操作（首次运行无此项，保持默认待机）
                     bridgeOn.store(atoi(val) != 0, std::memory_order_relaxed);
@@ -1505,7 +1511,7 @@ int wmain(int argc, wchar_t** argv) {
         // 避免新用户在尚未安装声卡驱动时看到一堆驱动初始化失败日志而误以为安装失败。
         // 用户装好驱动后，在 Web 控制台点击「开启桥」即可自动识别并工作。
         bridgeOn.store(false, std::memory_order_relaxed);
-        printf("[桥] 首次运行：默认待机，请在 Web 控制台点击「开启桥」后自动识别驱动\n");
+        printf("[桥] 首次运行：默认待机，请在 Web 控制台「输出设备」下拉框手动选择后开启桥\n");
     }
     // 静音残留自愈：上次进程被强杀/崩溃时，被静音端点的记录文件（mute_flag.txt）
     // 会残留。必须赶在首个会话建立前按记录解除静音——否则新会话会走到
@@ -1758,13 +1764,9 @@ int wmain(int argc, wchar_t** argv) {
         wmAvg = 0.0;
 
         // ===== 输出后端候选构建 + 逐个尝试初始化 =====
-        // 自动适配（通用发行版）：
-        //   显式选择(控制台/--driver) → 只试用户指定的那个，失败即报错重试
-        //   自动模式 → 候选列表按优先级逐个尝试，第一个 init 成功即用：
-        //     ① 设备列表中匹配到 ASIO 的端点
-        //     ② 注册表枚举到的全部 ASIO 驱动（逐个尝试——驱动可枚举但
-        //        可能初始化失败（残留/虚拟驱动），必须跳过继续试下一个）
-        //     ③ 全部 WASAPI 独占端点（逐个尝试，第一个可用即用）
+        // 全手动选择模式（无自动回退）：
+        //   显式选择(控制台下拉选定 / --driver 指定) → 只试用户指定的那一个，失败即报错重试
+        //   未选择(selectedDevice<0 且未传 --driver) → 不自动回退，空闲等待用户在控制台选择
         struct BackendCand {
             bool        asio = false;
             std::string driver;      // asio=true 时的 ASIO 驱动名
@@ -1788,28 +1790,20 @@ int wmain(int argc, wchar_t** argv) {
             cands.push_back(std::move(c));
             explicitPick = true;
         }
-        if (!explicitPick) {
-            // 自动：① 列表 ASIO → ② 注册表全部 ASIO → ③ 全部 WASAPI
-            {
-                std::lock_guard<std::mutex> lk(g_devMutex);
-                for (const auto& d : g_devices)
-                    if (d.asio) { BackendCand c; c.asio = true; c.driver = d.asioDriver; c.name = d.name; cands.push_back(std::move(c)); }
-            }
-            for (const auto& n : ListAsioDriverNames()) {
-                bool dup = false;
-                for (const auto& c : cands)
-                    if (c.asio && c.driver == n) { dup = true; break; }
-                if (!dup) { BackendCand c; c.asio = true; c.driver = n; cands.push_back(std::move(c)); }
-            }
-            {
-                std::lock_guard<std::mutex> lk(g_devMutex);
-                for (const auto& d : g_devices)
-                    if (!d.asio) { BackendCand c; c.asio = false; c.id = d.id; c.name = d.name; cands.push_back(std::move(c)); }
-            }
-        }
+        // 全手动选择：除用户显式选定的设备(--driver 或控制台下拉)外，不再自动回退。
+        // 未选择时 cands 为空，下方进入「未选择输出设备」空闲分支，等待用户在控制台选择。
         if (cands.empty()) {
-            printf("输出后端初始化失败: 未找到任何可用的输出设备"
-                   "（无 ASIO 驱动且无 WASAPI 渲染端点）\n");
+            int selNow = g_selectedDevice.load(std::memory_order_relaxed);
+            if (selNow < 0 && driver.empty()) {
+                // 全手动选择：用户尚未在控制台选定输出设备 → 空闲等待选择
+                static int needSelStreak = 0;
+                if ((needSelStreak++ % 10) == 0)
+                    printf("[设备] 尚未选择输出设备，请在 Web 控制台「输出设备」下拉框手动选择"
+                           "（支持 ASIO / WASAPI）后开启桥\n");
+            } else {
+                printf("输出后端初始化失败: 未找到任何可用的输出设备"
+                       "（无 ASIO 驱动且无 WASAPI 渲染端点）\n");
+            }
             pcap.close();
             if (g_stop.load()) break;
             Sleep(2000);

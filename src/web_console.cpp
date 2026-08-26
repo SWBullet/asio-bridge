@@ -536,7 +536,7 @@ function loadDevices(){
     fetch('/api/devices').then(function(r){return r.json()}).then(function(s){
       var sel=document.getElementById('bank-device');
       var cur=sel.value;
-      sel.innerHTML='<option value="-1">自动 (ASIO 优先, 无则 WASAPI)</option>';
+      sel.innerHTML='<option value="-1">请选择输出设备（未选择）</option>';
       var devs=s.devices||[];
       for(var i=0;i<devs.length;i++){
         var opt=document.createElement('option');
@@ -898,7 +898,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
                 g_p.bridgeOn->store(v != 0, std::memory_order_relaxed);
                 if (v == 0) g_p.needRestart->store(true);   // 关闭时立即断开会话
             } else if (strstr(body, "action=device")) {
-                // 输出设备选择：-1=自动, 0..N-1=设备索引；切换需重建链路
+                // 输出设备选择：-1=未选择(全手动), 0..N-1=设备索引；切换需重建链路
                 g_p.selectedDevice->store(v, std::memory_order_relaxed);
                 g_p.needRestart->store(true);
             } else if (strstr(body, "action=devscan")) {

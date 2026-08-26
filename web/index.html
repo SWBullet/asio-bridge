@@ -509,7 +509,7 @@ function loadDevices(){
     fetch('/api/devices').then(function(r){return r.json()}).then(function(s){
       var sel=document.getElementById('bank-device');
       var cur=sel.value;
-      sel.innerHTML='<option value="-1">自动 (ASIO 优先, 无则 WASAPI)</option>';
+      sel.innerHTML='<option value="-1">请选择输出设备（未选择）</option>';
       var devs=s.devices||[];
       for(var i=0;i<devs.length;i++){
         var opt=document.createElement('option');

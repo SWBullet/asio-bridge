@@ -154,6 +154,19 @@ static std::vector<DeviceEntry> scanInner(std::string& err) {
         }
         coll->Release();
     }
+    // 补全：注册表中存在但无对应 WASAPI 端点的纯 ASIO 驱动也列入列表，
+    // 保证「支持 ASIO 的驱动」在控制台下拉框中完整可见（无 WASAPI 端点时仅 ASIO 输出可用）。
+    for (const auto& dn : asioDrivers) {
+        bool represented = false;
+        for (const auto& e : out)
+            if (e.asio && e.asioDriver == dn) { represented = true; break; }
+        if (represented) continue;
+        DeviceEntry e;
+        e.asio = true;
+        e.asioDriver = dn;
+        e.name = std::wstring(dn.begin(), dn.end());   // 以 ASIO 驱动名作显示
+        out.push_back(std::move(e));
+    }
     en->Release();
     CoUninitialize();
     return out;
