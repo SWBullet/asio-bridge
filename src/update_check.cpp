@@ -146,10 +146,11 @@ std::string sha256File(const std::wstring& path) {
         if (BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0) != 0) break;
         BYTE buf[65536];
         DWORD got = 0;
+        bool dataOk = true;   // 读取到 EOF 即正常结束；仅当 BCryptHashData 失败才算错
         while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got > 0) {
-            if (BCryptHashData(hash, buf, got, 0) != 0) { hex.clear(); break; }
+            if (BCryptHashData(hash, buf, got, 0) != 0) { dataOk = false; break; }
         }
-        if (!hex.empty() || GetLastError() == ERROR_HANDLE_EOF) {
+        if (dataOk) {
             BYTE digest[32];
             if (BCryptFinishHash(hash, digest, 32, 0) == 0) {
                 static const char* kHex = "0123456789abcdef";
