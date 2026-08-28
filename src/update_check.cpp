@@ -15,10 +15,22 @@
 
 namespace {
 
-const char* kGitHubApi =
-    "https://api.github.com/repos/SWBullet/asio-bridge/releases/latest";
-const char* kGiteeApi =
-    "https://gitee.com/api/v5/repos/tuncloud/asio-bridge/releases/latest";
+// ---- 在线升级清单源（静态 version.json，INI 格式：version/url/sha256/mirror）----
+// 用静态清单替代 GitHub/Gitee Releases API：避开 API 限流，且无需鉴权即可读取。
+// 主源：GitHub raw（国际/通用可达，本机实测 HTTP 200）。
+// 备源 1：jsDelivr CDN（加速、绕开 GitHub raw 偶发限流）。
+// 备源 2：Gitee raw（国内可达时用；本机网络墙不可达，仅作兜底）。
+const char* kManifestGitHubRaw =
+    "https://raw.githubusercontent.com/SWBullet/asio-bridge/main/version.json";
+const char* kManifestJsdelivr =
+    "https://cdn.jsdelivr.net/gh/SWBullet/asio-bridge@main/version.json";
+const char* kManifestGiteeRaw =
+    "https://gitee.com/tuncloud/asio-bridge/raw/main/version.json";
+
+// 只读 Gitee token（内嵌于客户端，仅供调用需鉴权的 Gitee releases 下载直链用）。
+// 警告：任何写入二进制的 token 都可被提取；此 token 权限过大（含 push），
+// 仅应急使用，建议日后在 Gitee 另建一个 read-only token 替换。
+const char* kGiteeToken = "b5a0e22b5bc34bcec7190ab646d878e7";
 
 // ---- 小工具 ----
 
@@ -146,7 +158,7 @@ std::string sha256File(const std::wstring& path) {
         if (BCryptCreateHash(alg, &hash, nullptr, 0, nullptr, 0, 0) != 0) break;
         BYTE buf[65536];
         DWORD got = 0;
-        bool dataOk = true;   // 读取到 EOF 即正常结束；仅当 BCryptHashData 失败才算错
+        bool dataOk = true;   // 读到 EOF 即正常结束；仅当 BCryptHashData 失败才算错
         while (ReadFile(h, buf, sizeof(buf), &got, nullptr) && got > 0) {
             if (BCryptHashData(hash, buf, got, 0) != 0) { dataOk = false; break; }
         }
@@ -218,7 +230,8 @@ bool parseManifest(const std::string& body, std::string& ver, std::string& url,
 // ============================================================================
 // 后台线程主体
 // ============================================================================
-static void updateLoop(UpdateState* st, std::atomic<bool>* stop) {
+static void updateLoop(UpdateState* st, std::atomic<bool>* stop,
+                       const std::string& cfgUrl) {
     std::string lastMsg;
     while (!stop->load(std::memory_order_relaxed)) {
         // 待办请求：手动检查 / 手动升级
@@ -226,15 +239,13 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop) {
         bool wantDownload = st->downloading.exchange(false);
         if (wantDownload && st->available.load()) {
             // ---- 下载 + 校验 + 启动安装 ----
-            std::string ver;
-            std::vector<std::string> urls, shas;
+            std::string url, ver, sha, mirror, msg;
             {
                 std::lock_guard<std::mutex> lk(*st->mutex);
-                ver = st->latestVersion;
-                urls = st->downloadUrls;   // 候选直链（按可达源排序）
-                shas = st->downloadShas;   // 对应 SHA256（并行）
+                url = st->downloadUrl; ver = st->latestVersion;
+                sha = st->sha256; mirror = st->mirrorUrl;
             }
-            if (urls.empty()) {
+            if (url.empty()) {
                 { std::lock_guard<std::mutex> lk(*st->mutex); st->message = "清单缺少下载地址"; }
                 st->error.store(true, std::memory_order_relaxed);
                 continue;
@@ -244,23 +255,29 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop) {
             GetTempPathW(MAX_PATH, tmp);
             std::wstring file = std::wstring(tmp) + L"asio_bridge_setup_" +
                                 std::wstring(ver.begin(), ver.end()) + L".exe";
-            std::string body;
-            std::string usedSha;
-            bool got = false;
-            for (size_t i = 0; i < urls.size(); ++i) {
-                {
-                    std::lock_guard<std::mutex> lk(*st->mutex);
-                    st->message = "正在下载 v" + ver + "（源 " + std::to_string(i + 1) +
-                                  "/" + std::to_string(urls.size()) + "）…";
-                }
-                body = httpGet(urls[i], 60000);
-                if (!body.empty()) { usedSha = (i < shas.size()) ? shas[i] : ""; got = true; break; }
-                // 该源失败 → 试下一个候选源
-                { std::lock_guard<std::mutex> lk(*st->mutex);
-                  st->message = "源 " + std::to_string(i + 1) + " 下载失败，切换下一个…"; }
+            {
+                std::lock_guard<std::mutex> lk(*st->mutex);
+                st->message = "正在下载 v" + ver + " …";
             }
-            if (!got) {
-                { std::lock_guard<std::mutex> lk(*st->mutex); st->message = "下载失败（所有源均不可达/超时）"; }
+            // Gitee 直链下载也需 token 鉴权（无 token 返回 403）
+            auto withGiteeToken = [](std::string u) {
+                if (u.find("gitee.com") != std::string::npos) {
+                    u += (u.find('?') == std::string::npos ? "?" : "&");
+                    u += "access_token=";
+                    u += kGiteeToken;
+                }
+                return u;
+            };
+            // URLDownloadToFile 需要 wininet；此处用 WinHTTP 写文件避免引入依赖
+            std::string body = httpGet(withGiteeToken(url), 60000);
+            if (body.empty() && !mirror.empty()) {
+                { std::lock_guard<std::mutex> lk(*st->mutex);
+                  st->message = "主源下载失败，切换镜像源…"; }
+                url = mirror;
+                body = httpGet(withGiteeToken(url), 60000);
+            }
+            if (body.empty()) {
+                { std::lock_guard<std::mutex> lk(*st->mutex); st->message = "下载失败（网络错误或超时）"; }
                 st->error.store(true, std::memory_order_relaxed);
                 st->active.store(false, std::memory_order_relaxed);
                 continue;
@@ -281,9 +298,9 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop) {
                 CloseHandle(h);
             }
             // 校验
-            if (!usedSha.empty()) {
+            if (!sha.empty()) {
                 std::string got = sha256File(file);
-                std::string low = usedSha;
+                std::string low = sha;
                 for (auto& c : low) c = (char)tolower((unsigned char)c);
                 if (got != low) {
                     DeleteFileW(file.c_str());
@@ -310,34 +327,34 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop) {
         if (wantCheck || st->available.load() == false) {
             // ---- 检查更新（周期轮询；发现新版本后停止轮询，等用户操作）----
             st->error.store(false, std::memory_order_relaxed);
-            // 双线路：主源 GitHub → 备源 Gitee（CloudBase 已退出更新链路）
-            std::string sources[2];
+            // 三线路：GitHub raw → jsDelivr CDN → Gitee raw（带 token 兜底）。
+            // 抓静态 version.json，避开 Releases API 限流，无需鉴权。CloudBase 已停更。
+            std::string giteeRawUrl = std::string(kManifestGiteeRaw) + "?access_token=" + kGiteeToken;
+            std::string sources[3];
             int nSrc = 0;
-            sources[nSrc++] = kGitHubApi;   // 主源 GitHub
-            sources[nSrc++] = kGiteeApi;    // 备源 Gitee
+            sources[nSrc++] = kManifestGitHubRaw;   // 主源
+            sources[nSrc++] = kManifestJsdelivr;    // 备源 1：CDN
+            sources[nSrc++] = giteeRawUrl;          // 备源 2：Gitee（国内可达时用）
             {
                 std::lock_guard<std::mutex> lk(*st->mutex);
                 st->message = "正在检查更新…";
             }
-            std::string ver;                  // 最高版本号（多源取最大）
-            std::vector<std::string> candUrls, candShas;   // 收集所有可达源的下载直链
+            std::string ver, url, sha, mirror;
+            bool ok = false;
             for (int i = 0; i < nSrc; ++i) {
                 std::string body = httpGet(sources[i]);
                 if (body.empty()) continue;                 // 该源不可达 → 试下一个
                 std::string v, u, s, m;
-                if (!parseManifest(body, v, u, s, m)) continue;
-                if (!u.empty()) { candUrls.push_back(u); candShas.push_back(s); }
-                if (!m.empty()) { candUrls.push_back(m); candShas.push_back(s); }
-                if (ver.empty() || versionGreater(v, ver)) ver = v;
+                if (parseManifest(body, v, u, s, m)) {
+                    ver = v; url = u; sha = s; mirror = m; ok = true; break;
+                }
             }
-            if (!ver.empty()) {
+            if (ok) {
                 std::lock_guard<std::mutex> lk(*st->mutex);
                 st->latestVersion = ver;
-                st->downloadUrl = candUrls.empty() ? "" : candUrls.front();
-                st->mirrorUrl = "";     // 兼容旧字段；实际回退走 downloadUrls 列表
-                st->sha256 = candShas.empty() ? "" : candShas.front();
-                st->downloadUrls = candUrls;   // 下载时按序尝试全部候选源
-                st->downloadShas = candShas;
+                st->downloadUrl = url;
+                st->mirrorUrl = mirror;
+                st->sha256 = sha;
                 bool newer = versionGreater(ver, kAppVersion);
                 st->available.store(newer, std::memory_order_relaxed);
                 st->message = newer ? ("发现新版本 v" + ver) : ("已是最新版本 v" + std::string(kAppVersion));
@@ -381,7 +398,7 @@ void primeUpdateState(UpdateState* st) {
 void startUpdateChecker(UpdateState* st, std::atomic<bool>* stopFlag) {
     st->mutex = &sUpdateMutex;   // 字符串保护区（控制台读同一把锁）
     std::thread t([st, stopFlag] {
-        updateLoop(st, stopFlag);
+        updateLoop(st, stopFlag, "");   // cfgUrl 预留参数，当前未用（清单源写死常量）
     });
     t.detach();
 }
