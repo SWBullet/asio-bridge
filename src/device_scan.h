@@ -1,11 +1,16 @@
 #pragma once
+#include <cstdint>
 #include <string>
 #include <vector>
 
 // 输出设备条目：控制台设备列表的一项
 struct DeviceEntry {
     std::wstring name;        // 端点友好名
-    std::wstring id;          // 端点 ID (IMMDevice::GetId)
+    std::wstring id;          // 端点 ID (IMMDevice::GetId)，WASAPI 设备有值；ASIO 独占设备为空
+    std::string  key;         // 稳定唯一键（持久化选中项用，避免列表刷新后索引漂移）：
+                              //   WASAPI 端点 = 端点 ID 的 UTF-8 串；ASIO 独占 = "asio:" + 驱动名
+    uint32_t     state = 0;   // 设备状态(DEVICE_STATE_*)；ASIO 独占=0（非系统端点）。用 uint32_t 避免头文件依赖 windows.h（以免在 winsock2.h 之前误拉 winsock.h）
+    bool         isDefault = false; // 是否为系统默认渲染(eConsole)端点
     bool         asio = false;// true=走 ASIO 输出, false=走 WASAPI 独占
     std::string  asioDriver;  // asio=true 时的 ASIO 驱动名
 };

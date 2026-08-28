@@ -30,6 +30,15 @@ static std::string toLowerAscii(const std::string& s) {
     for (auto& c : r) c = (char)tolower((unsigned char)c);
     return r;
 }
+// wstring → UTF-8（端点 ID 实际为 ASCII，但用 UTF-8 以免宽字符丢失）
+static std::string ws2a(const std::wstring& ws) {
+    if (ws.empty()) return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), nullptr, 0, nullptr, nullptr);
+    if (n <= 0) return std::string();
+    std::string out((size_t)n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &out[0], n, nullptr, nullptr);
+    return out;
+}
 static std::wstring toLowerW(const std::wstring& s) {
     std::wstring r = s;
     for (auto& c : r) c = (wchar_t)tolower((wchar_t)c);
@@ -114,16 +123,35 @@ static std::vector<DeviceEntry> scanInner(std::string& err) {
 
     std::vector<std::string> asioDrivers = ListAsioDriverNames();
 
+    // 系统默认渲染(eConsole)端点 ID：标记 ★默认，且作为「自动跟随系统默认」依据
+    std::wstring defaultId;
+    {
+        IMMDevice* def = nullptr;
+        if (SUCCEEDED(en->GetDefaultAudioEndpoint(eRender, eConsole, &def)) && def) {
+            LPWSTR did = nullptr;
+            if (SUCCEEDED(def->GetId(&did)) && did) { defaultId = did; CoTaskMemFree(did); }
+            def->Release();
+        }
+    }
+
+    // 枚举「全部渲染端点」（含已禁用/已拔出），与系统「声音→播放」设置一致；
+    // 仅排除 NOTPRESENT（驱动已卸载，无需列出）。状态用于下拉框标注 [已禁用]/[已拔出]。
     IMMDeviceCollection* coll = nullptr;
-    if (SUCCEEDED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &coll)) && coll) {
+    if (SUCCEEDED(en->EnumAudioEndpoints(eRender,
+            DEVICE_STATE_ACTIVE | DEVICE_STATE_DISABLED | DEVICE_STATE_UNPLUGGED, &coll)) && coll) {
         UINT count = 0;
         coll->GetCount(&count);
         for (UINT i = 0; i < count; ++i) {
             IMMDevice* dev = nullptr;
             if (FAILED(coll->Item(i, &dev)) || !dev) continue;
             DeviceEntry e;
+            DWORD st = 0;
+            dev->GetState(&st);
+            e.state = st;
             LPWSTR idStr = nullptr;
             if (SUCCEEDED(dev->GetId(&idStr)) && idStr) { e.id = idStr; CoTaskMemFree(idStr); }
+            e.key = ws2a(e.id);   // 稳定键 = 端点 ID（UTF-8）；重启/重扫不变
+            e.isDefault = (e.id == defaultId);
             IPropertyStore* ps = nullptr;
             if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &ps)) && ps) {
                 // 友好名优先，回退设备描述。
@@ -156,6 +184,7 @@ static std::vector<DeviceEntry> scanInner(std::string& err) {
     }
     // 补全：注册表中存在但无对应 WASAPI 端点的纯 ASIO 驱动也列入列表，
     // 保证「支持 ASIO 的驱动」在控制台下拉框中完整可见（无 WASAPI 端点时仅 ASIO 输出可用）。
+    // 稳定键 = "asio:" + 驱动名（无 WASAPI 端点 ID 可用）。
     for (const auto& dn : asioDrivers) {
         bool represented = false;
         for (const auto& e : out)
@@ -165,6 +194,7 @@ static std::vector<DeviceEntry> scanInner(std::string& err) {
         e.asio = true;
         e.asioDriver = dn;
         e.name = std::wstring(dn.begin(), dn.end());   // 以 ASIO 驱动名作显示
+        e.key = "asio:" + dn;
         out.push_back(std::move(e));
     }
     en->Release();

@@ -55,8 +55,8 @@ struct BridgeStatsPtrs {
     std::atomic<unsigned long>* targetPid; // Bridge 采集目标进程 PID
     std::atomic<bool>* targetActive;       // 目标进程活跃状态
     std::vector<DeviceEntry>* devices;     // 输出设备列表(控制台展示)
-    std::mutex* devicesMutex;              // 保护 devices
-    std::atomic<int>* selectedDevice;      // 选中的设备索引(-1=自动)
+    std::mutex* devicesMutex;              // 保护 devices 与 selectedKey（同一把锁）
+    std::string* selectedKey;              // 选中的设备稳定键(空=未选择)，与 devicesMutex 同锁
     UpdateState* update;                   // 在线升级状态（可空=未启用）
 };
 

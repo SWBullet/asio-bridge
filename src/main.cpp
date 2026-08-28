@@ -1332,7 +1332,7 @@ int wmain(int argc, wchar_t** argv) {
     // 设备选择（控制台扫描/选择，主循环按选择创建后端）
     std::mutex g_devMutex;
     std::vector<DeviceEntry> g_devices;
-    std::atomic<int> g_selectedDevice{-1};           // -1=未选择(全手动，需在控制台指定)
+    std::string g_selectedKey;   // 选中设备的稳定键(空=未选择)；与 g_devMutex 同锁，避免列表刷新后索引漂移
     // 在线升级（可选：cfg update_url 指定更新源；空=内置 GitHub Releases）
     UpdateState updateState;
     std::string updateUrl;   // cfg 读入（主线程独占，启动检查线程前设置）
@@ -1393,7 +1393,7 @@ int wmain(int argc, wchar_t** argv) {
         &boosterOn, &boosterDb,
         &specIn, &specRes, &specSeq,
         &targetPid, &targetActive,
-        &g_devices, &g_devMutex, &g_selectedDevice,
+        &g_devices, &g_devMutex, &g_selectedKey,
         &updateState
     };
     // 装配升级状态锁：Web 线程启动第一毫秒就可能读 update 状态（UI 轮询
@@ -1443,7 +1443,10 @@ int wmain(int argc, wchar_t** argv) {
         if (!updateUrl.empty())
             fprintf(f, "update_url=%s\n", updateUrl.c_str());   // 保留在线升级更新源配置
         fprintf(f, "bridge_on=%d\n", bridgeOn.load(std::memory_order_relaxed) ? 1 : 0);  // 桥开关状态（首次运行默认待机）
-        fprintf(f, "selected_device=%d\n", g_selectedDevice.load(std::memory_order_relaxed));  // 手动选定的输出设备索引(-1=未选择)
+        {   // 选中设备稳定键：空=未选择；与设备列表同锁，避免读撕裂
+            std::lock_guard<std::mutex> lk(g_devMutex);
+            fprintf(f, "selected_device_id=%s\n", g_selectedKey.c_str());  // 手动选定的输出设备键(持久化，列表刷新不漂移)
+        }
         fclose(f);
     };
     auto loadConfig = [&]() -> bool {
@@ -1491,10 +1494,20 @@ int wmain(int argc, wchar_t** argv) {
                     if (val[0] && !strstr(val, "tcloudbaseapp.com"))
                         updateUrl = val;
                 }
+                else if (!strcmp(key, "selected_device_id")) {
+                    // 手动选定的输出设备稳定键（重启保持用户选择，列表刷新不漂移）
+                    {
+                        std::lock_guard<std::mutex> lk(g_devMutex);
+                        g_selectedKey = val;
+                    }
+                }
                 else if (!strcmp(key, "selected_device")) {
-                    // 手动选定的输出设备索引（重启保持用户选择；越界/负数视为未选择）
+                    // 旧版数值索引兼容：扫描已在加载前完成，可映射到稳定键
                     int v = atoi(val);
-                    g_selectedDevice.store(v >= 0 ? v : -1, std::memory_order_relaxed);
+                    if (v >= 0 && v < (int)g_devices.size()) {
+                        std::lock_guard<std::mutex> lk(g_devMutex);
+                        g_selectedKey = g_devices[(size_t)v].key;
+                    }
                 }
                 else if (!strcmp(key, "bridge_on")) {
                     // 桥开关状态：恢复上次操作（首次运行无此项，保持默认待机）
@@ -1587,10 +1600,13 @@ int wmain(int argc, wchar_t** argv) {
                 {
                     std::lock_guard<std::mutex> lk(g_devMutex);
                     g_devices = std::move(devs);
-                    // 选中设备被拔出 → 回退自动选择
-                    int sel = g_selectedDevice.load(std::memory_order_relaxed);
-                    if (sel >= (int)g_devices.size())
-                        g_selectedDevice.store(-1, std::memory_order_relaxed);
+                    // 选中设备若已不在列表(被拔出/移除) → 清空选择，等待用户重新选定
+                    if (!g_selectedKey.empty()) {
+                        bool found = false;
+                        for (const auto& d : g_devices)
+                            if (d.key == g_selectedKey) { found = true; break; }
+                        if (!found) g_selectedKey.clear();
+                    }
                 }
                 printf("[设备] 设备变化，重新扫描到 %zu 个输出设备%s\n", g_devices.size(),
                        scanErr.empty() ? "" : ("（" + scanErr + "）").c_str());
@@ -1774,15 +1790,20 @@ int wmain(int argc, wchar_t** argv) {
         };
         std::vector<BackendCand> cands;
         bool explicitPick = false;   // 用户显式指定（不自动换候选）
+        bool selEmpty = true;        // 选中键为空（未选择）
         {
             std::lock_guard<std::mutex> lk(g_devMutex);
-            int sel = g_selectedDevice.load(std::memory_order_relaxed);
-            if (sel >= 0 && sel < (int)g_devices.size()) {
-                const DeviceEntry& d = g_devices[(size_t)sel];
-                BackendCand c; c.asio = d.asio; c.driver = d.asioDriver;
-                c.id = d.id; c.name = d.name;
-                cands.push_back(std::move(c));
-                explicitPick = true;
+            selEmpty = g_selectedKey.empty();
+            if (!g_selectedKey.empty()) {
+                for (const auto& d : g_devices) {
+                    if (d.key == g_selectedKey) {
+                        BackendCand c; c.asio = d.asio; c.driver = d.asioDriver;
+                        c.id = d.id; c.name = d.name;
+                        cands.push_back(std::move(c));
+                        explicitPick = true;
+                        break;
+                    }
+                }
             }
         }
         if (!explicitPick && !driver.empty()) {
@@ -1793,8 +1814,7 @@ int wmain(int argc, wchar_t** argv) {
         // 全手动选择：除用户显式选定的设备(--driver 或控制台下拉)外，不再自动回退。
         // 未选择时 cands 为空，下方进入「未选择输出设备」空闲分支，等待用户在控制台选择。
         if (cands.empty()) {
-            int selNow = g_selectedDevice.load(std::memory_order_relaxed);
-            if (selNow < 0 && driver.empty()) {
+            if (selEmpty && driver.empty()) {
                 // 全手动选择：用户尚未在控制台选定输出设备 → 空闲等待选择
                 static int needSelStreak = 0;
                 if ((needSelStreak++ % 10) == 0)

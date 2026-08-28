@@ -469,7 +469,7 @@ async function pollStatus(){
       setBank('bank-floor',String(s.floor));
       setBank('bank-src',String(s.srcTaps||0));
       setBank('bank-width',String(s.thicknessWidth||0));
-      document.getElementById('bank-device').value=String(s.selectedDevice);
+      document.getElementById('bank-device').value=(s.selectedKey && s.selectedKey!=='-1')?s.selectedKey:'-1';
     }
     // ===== 在线升级（底部状态条）=====
     var ub=document.getElementById('updbar');
@@ -540,8 +540,11 @@ function loadDevices(){
       var devs=s.devices||[];
       for(var i=0;i<devs.length;i++){
         var opt=document.createElement('option');
-        opt.value=String(i);
-        opt.textContent=devs[i].name+' ['+(devs[i].asio?'ASIO':'WASAPI')+']';
+        opt.value=devs[i].key;
+        var tag=devs[i].asio?'ASIO':'WASAPI';
+        var st=devs[i].state==1?'':(devs[i].state==2?' [已禁用]':(devs[i].state==4?' [已拔出]':''));
+        var def=devs[i].isDefault?' ★默认':'';
+        opt.textContent=devs[i].name+' ['+tag+']'+st+def;
         sel.appendChild(opt);
       }
       if(cur)sel.value=cur;
@@ -788,6 +791,8 @@ static void handleRequest(SOCKET s, char* req, int n) {
         size_t floorM = g_p.floorMult->load(std::memory_order_relaxed);
         long buf = g_p.asioBuffer->load(std::memory_order_relaxed);
         unsigned long long target = (unsigned long long)wmMult * (unsigned long long)buf * 2ull;
+        std::string selKey;   // 选中设备键（与 devices 同锁读取，避免读撕裂）
+        { std::lock_guard<std::mutex> lk(*g_p.devicesMutex); selKey = *g_p.selectedKey; }
         char body[1024];
         int len = snprintf(body, sizeof(body),
             "{\"watermark\":%llu,\"target\":%llu,\"floor\":%llu,\"wmult\":%llu,"
@@ -803,7 +808,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             "\"thicknessOn\":%d,\"thicknessDelay\":%.1f,\"thicknessWidth\":%d,"
             "\"boosterOn\":%d,\"boosterDb\":%.1f,"
             "\"bridgeOn\":%d,"
-            "\"selectedDevice\":%d,"
+            "\"selectedKey\":\"%s\","
             "\"targetPid\":%u,\"targetActive\":%d,"
             "\"appVer\":\"%s\",\"updateAvailable\":%d,\"updateChecking\":%d,"
             "\"updateDownloading\":%d,\"updateError\":%d,\"updateMsg\":\"%s\",\"updateVer\":\"%s\"}",
@@ -829,7 +834,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             g_p.boosterOn->load(std::memory_order_relaxed) ? 1 : 0,
             (double)g_p.boosterDb->load(std::memory_order_relaxed),
             g_p.bridgeOn->load(std::memory_order_relaxed) ? 1 : 0,
-            (int)g_p.selectedDevice->load(std::memory_order_relaxed),
+            selKey.c_str(),
             (unsigned)g_p.targetPid->load(std::memory_order_relaxed),
             g_p.targetActive->load(std::memory_order_relaxed) ? 1 : 0,
             kAppVersion,
@@ -898,9 +903,20 @@ static void handleRequest(SOCKET s, char* req, int n) {
                 g_p.bridgeOn->store(v != 0, std::memory_order_relaxed);
                 if (v == 0) g_p.needRestart->store(true);   // 关闭时立即断开会话
             } else if (strstr(body, "action=device")) {
-                // 输出设备选择：-1=未选择(全手动), 0..N-1=设备索引；切换需重建链路
-                g_p.selectedDevice->store(v, std::memory_order_relaxed);
-                g_p.needRestart->store(true);
+                // 输出设备选择：value=设备稳定键（WASAPI 端点 ID / "asio:驱动名"）；
+                // "-1" 或空 = 未选择(全手动)；切换需重建链路
+                char* vp = strstr(body, "value=");
+                if (vp) {
+                    vp += 6;
+                    char* amp = strchr(vp, '&');
+                    std::string key = amp ? std::string(vp, amp - vp) : std::string(vp);
+                    {
+                        std::lock_guard<std::mutex> lk(*g_p.devicesMutex);
+                        if (key == "-1" || key.empty()) g_p.selectedKey->clear();
+                        else *g_p.selectedKey = key;
+                    }
+                    g_p.needRestart->store(true);
+                }
             } else if (strstr(body, "action=devscan")) {
                 std::string scanErr;
                 auto devs = ScanOutputDevices(scanErr);
@@ -974,11 +990,15 @@ static void handleRequest(SOCKET s, char* req, int n) {
             for (size_t i = 0; i < g_p.devices->size(); ++i) {
                 const DeviceEntry& d = (*g_p.devices)[i];
                 char tmp[640];
-                snprintf(tmp, sizeof(tmp), "%s{\"name\":\"%s\",\"asio\":%d,\"driver\":\"%s\"}",
+                snprintf(tmp, sizeof(tmp),
+                         "%s{\"name\":\"%s\",\"key\":\"%s\",\"asio\":%d,\"driver\":\"%s\",\"state\":%u,\"isDefault\":%d}",
                          first ? "" : ",",
                          ws2json(d.name).c_str(),
+                         d.key.c_str(),
                          d.asio ? 1 : 0,
-                         d.asioDriver.c_str());
+                         d.asioDriver.c_str(),
+                         (unsigned)d.state,
+                         d.isDefault ? 1 : 0);
                 body += tmp;
                 first = false;
             }

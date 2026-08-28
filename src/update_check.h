@@ -25,7 +25,7 @@
 
 // 软件当前版本（打包/发布时同步修改）。
 // 本地 1.0.5 补丁：保持 1.0.5 不自增版本号，让 in-app 更新器能把 1.0.10 识别为「可升级」。
-static const char* kAppVersion = "1.0.5";
+static const char* kAppVersion = "1.0.10";
 
 // 更新检查状态（控制台只读，检查线程写）
 struct UpdateState {
