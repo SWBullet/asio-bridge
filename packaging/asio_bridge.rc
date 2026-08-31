@@ -1,0 +1,5 @@
+// ASIO Bridge · Windows 资源
+// 把应用图标嵌入主程序(资源管理器/任务栏/开始菜单/卸载程序显示该图标)
+// 由 build_bridge.sh 调用 rc.exe 编译为 asio_bridge.res 后链入 exe
+#define IDI_ICON1 101
+IDI_ICON1 ICON "..\\assets\\icon.ico"
