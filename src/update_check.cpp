@@ -225,6 +225,48 @@ bool parseManifest(const std::string& body, std::string& ver, std::string& url,
     return !ver.empty();
 }
 
+// ============================================================================
+// 历史安装包清理
+// ============================================================================
+// 下载的安装包落在 %TEMP%\asio_bridge_setup_<ver>.exe，装完从不删除，
+// 每个版本 2MB+ 会一直堆积。策略：
+//   1) 更新线程启动时 / 下载新包前 —— 清掉不属于本次的所有历史包；
+//   2) 安装器启动后 —— 把本次用的包也删掉；若安装器正占用文件删不掉，
+//      退化为 MoveFileEx(DELAY_UNTIL_REBOOT)，下次重启时清除（需管理员权限，
+//      失败也无妨：下一次启动会再清一次）。
+
+// 删除 %TEMP% 下所有历史安装包，keepFile 指定的文件除外。返回实际删除数量。
+static int cleanupOldInstallers(const std::wstring& keepFile) {
+    wchar_t tmp[MAX_PATH + 1] = {0};
+    if (!GetTempPathW(MAX_PATH, tmp)) return 0;
+    std::wstring dir = tmp;
+    if (dir.empty()) return 0;
+    if (dir.back() != L'\\' && dir.back() != L'/') dir.push_back(L'\\');
+
+    WIN32_FIND_DATAW fd{};
+    HANDLE h = FindFirstFileW((dir + L"asio_bridge_setup_*.exe").c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+
+    int removed = 0;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        std::wstring full = dir + fd.cFileName;
+        if (!keepFile.empty() && lstrcmpiW(full.c_str(), keepFile.c_str()) == 0) continue;
+        if (DeleteFileW(full.c_str())) { ++removed; continue; }
+        // 被占用（安装器仍在运行）→ 计划下次重启时删除
+        MoveFileExW(full.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return removed;
+}
+
+// 丢弃单个安装包：能删就删，删不掉就标记为重启后删除。
+static void discardInstaller(const std::wstring& file) {
+    if (file.empty()) return;
+    if (DeleteFileW(file.c_str())) return;
+    MoveFileExW(file.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+}
+
 } // namespace
 
 // ============================================================================
@@ -233,6 +275,8 @@ bool parseManifest(const std::string& body, std::string& ver, std::string& url,
 static void updateLoop(UpdateState* st, std::atomic<bool>* stop,
                        const std::string& cfgUrl) {
     std::string lastMsg;
+    // 启动时先清一批历史安装包（含上次升级残留）
+    cleanupOldInstallers(L"");
     while (!stop->load(std::memory_order_relaxed)) {
         // 待办请求：手动检查 / 手动升级
         bool wantCheck = st->checking.exchange(false);
@@ -255,6 +299,8 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop,
             GetTempPathW(MAX_PATH, tmp);
             std::wstring file = std::wstring(tmp) + L"asio_bridge_setup_" +
                                 std::wstring(ver.begin(), ver.end()) + L".exe";
+            // 下载前清掉历史包（保留本次目标文件）
+            cleanupOldInstallers(file);
             {
                 std::lock_guard<std::mutex> lk(*st->mutex);
                 st->message = "正在下载 v" + ver + " …";
@@ -317,6 +363,9 @@ static void updateLoop(UpdateState* st, std::atomic<bool>* stop,
             ShellExecuteW(nullptr, L"open", file.c_str(),
                           L"/SILENT /FORCECLOSEAPPLICATIONS /NORESTART",
                           nullptr, SW_SHOWNORMAL);
+            // 安装已交给安装器，临时包不再需要：能删即删；正在被安装器占用时
+            // 删不掉，会自动降级为「下次重启时删除」（见 discardInstaller）。
+            discardInstaller(file);
             {
                 std::lock_guard<std::mutex> lk(*st->mutex);
                 st->message = "升级安装已启动，程序即将退出…";
