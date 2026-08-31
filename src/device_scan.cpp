@@ -87,7 +87,17 @@ static bool matchAsioToEndpoint(const std::string& driverName, const std::wstrin
     return false;
 }
 
-// 纯注册表枚举 ASIO 驱动名
+// 已知不存在/已卸载的 ASIO 驱动：注册表残留子键（无对应硬件）却仍以「纯 ASIO 驱动」
+// 形式出现在菜单里。列入此表即跳过，避免在控制台输出设备菜单显示 Phantom 设备。
+static bool isAsioDriverExcluded(const std::string& name) {
+    static const char* kExcluded[] = { "DSDTranscoder" };
+    std::string low = toLowerAscii(name);
+    for (const char* e : kExcluded)
+        if (low == toLowerAscii(e)) return true;
+    return false;
+}
+
+// 纯注册表枚举 ASIO 驱动名（跳过已知残留/已卸载驱动）
 std::vector<std::string> ListAsioDriverNames() {
     std::vector<std::string> names;
     HKEY hk = nullptr;
@@ -99,6 +109,7 @@ std::vector<std::string> ListAsioDriverNames() {
             len = sizeof(name);
             LONG r = RegEnumKeyExA(hk, i++, name, &len, nullptr, nullptr, nullptr, nullptr);
             if (r != ERROR_SUCCESS) break;
+            if (isAsioDriverExcluded(name)) continue;   // 跳过 Phantom 驱动
             names.emplace_back(name);
         }
         RegCloseKey(hk);
@@ -134,11 +145,12 @@ static std::vector<DeviceEntry> scanInner(std::string& err) {
         }
     }
 
-    // 枚举「全部渲染端点」（含已禁用/已拔出），与系统「声音→播放」设置一致；
-    // 仅排除 NOTPRESENT（驱动已卸载，无需列出）。状态用于下拉框标注 [已禁用]/[已拔出]。
+    // 枚举「全部渲染端点」（含已禁用），与系统「声音→播放」设置一致；
+    // 排除 UNPLUGGED（已拔出，物理不在系统里）与 NOTPRESENT（驱动已卸载）——这两类即
+    // 菜单里「系统里不存在的残留」，不应作为可选输出目标。状态用于下拉框标注 [已禁用]。
     IMMDeviceCollection* coll = nullptr;
     if (SUCCEEDED(en->EnumAudioEndpoints(eRender,
-            DEVICE_STATE_ACTIVE | DEVICE_STATE_DISABLED | DEVICE_STATE_UNPLUGGED, &coll)) && coll) {
+            DEVICE_STATE_ACTIVE | DEVICE_STATE_DISABLED, &coll)) && coll) {
         UINT count = 0;
         coll->GetCount(&count);
         for (UINT i = 0; i < count; ++i) {

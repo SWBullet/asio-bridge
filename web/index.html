@@ -442,7 +442,7 @@ async function pollStatus(){
       setBank('bank-floor',String(s.floor));
       setBank('bank-src',String(s.srcTaps||0));
       setBank('bank-width',String(s.thicknessWidth||0));
-      document.getElementById('bank-device').value=String(s.selectedDevice);
+      document.getElementById('bank-device').value=(s.selectedKey && s.selectedKey!=='-1')?s.selectedKey:'-1';
     }
     // ===== 在线升级（底部状态条）=====
     var ub=document.getElementById('updbar');
@@ -513,8 +513,11 @@ function loadDevices(){
       var devs=s.devices||[];
       for(var i=0;i<devs.length;i++){
         var opt=document.createElement('option');
-        opt.value=String(i);
-        opt.textContent=devs[i].name+' ['+(devs[i].asio?'ASIO':'WASAPI')+']';
+        opt.value=devs[i].key;
+        var tag=devs[i].asio?'ASIO':'WASAPI';
+        var st=devs[i].state==1?'':(devs[i].state==2?' [已禁用]':(devs[i].state==4?' [已拔出]':''));
+        var def=devs[i].isDefault?' ★默认':'';
+        opt.textContent=devs[i].name+' ['+tag+']'+st+def;
         sel.appendChild(opt);
       }
       if(cur)sel.value=cur;
