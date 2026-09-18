@@ -1452,11 +1452,18 @@ int wmain(int argc, wchar_t** argv) {
     auto loadConfig = [&]() -> bool {
         FILE* f = _wfopen(configPath().c_str(), L"r");
         if (!f) return false;   // 首次运行：下方置待机
-        char line[128];
+        char line[512];
         while (fgets(line, sizeof(line), f)) {
             char key[64] = {0};
-            char val[64] = {0};
-            if (sscanf(line, "%63[^=]=%63s", key, val) == 2) {
+            char val[256] = {0};
+            // 注意：值必须整段读到行尾（%255[^\r\n]），不能用 %s —— %s 遇空格即截断，
+            // 会把含空格的键（如 asio:ASIO MADIface USB、asio:Realtek ASIO）截成
+            // "asio:ASIO"，导致所选设备永远匹配不上、桥报「未找到可用的输出设备」。
+            if (sscanf(line, "%63[^=]=%255[^\r\n]", key, val) == 2) {
+                // 去掉值尾部空白/CR（前导空格由 %[^\r\n] 原样保留，键本身不含前导空格）
+                size_t vn = strlen(val);
+                while (vn > 0 && (val[vn - 1] == '\r' || val[vn - 1] == '\n' ||
+                                  val[vn - 1] == ' '  || val[vn - 1] == '\t')) val[--vn] = 0;
                 if (!strcmp(key, "tube_on")) tubeOn.store(atoi(val) != 0, std::memory_order_relaxed);
                 else if (!strcmp(key, "tube_warmth")) {
                     float fv = (float)atof(val);
@@ -1797,9 +1804,25 @@ int wmain(int argc, wchar_t** argv) {
             if (!g_selectedKey.empty()) {
                 for (const auto& d : g_devices) {
                     if (d.key == g_selectedKey) {
-                        BackendCand c; c.asio = d.asio; c.driver = d.asioDriver;
-                        c.id = d.id; c.name = d.name;
-                        cands.push_back(std::move(c));
+                        // 同一设备的两种后端都给出候选：ASIO 优先，WASAPI 独占兜底。
+                        // 只在同一设备具备 WASAPI 渲染端点(d.id 非空)时才兜底 ——
+                        // 纯 ASIO 独占设备(MADIface 等)d.id 为空，无 WASAPI 可退。
+                        // 背景：Realtek 这类设备同时暴露 ASIO 驱动与 WASAPI 端点，
+                        // 但 Realtek ASIO 常初始化失败(驱动未启用/不支持)；此前只给
+                        // ASIO 一条路，失败即死锁，桥反复重试、采样全丢。
+                        if (d.asio && !d.asioDriver.empty()) {
+                            BackendCand a; a.asio = true; a.driver = d.asioDriver;
+                            a.id = d.id; a.name = d.name;
+                            cands.push_back(std::move(a));
+                            if (!d.id.empty()) {
+                                BackendCand w; w.asio = false; w.id = d.id; w.name = d.name;
+                                cands.push_back(std::move(w));
+                            }
+                        } else {
+                            BackendCand c; c.asio = d.asio; c.driver = d.asioDriver;
+                            c.id = d.id; c.name = d.name;
+                            cands.push_back(std::move(c));
+                        }
                         explicitPick = true;
                         break;
                     }

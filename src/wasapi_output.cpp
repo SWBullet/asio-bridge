@@ -6,6 +6,7 @@
 #include <avrt.h>
 #include <cstring>
 #include <cmath>
+#include <cstdio>
 
 // 格式判断：是否 float32
 static bool IsFloatFormat(const WAVEFORMATEX* wf) {
@@ -100,16 +101,31 @@ void WasapiOutput::threadLoop() {
     client_->GetDevicePeriod(&defPeriod, &minPeriod);
     REFERENCE_TIME bufDur = (defPeriod > 0) ? defPeriod * 2 : 200000;   // 2×默认周期 ≈ 20ms
 
-    // 尝试用给定格式做独占初始化(含缓冲对齐重试)
+    // 尝试用给定格式做独占初始化（含缓冲尺寸/对齐错误重试）。
+    // 关键：独占模式下缓冲时长不是设备周期整数倍时，不同驱动回报的 HRESULT 不同——
+    //   AUDCLNT_E_BUFFER_SIZE_ERROR        = 0x88890016  （本机 Realtek / Bose 实测即此码）
+    //   AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED  = 0x88890019
+    // 旧代码只判 NOT_ALIGNED，导致 0x016 从不重试、独占模式在所有设备上恒失败
+    // （症状：桥反复「输出后端初始化失败」、采样全丢、无声）。两者都要重算时长重试。
     auto tryInitX = [&](const WAVEFORMATEX* f, REFERENCE_TIME dur) -> HRESULT {
         HRESULT h = client_->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE,
                                         AUDCLNT_STREAMFLAGS_EVENTCALLBACK, dur, 0, f, nullptr);
-        if (h == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
-            UINT32 af = 0;
-            if (SUCCEEDED(client_->GetBufferSize(&af)) && af > 0 && f->nSamplesPerSec > 0)
-                dur = (REFERENCE_TIME)(10000000.0 * (double)af / (double)f->nSamplesPerSec);
+        if (h != AUDCLNT_E_BUFFER_SIZE_ERROR && h != AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED)
+            return h;
+        // 重试候选：对齐帧数 → 设备最小周期 → 设备默认周期
+        REFERENCE_TIME alt[3];
+        int n = 0;
+        UINT32 af = 0;
+        if (SUCCEEDED(client_->GetBufferSize(&af)) && af > 0 && f->nSamplesPerSec > 0) {
+            REFERENCE_TIME aligned = (REFERENCE_TIME)(10000000.0 * (double)af / (double)f->nSamplesPerSec);
+            if (aligned > 0) alt[n++] = aligned;
+        }
+        if (minPeriod > 0) alt[n++] = minPeriod;
+        if (defPeriod > 0) alt[n++] = defPeriod;
+        for (int i = 0; i < n && FAILED(h); ++i) {
+            if (alt[i] == dur) continue;
             h = client_->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE,
-                                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, dur, 0, f, nullptr);
+                                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, alt[i], 0, f, nullptr);
         }
         return h;
     };
@@ -140,8 +156,37 @@ void WasapiOutput::threadLoop() {
             }
         }
     }
+    if (FAILED(hr)) {
+        // 独占不可用 → 降级共享模式。
+        // 实测：Win11(10.0.26200) 上 Realtek / Bose 端点独占恒返回
+        // AUDCLNT_E_BUFFER_SIZE_ERROR(0x88890016)，按对齐帧数/设备周期重试仍无效。
+        // 共享模式延迟略高(约 20ms，独占约 5-10ms)，但几乎每个渲染端点都可用，
+        // 远好于「永久初始化失败 → 采样全丢 → 没声音」。
+        // 必须传完整的 mixFmt 指针：GetMixFormat 常返回 WAVEFORMATEXTENSIBLE，
+        // 而 fmt_ 只是其 WAVEFORMATEX 截断拷贝（cbSize 仍声明 22 字节扩展数据，
+        // 但 SubFormat 等已被丢弃）→ 传 &fmt_ 会被判 UNSUPPORTED_FORMAT(0x88890008)。
+        const HRESULT hrEx = hr;   // 保存独占失败码（下面 hr 会被共享模式结果覆盖）
+        HRESULT hs = client_->Initialize(AUDCLNT_SHAREMODE_SHARED,
+                                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                        0, 0, mixFmt, nullptr);
+        if (SUCCEEDED(hs)) {
+            shared_ = true;
+            hr = hs;
+            printf("[设备] 独占模式不可用(hr=0x%08lX)，已降级为 WASAPI 共享模式\n",
+                   (unsigned long)hrEx);
+        } else {
+            const char* hint = (hr == AUDCLNT_E_BUFFER_SIZE_ERROR ||
+                                hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) ? " (独占缓冲时长不符设备要求)"
+                             : (hr == AUDCLNT_E_DEVICE_IN_USE)            ? " (设备已被其他程序独占占用)"
+                             : (hr == AUDCLNT_E_UNSUPPORTED_FORMAT)       ? " (该格式独占模式不支持)"
+                                                                          : " (设备被占用或格式不支持?)";
+            initErr_ = "WASAPI 独占 Initialize 失败 hr=" + hresultText(hr) + hint
+                     + "；共享模式亦失败 hr=" + hresultText(hs);
+            CoTaskMemFree(mixFmt);
+            goto fail;
+        }
+    }
     CoTaskMemFree(mixFmt);
-    if (FAILED(hr)) { initErr_ = "WASAPI 独占 Initialize 失败 hr=" + hresultText(hr) + " (设备被占用或格式不支持?)"; goto fail; }
 
     UINT32 bufFrames = 0;
     if (FAILED(client_->GetBufferSize(&bufFrames)) || bufFrames == 0) { initErr_ = "GetBufferSize 失败"; goto fail; }

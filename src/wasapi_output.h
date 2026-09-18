@@ -44,6 +44,7 @@ private:
     IAudioRenderClient* render_ = nullptr;
     WAVEFORMATEX fmt_ = {};
     bool isFloat_ = false;
+    bool shared_ = false;    // true=独占不可用、已降级为共享模式(延迟略高但几乎全设备可用)
     std::vector<float> scratch_;
     std::string initErr_;
 };
