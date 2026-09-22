@@ -748,7 +748,7 @@ static int captureSelfTest() {
             if (SUCCEEDED(store->GetValue(kName, &v)) && v.vt == VT_LPWSTR) devName = v.pwszVal;
             PropVariantClear(&v); store->Release();
         }
-        printf("[Bridge 自检] 渲染端点: %ls\n", devName.c_str());
+        printf("[Bridge 自检] 渲染端点: %s\n", ws2s(devName).c_str());
         // 只有真的落到「静默目标」CABLE Input 上才按低打扰处理。
         // 曾经这里写成 silentTarget = (candIdx == 0)（只看「选中的是第一个候选」），
         // 于是没有虚拟声卡时会误报「静默目标 CABLE Input」并按 0.5 振幅播给
@@ -1882,19 +1882,21 @@ int wmain(int argc, wchar_t** argv) {
                         endpointMutes = MuteTargetEndpointsSkipping(pid, skipId, &skippedEndpoints);
                         if (!skippedEndpoints.empty()) {
                             risk = 1;
-                            std::wstring outDev = L"(未识别)";
+                            std::wstring outDevW = L"(未识别)";
                             {
                                 std::lock_guard<std::mutex> lk(g_devMutex);
                                 for (const auto& d : g_devices)
-                                    if (d.key == g_selectedKey) { outDev = d.name; break; }
+                                    if (d.key == g_selectedKey) { outDevW = d.name; break; }
                             }
-                            printf("[静音] 【双重声风险】源应用与桥的输出在同一个端点「%ls」：\n"
-                                   "        该端点主音量不能静音（桥的 WASAPI 共享输出必经它，"
-                                   "静音了桥也一起哑），所以这条路径上的原声无法消除，会听到回音。\n"
-                                   "        解法：把源应用的输出设备改到「别的」端点——播放器自带设置里选，"
-                                   "或 Windows 设置 → 系统 → 声音 → 音量合成器 → 逐个应用选输出设备。\n"
-                                   "        源改走后，那个端点会被自动静音，桥仍输出到「%ls」，"
-                                   "于是只剩桥渲染的声音，且系统音量照常可调。\n",
+                            // 单行输出：日志可能被其它线程的 printf 插话，多行消息会被截断
+                            // （设备名此前用 %ls 打印恒为空——printf 走窄字符通道，中文宽串
+                            //  在 C locale 下转换失败，故统一用 ws2s 转 UTF-8 后按 %s 打）。
+                            std::string outDev = ws2s(outDevW);
+                            printf("[静音] 【双重声风险】源应用与桥的输出同在一个端点「%s」——"
+                                   "该端点主音量不能静音（桥的 WASAPI 共享输出必经它，静了桥也一起哑），"
+                                   "故原声无法消除、会听到回音。解法：把源应用的输出设备改到别的端点"
+                                   "（播放器设置里选，或 Windows 设置→系统→声音→音量合成器→逐应用选），"
+                                   "那个端点会被自动静音，桥仍输出到「%s」，系统音量照常可调。\n",
                                    outDev.c_str(), outDev.c_str());
                         }
                         if (!endpointMutes.empty())
@@ -2190,7 +2192,7 @@ int wmain(int argc, wchar_t** argv) {
                 } else {
                     out = std::make_unique<WasapiOutput>(c.id);
                     outAsio = false;
-                    printf("[设备] 尝试 WASAPI 独占: %ls\n", c.name.c_str());
+                    printf("[设备] 尝试 WASAPI 独占: %s\n", ws2s(c.name).c_str());
                 }
                 out->setDither(ditherOn.load(std::memory_order_relaxed));
                 out->setPullCallback(pullCb);
