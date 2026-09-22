@@ -58,6 +58,10 @@ struct BridgeStatsPtrs {
     std::mutex* devicesMutex;              // 保护 devices 与 selectedKey（同一把锁）
     std::string* selectedKey;              // 选中的设备稳定键(空=未选择)，与 devicesMutex 同锁
     UpdateState* update;                   // 在线升级状态（可空=未启用）
+    // 双重声风险：1 = 源应用与桥的输出在同一个 WASAPI 端点，该端点主音量不能静音
+    // （静了桥自己也哑），故这条路径上的原声无法消除，用户会听到回音。控制台据此
+    // 显示告示并给出解法（把源应用输出改到别的端点，桥仍输出到当前设备）。
+    std::atomic<int>* dualRisk;
 };
 
 constexpr size_t kHistCap = 3600;   // 2 秒一采样 × 3600 = 2 小时

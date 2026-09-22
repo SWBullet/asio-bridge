@@ -45,6 +45,7 @@ private:
     WAVEFORMATEX fmt_ = {};
     bool isFloat_ = false;
     bool shared_ = false;    // true=独占不可用、已降级为共享模式(延迟略高但几乎全设备可用)
+    UINT32 deviceBufFrames_ = 0;   // 端点缓冲总帧数(GetBufferSize)；共享模式据此算可用空间
     std::vector<float> scratch_;
     std::string initErr_;
 };

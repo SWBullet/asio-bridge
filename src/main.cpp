@@ -739,7 +739,6 @@ static int captureSelfTest() {
         printf("[Bridge 自检] 没有任何可用的渲染端点（音频服务/设备状态异常？）\n");
         en->Release(); CoUninitialize(); return 1;
     }
-    silentTarget = (candIdx == 0);
     {
         IPropertyStore* store = nullptr;
         std::wstring devName = L"?";
@@ -750,6 +749,11 @@ static int captureSelfTest() {
             PropVariantClear(&v); store->Release();
         }
         printf("[Bridge 自检] 渲染端点: %ls\n", devName.c_str());
+        // 只有真的落到「静默目标」CABLE Input 上才按低打扰处理。
+        // 曾经这里写成 silentTarget = (candIdx == 0)（只看「选中的是第一个候选」），
+        // 于是没有虚拟声卡时会误报「静默目标 CABLE Input」并按 0.5 振幅播给
+        // 真实扬声器 —— 标签与音量都错，此处按设备名判定。
+        silentTarget = (devName.find(L"CABLE Input") != std::wstring::npos);
     }
     IAudioRenderClient* rr = nullptr;
     rc->GetService(__uuidof(IAudioRenderClient), (void**)&rr);
@@ -979,6 +983,102 @@ static int captureSelfTest() {
         run2.store(false);
         render2.join();
         if (!ok4) pass = false;
+    }
+
+    // 5) 会话静音语义验证（WASAPI 共享输出场景的消双重声手段）：
+    //    端点静音会静音端点主音量（= 系统音量控制），而 WASAPI 共享输出必经
+    //    端点主音量 —— 于是桥自己的输出也被静音。本机无可用 ASIO，只能走
+    //    WASAPI，故端点静音不可用，替代方案是会话级静音。此阶段实测判定其
+    //    成立前提：进程回环取点是否在「会话静音之前」。
+    //    注意：本阶段是「判定」而非「断言」，不参与 pass（改判策略的依据）。
+    {
+        printf("[Bridge 自检] 阶段5：会话静音目标进程后回环捕获是否仍有效...\n");
+        std::atomic<bool> run5{true};
+        std::thread render5([&] {
+            UINT32 bf = 0; rc->GetBufferSize(&bf);
+            double phase = 0.0;
+            rc->Start();
+            while (run5.load()) {
+                if (WaitForSingleObject(rEvt, 100) != WAIT_OBJECT_0) continue;
+                UINT32 pad = 0; rc->GetCurrentPadding(&pad);
+                UINT32 avail = bf - pad;
+                if (avail == 0) continue;
+                BYTE* p = nullptr;
+                if (SUCCEEDED(rr->GetBuffer(avail, &p))) {
+                    float* fp = (float*)p;
+                    for (UINT32 i = 0; i < avail; ++i) {
+                        float s = (float)(amp * sin(phase));
+                        phase += 2.0 * 3.14159265358979323846 * fTest / mixRate;
+                        if (phase > 2.0 * 3.14159265358979323846) phase -= 2.0 * 3.14159265358979323846;
+                        fp[i * 2] = s; fp[i * 2 + 1] = s;
+                    }
+                    rr->ReleaseBuffer(avail, 0);
+                }
+            }
+            rc->Stop();
+        });
+        Sleep(400);
+        // 采集一次并返回 RMS；样本数经 nOut 回传。
+        // 关键：必须区分「采到静音」与「什么都没采到」——两者 RMS 都是 0，
+        // 早期版本没有区分，会把「采集为空」误判成「会话静音哑掉了捕获」。
+        auto measure5 = [&](std::vector<float>& capOut, size_t& nOut) -> double {
+            capOut.clear();
+            nOut = 0;
+            WasapiProcessCapture pc5;
+            std::string err5;
+            if (!pc5.open(GetCurrentProcessId(), [&](const float* d, uint32_t frames) {
+                    capOut.insert(capOut.end(), d, d + (size_t)frames * 2);
+                }, err5)) {
+                printf("[Bridge 自检] 阶段5捕获打开失败: %s\n", err5.c_str());
+                return -1.0;
+            }
+            Sleep(1500);
+            pc5.close();
+            double sumSq = 0.0;
+            size_t start = (size_t)pc5.format().sampleRate / 2 * 2;
+            for (size_t i = start; i + 1 < capOut.size(); i += 2) {
+                double v = capOut[i];
+                sumSq += v * v;
+                ++nOut;
+            }
+            return nOut ? sqrt(sumSq / nOut) : 0.0;
+        };
+
+        // 对照组：未静音时必须采到满幅正弦，否则本阶段无法判定
+        std::vector<float> capA;
+        size_t nA = 0;
+        double rmsA = measure5(capA, nA);
+        printf("[Bridge 自检] 阶段5对照组(未静音) 捕获 RMS %.4f / 样本 %zu（期望 %.4f）\n",
+               rmsA, nA, expectRms);
+
+        std::vector<SessionMuteEntry> smutes = MuteTargetSessions(GetCurrentProcessId());
+        const size_t nSmutes = smutes.size();   // RestoreSessionMutes 会清空 vector，先存住
+        printf("[Bridge 自检] 已会话静音 %zu 个会话\n", nSmutes);
+
+        // 实验组：会话静音后同样采一次
+        std::vector<float> capB;
+        size_t nB = 0;
+        double rmsB = nSmutes ? measure5(capB, nB) : -1.0;
+        RestoreSessionMutes(smutes);
+
+        if (!nSmutes) {
+            printf("[Bridge 自检] 无可静音目标会话 => 无法判定\n");
+        } else {
+            printf("[Bridge 自检] 阶段5实验组(会话静音后) 捕获 RMS %.4f / 样本 %zu\n", rmsB, nB);
+            bool ctrlOk = nA > 1000 && rmsA > expectRms * 0.8 && rmsA < expectRms * 1.2;
+            bool expOk  = nB > 1000 && rmsB > expectRms * 0.8 && rmsB < expectRms * 1.2;
+            if (!ctrlOk) {
+                printf("[Bridge 自检] 阶段5对照组无效（样本 %zu, RMS %.4f）=> 无法判定\n", nA, rmsA);
+            } else if (expOk) {
+                printf("[Bridge 自检] => 取点在会话静音之前 ✓（会话静音方案可用："
+                       "可消双重声且不动系统音量）\n");
+            } else {
+                printf("[Bridge 自检] => 取点在会话静音之后 ✗（会话静音会哑掉捕获，"
+                       "样本 %zu RMS %.4f）\n", nB, rmsB);
+            }
+        }
+        run5.store(false);
+        render5.join();
     }
 
     CloseHandle(rEvt);
@@ -1333,6 +1433,9 @@ int wmain(int argc, wchar_t** argv) {
     std::mutex g_devMutex;
     std::vector<DeviceEntry> g_devices;
     std::string g_selectedKey;   // 选中设备的稳定键(空=未选择)；与 g_devMutex 同锁，避免列表刷新后索引漂移
+    // 双重声风险标志（1=源与桥输出同端点，原声无法消除；控制台据此告示）
+    std::atomic<int> g_dualRisk{0};
+    int selMissingStreak = 0;    // 选中设备连续缺席次数（容忍 USB 声卡瞬时缺席，见重扫处）
     // 在线升级（可选：cfg update_url 指定更新源；空=内置 GitHub Releases）
     UpdateState updateState;
     std::string updateUrl;   // cfg 读入（主线程独占，启动检查线程前设置）
@@ -1394,7 +1497,8 @@ int wmain(int argc, wchar_t** argv) {
         &specIn, &specRes, &specSeq,
         &targetPid, &targetActive,
         &g_devices, &g_devMutex, &g_selectedKey,
-        &updateState
+        &updateState,
+        &g_dualRisk
     };
     // 装配升级状态锁：Web 线程启动第一毫秒就可能读 update 状态（UI 轮询
     // /api/status 会 lock(*update->mutex)），锁必须先于 startWebConsole 就位，
@@ -1607,12 +1711,24 @@ int wmain(int argc, wchar_t** argv) {
                 {
                     std::lock_guard<std::mutex> lk(g_devMutex);
                     g_devices = std::move(devs);
-                    // 选中设备若已不在列表(被拔出/移除) → 清空选择，等待用户重新选定
+                    // 选中设备若已不在列表(被拔出/移除) → 清空选择，等待用户重新选定。
+                    // 但必须容忍「瞬时缺席」：USB 声卡（如 Bose）在设备枚举的瞬间会短暂
+                    // 不出现在列表里，早先一缺席就立刻清空选择，结果是桥静默失能
+                    // （无输出设备 → 什么都不输出），用户看到的现象是「桥没起来/没声音」。
+                    // 故：扫到设备但目标不在其中、且连续 3 次仍未出现，才认定设备真的走了；
+                    // 扫描结果为空视为枚举失败，一律不清。
                     if (!g_selectedKey.empty()) {
                         bool found = false;
                         for (const auto& d : g_devices)
                             if (d.key == g_selectedKey) { found = true; break; }
-                        if (!found) g_selectedKey.clear();
+                        if (found || g_devices.empty()) {
+                            selMissingStreak = 0;
+                        } else if (++selMissingStreak >= 3) {
+                            printf("[设备] 选中设备连续 %d 次未出现在扫描结果中，"
+                                   "判定为已移除，清空选择\n", selMissingStreak);
+                            g_selectedKey.clear();
+                            selMissingStreak = 0;
+                        }
                     }
                 }
                 printf("[设备] 设备变化，重新扫描到 %zu 个输出设备%s\n", g_devices.size(),
@@ -1724,25 +1840,73 @@ int wmain(int argc, wchar_t** argv) {
             }
             capOk = pcap.open(pid, onData, oerr);
             if (capOk) {
+                // 双重声风险标志：每轮先清零，仅当「源与桥输出同端点」时置 1（见下方静音段）
+                g_dualRisk.store(0, std::memory_order_relaxed);
                 targetPid.store(pid, std::memory_order_relaxed);
                 // 整条 DSP 链为立体声硬编码：多声道混音格式(5.1/7.1)下只取前 2 通道
                 // (前 L/R)，否则重采样器/ASIO 按 2 通道记账与采集通道数错位，音频错乱。
                 capCh = (uint16_t)std::min<uint16_t>(pcap.format().channels, 2);
                 // tap→redirect：静音目标所在渲染端点的终点主音量，消除双重声。
-                // 数值自检证明回环取点在终点主音量之前、会话静音之后：
-                // 终点静音不影响捕获（ASIO 不走 WDM 终点音量，同样不受影响）
-                if (noMute) {
-                    printf("[静音] --no-mute 诊断模式：跳过端点静音（可能出现双重声）\n");
-                } else {
-                    endpointMutes = MuteTargetEndpoints(pid);
-                    if (!endpointMutes.empty())
-                        printf("[静音] 已静音目标进程 %lu 所在 %zu 个端点——消除双重声"
-                               "（重建/退出时自动恢复；该端点其他 WDM 声音也会静音）\n",
-                               (unsigned long)pid, endpointMutes.size());
-                    else
-                        printf("[静音] 目标进程 %lu 所在端点：无新增静音"
-                               "（端点已是静音态或获取音量失败——桥关闭时不会恢复此端点）\n",
-                               (unsigned long)pid);
+                //
+                // 两条取点事实由 --capture-test 实测钉死（阶段4/阶段5，均带对照组
+                // 与样本数双重确认，排除「采集为空」造成的假阴性）：
+                //   · 端点主音量静音 → 捕获 RMS 0.3536 不变（取点在端点主音量「之前」）
+                //   · 会话静音       → 捕获 RMS 0.0000 归零（取点在会话静音「之后」）
+                // 即链路顺序为：进程流 → 会话音量 →[回环取点]→ 端点主音量 → 设备。
+                // 推论：想「静掉原声」又「保住捕获」，只能在取点之后动手 —— 只有端点
+                // 静音这一条路，根本没有「按进程」的等价手段（会话静音会哑掉捕获）。
+                //
+                // 于是：
+                //  · 输出走 ASIO / WASAPI 独占：不经 WDM 端点主音量 → 端点静音只杀
+                //    原声、不伤桥，完美（RME 场景）。
+                //  · 输出走 WASAPI 共享：必经端点主音量 → 静音该端点会把桥自己一起
+                //    静音（症状：系统音量一关就彻底无声，一开就与原声叠成双重声）。
+                //    此时唯一可行的拓扑是「源与桥输出不在同一端点」：静音源所在端点，
+                //    桥输出端点保持不静音。故共享输出场景跳过桥自己的输出端点，
+                //    并在控制台暴露双重声风险标志。
+                {
+                    int risk = 0;
+                    // 未选择输出设备时绝不能静音：此时 skipId 为空，Skipping 版本会静掉
+                    // 目标所在的「全部」端点（含系统默认设备），结果是把用户的系统音量
+                    // 整个静默掉、彻底没声。没输出设备就没有双重声可言，直接不静。
+                    const bool haveOut = !g_selectedKey.empty();
+                    if (!haveOut) {
+                        printf("[静音] 尚未选择输出设备——本轮不做任何端点静音"
+                               "（否则会把系统端点静默掉、彻底没声）\n");
+                    } else if (noMute) {
+                        printf("[静音] --no-mute 诊断模式：跳过端点静音（可能出现双重声）\n");
+                    } else {
+                        std::string skipId;
+                        if (g_selectedKey.compare(0, 5, "asio:") != 0) skipId = g_selectedKey;   // ASIO 驱动键不在端点表内
+                        std::vector<std::string> skippedEndpoints;
+                        endpointMutes = MuteTargetEndpointsSkipping(pid, skipId, &skippedEndpoints);
+                        if (!skippedEndpoints.empty()) {
+                            risk = 1;
+                            std::wstring outDev = L"(未识别)";
+                            {
+                                std::lock_guard<std::mutex> lk(g_devMutex);
+                                for (const auto& d : g_devices)
+                                    if (d.key == g_selectedKey) { outDev = d.name; break; }
+                            }
+                            printf("[静音] 【双重声风险】源应用与桥的输出在同一个端点「%ls」：\n"
+                                   "        该端点主音量不能静音（桥的 WASAPI 共享输出必经它，"
+                                   "静音了桥也一起哑），所以这条路径上的原声无法消除，会听到回音。\n"
+                                   "        解法：把源应用的输出设备改到「别的」端点——播放器自带设置里选，"
+                                   "或 Windows 设置 → 系统 → 声音 → 音量合成器 → 逐个应用选输出设备。\n"
+                                   "        源改走后，那个端点会被自动静音，桥仍输出到「%ls」，"
+                                   "于是只剩桥渲染的声音，且系统音量照常可调。\n",
+                                   outDev.c_str(), outDev.c_str());
+                        }
+                        if (!endpointMutes.empty())
+                            printf("[静音] 已静音目标进程 %lu 所在 %zu 个端点——消除双重声"
+                                   "（重建/退出时自动恢复；该端点其他 WDM 声音也会静音）\n",
+                                   (unsigned long)pid, endpointMutes.size());
+                        else if (skippedEndpoints.empty())
+                            printf("[静音] 目标进程 %lu 所在端点：无新增静音"
+                                   "（端点已是静音态或获取音量失败——桥关闭时不会恢复此端点）\n",
+                                   (unsigned long)pid);
+                    }
+                    g_dualRisk.store(risk, std::memory_order_relaxed);
                 }
             }
         }

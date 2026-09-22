@@ -1,5 +1,6 @@
 #pragma once
 #include <audioclient.h>
+#include <audiopolicy.h>
 #include <endpointvolume.h>
 #include <atomic>
 #include <cstdint>
@@ -87,7 +88,32 @@ struct EndpointMuteEntry {
     BOOL prevMute = FALSE;
 };
 std::vector<EndpointMuteEntry> MuteTargetEndpoints(DWORD pid);
+// 同上，但跳过 skipEndpointId 指定的端点（空串=不跳过）。
+// 用途：输出后端降级为 WASAPI 共享模式时，桥的输出必经该端点主音量，
+// 静音自己的输出端点会把桥一起静音 —— 症状是「系统音量一关就彻底无声、
+// 一开就与原声叠成双重声」。ASIO / 独占输出不走端点主音量，传空即可。
+// skipped 非空时回传被跳过的端点 ID，供上层提示用户。
+std::vector<EndpointMuteEntry> MuteTargetEndpointsSkipping(DWORD pid,
+                                                           const std::string& skipEndpointId,
+                                                           std::vector<std::string>* skipped);
 void RestoreEndpointMutes(std::vector<EndpointMuteEntry>& entries);
+
+// ---------------------------------------------------------------------------
+// 目标会话静音（WASAPI 共享输出场景下的消双重声手段）：
+// 端点级静音虽然不影响捕获，但有两个对本机（无可用 ASIO）致命的副作用：
+//   1) 它会静音端点主音量 —— 即「系统音量控制」，用户看到静音、无法调节；
+//   2) WASAPI 共享输出必经端点主音量，所以桥自己的输出会被一起静音 → 无声。
+// 因此当桥输出走 WASAPI（共享/独占）时，消双重声必须改用会话级静音：
+// 只哑掉目标进程（含进程树）自己的音频会话，端点主音量完全不动。
+// 会话随目标进程退出自动销毁，故不需要 mute_flag 崩溃自愈。
+// 前提：进程回环取点在会话静音「之前」——由 --capture-test 阶段5 判定。
+// ---------------------------------------------------------------------------
+struct SessionMuteEntry {
+    ISimpleAudioVolume* sv = nullptr;
+    BOOL prevMute = FALSE;
+};
+std::vector<SessionMuteEntry> MuteTargetSessions(DWORD pid);
+void RestoreSessionMutes(std::vector<SessionMuteEntry>& entries);
 
 // 崩溃自愈：启动时消费 mute_flag.txt（上次异常退出残留的静音端点记录），
 // 按端点 ID 解除残留静音。返回恢复的端点数；-1 = 无残留标志（上次正常退出）；

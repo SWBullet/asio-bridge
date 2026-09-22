@@ -610,7 +610,20 @@ static std::string NarrowAscii(const wchar_t* w) {
     return s;
 }
 
-static std::vector<EndpointMuteEntry> MuteTargetEndpointsInner(DWORD pid) {
+// 端点 ID 大小写不敏感比较（GetId 与设备列表 key 的大小写不保证一致）
+static bool EndpointIdEqual(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca = (char)(ca - 'A' + 'a');
+        if (cb >= 'A' && cb <= 'Z') cb = (char)(cb - 'A' + 'a');
+        if (ca != cb) return false;
+    }
+    return true;
+}
+
+static std::vector<EndpointMuteEntry> MuteTargetEndpointsInner(DWORD pid, const std::string& skipId,
+                                                               std::vector<std::string>* skipped) {
     std::vector<EndpointMuteEntry> out;
     std::vector<std::string> mutedIds;   // 本次新增静音的端点 ID（写崩溃自愈标志）
     if (!pid) return out;
@@ -677,6 +690,21 @@ static std::vector<EndpointMuteEntry> MuteTargetEndpointsInner(DWORD pid) {
                 mgr->Release();
             }
             if (hasTarget) {
+                // 跳过桥自己的输出端点：WASAPI 共享模式下桥的输出必经该端点主音量，
+                // 静音它等于把桥自己也静音（ASIO / 独占输出不走端点主音量 → skipId 为空）
+                if (!skipId.empty()) {
+                    LPWSTR cid = nullptr;
+                    bool isSkip = false;
+                    if (SUCCEEDED(dev->GetId(&cid)) && cid) {
+                        std::string cidN = NarrowAscii(cid);
+                        CoTaskMemFree(cid);
+                        if (EndpointIdEqual(cidN, skipId)) {
+                            isSkip = true;
+                            if (skipped) skipped->push_back(cidN);
+                        }
+                    }
+                    if (isSkip) { dev->Release(); continue; }
+                }
                 IAudioEndpointVolume* ev = nullptr;
                 if (SUCCEEDED(dev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL,
                                             nullptr, (void**)&ev)) && ev) {
@@ -798,5 +826,130 @@ int RecoverOrphanMutes() {
 }
 
 std::vector<EndpointMuteEntry> MuteTargetEndpoints(DWORD pid) {
-    return RunComOnMta([pid] { return MuteTargetEndpointsInner(pid); });
+    return RunComOnMta([pid] { return MuteTargetEndpointsInner(pid, std::string(), nullptr); });
+}
+
+std::vector<EndpointMuteEntry> MuteTargetEndpointsSkipping(DWORD pid,
+                                                           const std::string& skipEndpointId,
+                                                           std::vector<std::string>* skipped) {
+    return RunComOnMta([pid, skipEndpointId, skipped] {
+        return MuteTargetEndpointsInner(pid, skipEndpointId, skipped);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// 会话级静音（WASAPI 共享输出场景）—— 见头文件中的设计说明。
+// ---------------------------------------------------------------------------
+
+// 进程树过滤器：收集父链，判断会话 PID 是否为目标进程或其任意后代
+// （与 PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE 对齐）
+static std::function<bool(DWORD)> MakeProcessTreeFilter(DWORD pid) {
+    std::unordered_map<DWORD, DWORD> parents;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe;
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(snap, &pe)) {
+            do { parents[pe.th32ProcessID] = pe.th32ParentProcessID; }
+            while (Process32NextW(snap, &pe));
+        }
+        CloseHandle(snap);
+    }
+    return [parents, pid](DWORD p) {
+        if (p == pid) return true;
+        DWORD cur = p;
+        for (int hop = 0; hop < 64; ++hop) {
+            auto it = parents.find(cur);
+            if (it == parents.end() || it->second == 0) return false;
+            cur = it->second;
+            if (cur == pid) return true;
+        }
+        return false;
+    };
+}
+
+static std::vector<SessionMuteEntry> MuteTargetSessionsInner(DWORD pid) {
+    std::vector<SessionMuteEntry> out;
+    if (!pid) return out;
+    auto inTree = MakeProcessTreeFilter(pid);
+
+    IMMDeviceEnumerator* en = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                __uuidof(IMMDeviceEnumerator), (void**)&en))) return out;
+    IMMDeviceCollection* coll = nullptr;
+    if (SUCCEEDED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &coll)) && coll) {
+        UINT count = 0;
+        coll->GetCount(&count);
+        for (UINT i = 0; i < count; ++i) {
+            IMMDevice* dev = nullptr;
+            if (FAILED(coll->Item(i, &dev))) continue;
+            IAudioSessionManager2* mgr = nullptr;
+            if (SUCCEEDED(dev->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL,
+                                        nullptr, (void**)&mgr)) && mgr) {
+                IAudioSessionEnumerator* se = nullptr;
+                if (SUCCEEDED(mgr->GetSessionEnumerator(&se)) && se) {
+                    int n = 0;
+                    se->GetCount(&n);
+                    for (int j = 0; j < n; ++j) {
+                        IAudioSessionControl* sc = nullptr;
+                        if (FAILED(se->GetSession(j, &sc))) continue;
+                        IAudioSessionControl2* sc2 = nullptr;
+                        DWORD spid = 0;
+                        if (SUCCEEDED(sc->QueryInterface(__uuidof(IAudioSessionControl2),
+                                                         (void**)&sc2)) && sc2) {
+                            sc2->GetProcessId(&spid);
+                            sc2->Release();
+                        }
+                        if (spid && inTree(spid)) {
+                            ISimpleAudioVolume* sv = nullptr;
+                            if (SUCCEEDED(sc->QueryInterface(__uuidof(ISimpleAudioVolume),
+                                                             (void**)&sv)) && sv) {
+                                BOOL prev = FALSE;
+                                sv->GetMute(&prev);
+                                if (prev) {
+                                    sv->Release();   // 本来已静音，无需记录恢复责任
+                                } else if (SUCCEEDED(sv->SetMute(TRUE, nullptr))) {
+                                    out.push_back({sv, FALSE});
+                                } else {
+                                    sv->Release();
+                                }
+                            }
+                        }
+                        sc->Release();
+                    }
+                    se->Release();
+                }
+                mgr->Release();
+            }
+            dev->Release();
+        }
+        coll->Release();
+    }
+    en->Release();
+    // 会话是进程生命周期内的临时对象：进程退出即销毁，故不写 mute_flag
+    // （不存在「残留静音卡死系统音量」的风险，这也是相对端点静音的优势）。
+    return out;
+}
+
+std::vector<SessionMuteEntry> MuteTargetSessions(DWORD pid) {
+    return RunComOnMta([pid] { return MuteTargetSessionsInner(pid); });
+}
+
+void RestoreSessionMutes(std::vector<SessionMuteEntry>& entries) {
+    if (entries.empty()) return;
+    RunComOnMta([&] {
+        for (auto& e : entries) {
+            if (e.sv) {
+                e.sv->SetMute(e.prevMute, nullptr);
+                e.sv->Release();
+                e.sv = nullptr;
+            }
+        }
+        return true;
+    });
+    // 兜底：RunComOnMta 未执行 lambda 时释放残留指针，避免整批泄漏
+    for (auto& e : entries) {
+        if (e.sv) { e.sv->Release(); e.sv = nullptr; }
+    }
+    entries.clear();
 }

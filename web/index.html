@@ -260,6 +260,18 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
   </div>
 </div>
 
+<div id="dualbar" style="display:none;margin:14px 0 8px;padding:10px 14px;background:linear-gradient(180deg,#3a2e16,#241c0d);
+  border:1px solid #a2812f;border-radius:6px;font-size:12px;color:#ffd27f;align-items:flex-start;gap:10px;flex-wrap:wrap">
+  <span style="font-weight:600;white-space:nowrap">⚠ 双重声风险</span>
+  <span style="flex:1;min-width:260px;line-height:1.7">
+    源应用与桥的输出在<b>同一个音频端点</b>上，所以你会同时听到「原声 + 桥渲染的副本」＝回音。
+    该端点的主音量不能静音（桥自己的输出也走它，静了桥会一起哑），因此这条路径上的原声无法自动消除。<br>
+    <b style="color:#ffe6b0">解法：</b>把<b>源应用</b>的输出设备改到「别的」端点——播放器自带设置里选，
+    或 Windows 设置 → 系统 → 声音 → 音量合成器 → 逐个应用选输出设备。桥保持输出到当前设备即可：
+    源所在的端点会被自动静音，于是只剩桥渲染的声音，且系统音量照常可调。
+  </span>
+</div>
+
 <div id="updbar" style="display:none;margin:14px 0 8px;padding:9px 14px;background:linear-gradient(180deg,#262a2f,#171a1e);
   border:1px solid #565c64;border-radius:6px;font-size:12px;color:#aab2bc;align-items:center;gap:10px;flex-wrap:wrap">
   <span id="updmsg">检查更新</span>
@@ -468,6 +480,12 @@ async function pollStatus(){
       document.getElementById('updcheck').style.display=s.updateChecking?'none':'inline-block';
       document.getElementById('updgo').style.display=s.updateAvailable?'inline-block':'none';
       ub.style.display='flex';
+    }
+    // ===== 双重声风险告示：源应用与桥输出在同一端点时，原声无法自动消除 =====
+    var dub=document.getElementById('dualbar');
+    if(dub){
+      var want=(s.bridgeOn&&s.dualRisk)?'flex':'none';
+      if(dub.style.display!==want) dub.style.display=want;
     }
   }catch(e){}
 }

@@ -793,7 +793,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
         unsigned long long target = (unsigned long long)wmMult * (unsigned long long)buf * 2ull;
         std::string selKey;   // 选中设备键（与 devices 同锁读取，避免读撕裂）
         { std::lock_guard<std::mutex> lk(*g_p.devicesMutex); selKey = *g_p.selectedKey; }
-        char body[1024];
+        char body[1536];
         int len = snprintf(body, sizeof(body),
             "{\"watermark\":%llu,\"target\":%llu,\"floor\":%llu,\"wmult\":%llu,"
             "\"underruns\":%llu,\"dropped\":%llu,\"peak\":%.3f,\"drift\":%.2f,"
@@ -808,6 +808,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             "\"thicknessOn\":%d,\"thicknessDelay\":%.1f,\"thicknessWidth\":%d,"
             "\"boosterOn\":%d,\"boosterDb\":%.1f,"
             "\"bridgeOn\":%d,"
+            "\"dualRisk\":%d,"
             "\"selectedKey\":\"%s\","
             "\"targetPid\":%u,\"targetActive\":%d,"
             "\"appVer\":\"%s\",\"updateAvailable\":%d,\"updateChecking\":%d,"
@@ -834,6 +835,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             g_p.boosterOn->load(std::memory_order_relaxed) ? 1 : 0,
             (double)g_p.boosterDb->load(std::memory_order_relaxed),
             g_p.bridgeOn->load(std::memory_order_relaxed) ? 1 : 0,
+            g_p.dualRisk ? g_p.dualRisk->load(std::memory_order_relaxed) : 0,
             selKey.c_str(),
             (unsigned)g_p.targetPid->load(std::memory_order_relaxed),
             g_p.targetActive->load(std::memory_order_relaxed) ? 1 : 0,

@@ -190,14 +190,31 @@ void WasapiOutput::threadLoop() {
 
     UINT32 bufFrames = 0;
     if (FAILED(client_->GetBufferSize(&bufFrames)) || bufFrames == 0) { initErr_ = "GetBufferSize 失败"; goto fail; }
+    deviceBufFrames_ = bufFrames;
+    // 共享模式：块大小取「引擎周期帧数」，而非端点缓冲总量。
+    // 实测(Bose Revolve+ USB)：端点缓冲总量 1056 帧，但引擎每 10ms 事件只释放
+    // 480 帧（一个周期）→ 若按缓冲总量请求，2 秒内 200 次事件仅 67 次成功、
+    // 133 次返回 AUDCLNT_E_BUFFER_TOO_LARGE(0x88890006)，实际写入仅 ~35k 帧/秒，
+    // 远低于设备 48k 需求 → 设备缓冲周期性耗尽（断续/咔哒），同时环水位只增不减、
+    // 周期性触发快排丢弃（第二重跳变）。改用周期帧数后：100 Hz × 480 = 48000 帧/秒，
+    // 与设备消费严格匹配，水位回到目标附近、快排不再触发。
+    UINT32 blockFrames = bufFrames;
+    REFERENCE_TIME dp2 = 0, mp2 = 0;
+    if (shared_ && SUCCEEDED(client_->GetDevicePeriod(&dp2, &mp2)) && dp2 > 0) {
+        UINT32 pf = (UINT32)((double)dp2 * (double)fmt_.nSamplesPerSec / 10000000.0);
+        if (pf > 0 && pf <= bufFrames) blockFrames = pf;
+    }
     hr = client_->GetService(__uuidof(IAudioRenderClient), (void**)&render_);
     if (FAILED(hr) || !render_) { initErr_ = "GetService(IAudioRenderClient) 失败"; goto fail; }
     if (FAILED(client_->SetEventHandle(event_))) { initErr_ = "SetEventHandle 失败"; goto fail; }
 
     // 3) 填充 info
     info_.sampleRate = (double)fmt_.nSamplesPerSec;
-    info_.bufferSize = (long)bufFrames;
+    info_.bufferSize = (long)blockFrames;
     info_.sampleType = fmt_.wFormatTag;
+    printf("[设备] WASAPI %s：端点缓冲 %u 帧，每次写入 %u 帧（引擎周期 %u 帧）\n",
+           shared_ ? "共享" : "独占", (unsigned)bufFrames, (unsigned)blockFrames,
+           (dp2 > 0) ? (unsigned)((double)dp2 * (double)fmt_.nSamplesPerSec / 10000000.0) : 0);
     {
         long long lat = 0;
         if (SUCCEEDED(client_->GetStreamLatency(&lat)))
@@ -226,34 +243,72 @@ fail:
 // 渲染循环：事件驱动拉取 → 写设备缓冲。本函数只用 POD 局部 + 成员访问，
 // 以便容纳 __try/__except(设备掉线 AV 兜底)。
 void WasapiOutput::renderLoop() {
-    const UINT32 bufFrames = (UINT32)info_.bufferSize;
+    // 共享模式：每次事件只写「当前可用空间」（实测恰为一个引擎周期 480 帧）。
+    // deviceBufFrames_ 是端点缓冲总量，仅用于算可用空间；写入量固定用
+    // info_.bufferSize（= 引擎周期帧数），以保持 pull 块大小恒定 —— 桥的水位
+    // 目标 setpoint 按 frames 计算，块大小抖动会带偏水位目标。
+    const UINT32 blockFrames = (UINT32)info_.bufferSize;
+    const UINT32 totalFrames = deviceBufFrames_ ? deviceBufFrames_ : blockFrames;
     const uint16_t ch = (uint16_t)fmt_.nChannels;
+    // 诊断：正常应恒为 0，仅异常（空间不足 / TOO_LARGE）时打印
+    uint64_t dgT0 = GetTickCount64();
+    uint64_t dgEv = 0, dgOk = 0, dgTooLarge = 0, dgFail = 0, dgShort = 0;
     __try {
         while (running_.load() && !failed_.load()) {
             DWORD r = WaitForSingleObject(event_, 500);
             if (r != WAIT_OBJECT_0) continue;
+            ++dgEv;
+            UINT32 n = blockFrames;
+            if (shared_) {
+                UINT32 pad = 0;
+                if (FAILED(client_->GetCurrentPadding(&pad))) continue;
+                UINT32 avail = (pad < totalFrames) ? (totalFrames - pad) : 0;
+                if (avail < n) {                 // 可用空间不足一个周期
+                    ++dgShort;
+                    if (avail == 0) continue;    // 完全没空间：本次不写，环内有水位兜底
+                    n = avail;
+                }
+            }
             BYTE* data = nullptr;
-            HRESULT hr = render_->GetBuffer(bufFrames, &data);
+            HRESULT hr = render_->GetBuffer(n, &data);
             if (hr == AUDCLNT_E_DEVICE_INVALIDATED || hr == AUDCLNT_E_SERVICE_NOT_RUNNING) {
                 failed_.store(true);
                 break;
             }
+            if (FAILED(hr) || !data) {
+                if (hr == AUDCLNT_E_BUFFER_TOO_LARGE) ++dgTooLarge; else ++dgFail;
+            } else {
+                ++dgOk;
+            }
+            {
+                uint64_t dgNow = GetTickCount64();
+                if (dgNow - dgT0 >= 2000) {
+                    if (dgTooLarge || dgFail || dgShort)
+                        printf("[WASAPI] 异常统计(2s): 事件=%llu 成功=%llu TOO_LARGE=%llu 失败=%llu 空间不足=%llu"
+                               " (块=%u 缓冲=%u)\n",
+                               (unsigned long long)dgEv, (unsigned long long)dgOk,
+                               (unsigned long long)dgTooLarge, (unsigned long long)dgFail,
+                               (unsigned long long)dgShort,
+                               (unsigned)blockFrames, (unsigned)totalFrames);
+                    dgT0 = dgNow; dgEv = dgOk = dgTooLarge = dgFail = dgShort = 0;
+                }
+            }
             if (FAILED(hr) || !data) continue;
             if (isFloat_) {
                 // float32：直接拉取进设备缓冲
-                size_t got = pull_ ? pull_((float*)data, bufFrames, ch) : 0;
-                if (got < bufFrames) {
+                size_t got = pull_ ? pull_((float*)data, n, ch) : 0;
+                if (got < n) {
                     float* fp = (float*)data;
-                    for (size_t i = (size_t)got * ch; i < (size_t)bufFrames * ch; ++i) fp[i] = 0.0f;
+                    for (size_t i = (size_t)got * ch; i < (size_t)n * ch; ++i) fp[i] = 0.0f;
                 }
             } else {
-                size_t got = pull_ ? pull_(scratch_.data(), bufFrames, ch) : 0;
-                if (got < bufFrames) {
-                    for (size_t i = (size_t)got * ch; i < (size_t)bufFrames * ch; ++i) scratch_[i] = 0.0f;
+                size_t got = pull_ ? pull_(scratch_.data(), n, ch) : 0;
+                if (got < n) {
+                    for (size_t i = (size_t)got * ch; i < (size_t)n * ch; ++i) scratch_[i] = 0.0f;
                 }
-                convertAndWrite(data, scratch_.data(), bufFrames);
+                convertAndWrite(data, scratch_.data(), n);
             }
-            render_->ReleaseBuffer(bufFrames, 0);
+            render_->ReleaseBuffer(n, 0);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         failed_.store(true);
