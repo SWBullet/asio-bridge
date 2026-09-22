@@ -792,8 +792,13 @@ static void handleRequest(SOCKET s, char* req, int n) {
         long buf = g_p.asioBuffer->load(std::memory_order_relaxed);
         unsigned long long target = (unsigned long long)wmMult * (unsigned long long)buf * 2ull;
         std::string selKey;   // 选中设备键（与 devices 同锁读取，避免读撕裂）
-        { std::lock_guard<std::mutex> lk(*g_p.devicesMutex); selKey = *g_p.selectedKey; }
-        char body[1536];
+        std::string capKey;   // 采集源键（空=进程回环）
+        {
+            std::lock_guard<std::mutex> lk(*g_p.devicesMutex);
+            selKey = *g_p.selectedKey;
+            capKey = *g_p.captureKey;
+        }
+        char body[2048];
         int len = snprintf(body, sizeof(body),
             "{\"watermark\":%llu,\"target\":%llu,\"floor\":%llu,\"wmult\":%llu,"
             "\"underruns\":%llu,\"dropped\":%llu,\"peak\":%.3f,\"drift\":%.2f,"
@@ -810,6 +815,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             "\"bridgeOn\":%d,"
             "\"dualRisk\":%d,"
             "\"selectedKey\":\"%s\","
+            "\"captureKey\":\"%s\",\"captureMode\":%d,\"volMapOn\":%d,\"capIdle\":%d,"
             "\"targetPid\":%u,\"targetActive\":%d,"
             "\"appVer\":\"%s\",\"updateAvailable\":%d,\"updateChecking\":%d,"
             "\"updateDownloading\":%d,\"updateError\":%d,\"updateMsg\":\"%s\",\"updateVer\":\"%s\"}",
@@ -837,6 +843,10 @@ static void handleRequest(SOCKET s, char* req, int n) {
             g_p.bridgeOn->load(std::memory_order_relaxed) ? 1 : 0,
             g_p.dualRisk ? g_p.dualRisk->load(std::memory_order_relaxed) : 0,
             selKey.c_str(),
+            capKey.c_str(),
+            g_p.capMode ? g_p.capMode->load(std::memory_order_relaxed) : 0,
+            g_p.volMapOn ? g_p.volMapOn->load(std::memory_order_relaxed) : 0,
+            g_p.capIdle ? g_p.capIdle->load(std::memory_order_relaxed) : 0,
             (unsigned)g_p.targetPid->load(std::memory_order_relaxed),
             g_p.targetActive->load(std::memory_order_relaxed) ? 1 : 0,
             kAppVersion,
@@ -856,6 +866,7 @@ static void handleRequest(SOCKET s, char* req, int n) {
             sendResponse(s, "403 Forbidden", "application/json", denied, (int)strlen(denied));
             return;
         }
+        bool badReq = false;
         char* body = strstr(req, "\r\n\r\n");
         if (body) {
             body += 4;
@@ -919,6 +930,26 @@ static void handleRequest(SOCKET s, char* req, int n) {
                     }
                     g_p.needRestart->store(true);
                 }
+            } else if (strstr(body, "action=capture")) {
+                // 采集源选择（端点回环）：value=采集源端点稳定键；"-1"/空=进程回环。
+                // 切换后需重建链路（主循环下一轮按新采集源重新打开采集）。
+                char* vpc = strstr(body, "value=");
+                if (vpc) {
+                    vpc += 6;
+                    char* amp = strchr(vpc, '&');
+                    std::string ckey = amp ? std::string(vpc, amp - vpc) : std::string(vpc);
+                    {
+                        std::lock_guard<std::mutex> lk(*g_p.devicesMutex);
+                        if (ckey == "-1") ckey.clear();
+                        // 采集源不得等于输出端点：否则桥采到自己的输出 = 自激无限回环
+                        if (!ckey.empty() && ckey == *g_p.selectedKey) {
+                            badReq = true;
+                        } else {
+                            *g_p.captureKey = ckey;
+                        }
+                    }
+                    if (!badReq) g_p.needRestart->store(true);
+                }
             } else if (strstr(body, "action=devscan")) {
                 std::string scanErr;
                 auto devs = ScanOutputDevices(scanErr);
@@ -934,7 +965,9 @@ static void handleRequest(SOCKET s, char* req, int n) {
                 requestUpdateDownload(g_p.update);
             }
         }
-        const char* okBody = "{\"ok\":true}";
+        const char* okBody = badReq
+            ? "{\"ok\":false,\"error\":\"采集源不能与输出设备是同一个端点（会自激回环）\"}"
+            : "{\"ok\":true}";
         sendResponse(s, "200 OK", "application/json", okBody, (int)strlen(okBody));
     } else if (strncmp(path, "/api/history", 12) == 0) {
         int rng = 600;
@@ -993,14 +1026,18 @@ static void handleRequest(SOCKET s, char* req, int n) {
                 const DeviceEntry& d = (*g_p.devices)[i];
                 char tmp[640];
                 snprintf(tmp, sizeof(tmp),
-                         "%s{\"name\":\"%s\",\"key\":\"%s\",\"asio\":%d,\"driver\":\"%s\",\"state\":%u,\"isDefault\":%d}",
+                         // ep=1 表示该条目带 WASAPI 渲染端点 ID —— 只有这类条目能做
+                         // 端点回环采集源（控制台「采集源」下拉据此过滤）
+                         "%s{\"name\":\"%s\",\"key\":\"%s\",\"asio\":%d,\"driver\":\"%s\","
+                         "\"state\":%u,\"isDefault\":%d,\"ep\":%d}",
                          first ? "" : ",",
                          ws2json(d.name).c_str(),
                          d.key.c_str(),
                          d.asio ? 1 : 0,
                          d.asioDriver.c_str(),
                          (unsigned)d.state,
-                         d.isDefault ? 1 : 0);
+                         d.isDefault ? 1 : 0,
+                         d.id.empty() ? 0 : 1);
                 body += tmp;
                 first = false;
             }

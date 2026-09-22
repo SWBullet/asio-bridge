@@ -201,6 +201,10 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
     <button class="btn" id="devscan">刷新</button>
   </div>
   <div class="ctlrow">
+    <span class="lbl">采集源</span>
+    <select id="bank-capture" style="background:#1e2226;color:#d8dde3;border:1px solid #565c64;border-radius:5px;padding:6px 8px;font-size:12px;min-width:290px;font-family:inherit"></select>
+  </div>
+  <div class="ctlrow">
     <span class="lbl">水位下限</span>
     <span id="bank-floor">
       <button class="btn" data-v="4">4×</button><button class="btn" data-v="6">6×</button>
@@ -269,6 +273,22 @@ body{background:radial-gradient(ellipse at 50% -10%,#23272e 0%,#13161b 55%,#0b0d
     <b style="color:#ffe6b0">解法：</b>把<b>源应用</b>的输出设备改到「别的」端点——播放器自带设置里选，
     或 Windows 设置 → 系统 → 声音 → 音量合成器 → 逐个应用选输出设备。桥保持输出到当前设备即可：
     源所在的端点会被自动静音，于是只剩桥渲染的声音，且系统音量照常可调。
+  </span>
+</div>
+
+<div id="capbar" style="display:none;margin:14px 0 8px;padding:10px 14px;background:linear-gradient(180deg,#162a33,#0d1a1f);
+  border:1px solid #2f7f96;border-radius:6px;font-size:12px;color:#9fdcea;align-items:flex-start;gap:10px;flex-wrap:wrap">
+  <span style="font-weight:600;white-space:nowrap">◎ 全系统过桥</span>
+  <span style="flex:1;min-width:260px;line-height:1.7">
+    采集源 = <b id="capname">—</b>（端点回环）：桥直接采这个<b>端点</b>混音后的全部声音，不限应用。<br>
+    <b style="color:#cdeffa">用法：</b>把 <b>系统默认输出</b>选成这个端点（设置 → 系统 → 声音 → 输出，
+    或音量合成器里逐个应用选），全系统音频就会经桥渲染到上面的输出设备——不需要逐个应用改设置。<br>
+    音量：任务栏滑块与静音键控制的就是这个端点，已实时映射到输出设备
+    <span id="volmap">（映射：—）</span>。<br>
+    <span id="capidle" style="display:none;color:#ffb84a">⚠ 当前没有任何音频进入桥 ——
+      请确认「系统默认输出」已设为上面的采集源端点（设置 → 系统 → 声音 → 输出）。</span><br>
+    <b style="color:#ffe6b0">注意：</b>该端点必须<b>不会发出物理声音</b>（未接扬声器的板载输出 / 虚拟声卡），
+    否则它的出声会与桥的输出叠成双重声；也不能选成桥的输出设备本身（会自激回环）。
   </span>
 </div>
 
@@ -455,6 +475,7 @@ async function pollStatus(){
       setBank('bank-src',String(s.srcTaps||0));
       setBank('bank-width',String(s.thicknessWidth||0));
       document.getElementById('bank-device').value=(s.selectedKey && s.selectedKey!=='-1')?s.selectedKey:'-1';
+      document.getElementById('bank-capture').value=(s.captureKey && s.captureKey!=='-1')?s.captureKey:'-1';
     }
     // ===== 在线升级（底部状态条）=====
     var ub=document.getElementById('updbar');
@@ -486,6 +507,17 @@ async function pollStatus(){
     if(dub){
       var want=(s.bridgeOn&&s.dualRisk)?'flex':'none';
       if(dub.style.display!==want) dub.style.display=want;
+    }
+    // ===== 全系统过桥告示（端点回环实际生效时）=====
+    var cb=document.getElementById('capbar');
+    if(cb){
+      var want2=(s.bridgeOn&&s.captureMode)?'flex':'none';
+      if(cb.style.display!==want2) cb.style.display=want2;
+      var vm=document.getElementById('volmap');
+      if(vm) vm.textContent='（映射：'+(s.volMapOn?'已启用，滑块/静音键生效':'未启用')+'）';
+      var ci=document.getElementById('capidle');
+      if(ci) ci.style.display=s.capIdle?'inline':'none';
+      refreshCapName();
     }
   }catch(e){}
 }
@@ -529,6 +561,9 @@ function loadDevices(){
       var cur=sel.value;
       sel.innerHTML='<option value="-1">请选择输出设备（未选择）</option>';
       var devs=s.devices||[];
+      var cap=document.getElementById('bank-capture');
+      var capCur=cap.value;
+      cap.innerHTML='<option value="-1">进程回环（跟随播放器，默认）</option>';
       for(var i=0;i<devs.length;i++){
         var opt=document.createElement('option');
         opt.value=devs[i].key;
@@ -537,12 +572,37 @@ function loadDevices(){
         var def=devs[i].isDefault?' ★默认':'';
         opt.textContent=devs[i].name+' ['+tag+']'+st+def;
         sel.appendChild(opt);
+        // 采集源候选：仅 WASAPI 渲染端点（ASIO 驱动无端点 ID，无法做回环采集）；
+        // 与输出设备相同的端点会自激回环，标出并禁用
+        if(devs[i].ep){
+          var copt=document.createElement('option');
+          copt.value=devs[i].key;
+          var isOut=(devs[i].key===cur);
+          copt.textContent=devs[i].name+st+def+(isOut?'（= 输出设备，不可选）':'');
+          if(isOut) copt.disabled=true;
+          cap.appendChild(copt);
+        }
       }
       if(cur)sel.value=cur;
+      if(capCur)cap.value=capCur;
+      refreshCapName();
     });
   }catch(e){}
 }
+function refreshCapName(){
+  var el=document.getElementById('capname');
+  if(!el)return;
+  var cap=document.getElementById('bank-capture');
+  var v=cap.value;
+  if(!v||v==='-1'){ el.textContent='未选择（进程回环）'; return; }
+  var txt=v;
+  for(var i=0;i<cap.options.length;i++){
+    if(cap.options[i].value===v){ txt=cap.options[i].textContent; break; }
+  }
+  el.textContent=txt;
+}
 document.getElementById('bank-device').onchange=function(){ctl('action=device&value='+this.value)}
+document.getElementById('bank-capture').onchange=function(){ctl('action=capture&value='+this.value);refreshCapName();setTimeout(loadDevices,800)}
 document.getElementById('devscan').onclick=function(){ctl('action=devscan&value=1');setTimeout(loadDevices,600)}
 loadDevices();
 // 设备热插拔自动刷新：每 3 秒轮询设备列表（服务端在设备事件时已自动重扫，

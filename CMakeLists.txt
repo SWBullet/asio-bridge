@@ -15,6 +15,8 @@ set(ASIO_SDK ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ASIOSDK2.3)
 add_executable(asio_bridge
   src/main.cpp
   src/wasapi_process_capture.cpp
+  src/wasapi_endpoint_capture.cpp
+  src/volume_map.cpp
   src/asio_render.cpp
   src/wasapi_output.cpp
   src/device_scan.cpp

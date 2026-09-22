@@ -57,11 +57,19 @@ struct BridgeStatsPtrs {
     std::vector<DeviceEntry>* devices;     // 输出设备列表(控制台展示)
     std::mutex* devicesMutex;              // 保护 devices 与 selectedKey（同一把锁）
     std::string* selectedKey;              // 选中的设备稳定键(空=未选择)，与 devicesMutex 同锁
+    // 采集源端点稳定键（空=进程回环跟随播放器；非空=端点回环全系统过桥），同 devicesMutex
+    std::string* captureKey;
     UpdateState* update;                   // 在线升级状态（可空=未启用）
     // 双重声风险：1 = 源应用与桥的输出在同一个 WASAPI 端点，该端点主音量不能静音
     // （静了桥自己也哑），故这条路径上的原声无法消除，用户会听到回音。控制台据此
     // 显示告示并给出解法（把源应用输出改到别的端点，桥仍输出到当前设备）。
     std::atomic<int>* dualRisk;
+    // 实际生效的采集模式：0=进程回环（跟随播放器），1=端点回环（全系统过桥）
+    std::atomic<int>* capMode;
+    // 音量映射是否启用：1=系统音量（默认设备=采集源端点）已映射到桥输出端点
+    std::atomic<int>* volMapOn;
+    // 端点回环下采集源是否长时间无音频（1=空转：多半是系统默认输出没指向采集源）
+    std::atomic<int>* capIdle;
 };
 
 constexpr size_t kHistCap = 3600;   // 2 秒一采样 × 3600 = 2 小时

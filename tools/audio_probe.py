@@ -12,7 +12,11 @@
   python audio_probe.py --watch 60             轮询 60 秒，报告端点增删与静音态变化
   python audio_probe.py --unmute <id 子串>     解除该端点静音（"ALL" = 全部）
   python audio_probe.py --mute   <id 子串>     置该端点静音（"ALL" = 全部）
+  python audio_probe.py --volume <id 子串> <0..100>
+                                               设置该端点主音量（"ALL" = 全部）
     写操作用于急救：桥被强杀后端点静音残留、或需要把被静默掉的系统音量救回来。
+    --volume 另可用于验证「音量映射」：全系统过桥时改采集源端点音量，
+    应能在 120ms 内实时反映到桥的输出端点音量。
 
 输出可直接与桥 /api/devices 的 key 对照得到设备名。
 """
@@ -143,6 +147,13 @@ def force_mute(vol, dev_id, entry, value):
     return hr == S_OK
 
 
+def set_volume(vol, dev_id, entry, level):
+    """IAudioEndpointVolume::SetMasterVolumeLevelScalar（vtable 7）。"""
+    hr = method(vol, 7, HRESULT, c_float, c_void_p)(vol, c_float(level), None)
+    print("    -> SetMasterVolumeLevelScalar(%.3f) hr=0x%08X" % (level, hr & 0xFFFFFFFF))
+    return hr == S_OK
+
+
 def main():
     watch = 0
     if "--watch" in sys.argv:
@@ -160,8 +171,36 @@ def main():
             j = sys.argv.index(flag) + 1
             target = sys.argv[j] if j < len(sys.argv) else "ALL"
 
+    # 音量写操作：--volume <id 子串> <0..100>。
+    # 用途：验证「音量映射」（全系统过桥时，改采集源端点音量应实时反映到输出端点），
+    # 以及把端点音量设成指定值。
+    vol_write = None
+    vol_target = None
+    if "--volume" in sys.argv:
+        j = sys.argv.index("--volume")
+        vol_target = sys.argv[j + 1] if j + 1 < len(sys.argv) else "ALL"
+        vol_write = float(sys.argv[j + 2]) if j + 2 < len(sys.argv) else 50.0
+
     ole32.CoInitializeEx(None, 0)   # STA
     try:
+        if vol_write is not None:
+            hits = []
+            lvl = max(0.0, min(1.0, vol_write / 100.0))
+
+            def actv(vol, dev_id, entry):
+                if vol_target != "ALL" and vol_target not in dev_id:
+                    return
+                hits.append(dev_id)
+                print("[写] %s  当前 mute=%s vol=%s" % (dev_id, entry["mute"], entry["volume"]))
+                set_volume(vol, dev_id, entry, lvl)
+
+            enumerate_endpoints(action=actv)
+            print("=== 命中并已设音量 %d 个端点（%s -> %.3f）===" % (
+                len(hits), "全部" if vol_target == "ALL" else vol_target, lvl))
+            if not hits:
+                print("!! 没有任何端点匹配 %r —— 检查子串是否写对" % vol_target)
+            return
+
         if write_action is not None:
             hits = []
 

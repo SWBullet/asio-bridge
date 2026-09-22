@@ -11,6 +11,8 @@
 #include "resampler.h"
 #include "ring_buffer.h"
 #include "wasapi_process_capture.h"
+#include "wasapi_endpoint_capture.h"
+#include "volume_map.h"
 #include "util.h"
 #include "update_check.h"
 #include "web_console.h"
@@ -1433,8 +1435,18 @@ int wmain(int argc, wchar_t** argv) {
     std::mutex g_devMutex;
     std::vector<DeviceEntry> g_devices;
     std::string g_selectedKey;   // 选中设备的稳定键(空=未选择)；与 g_devMutex 同锁，避免列表刷新后索引漂移
+    // 采集源端点稳定键（空=进程回环，跟随播放器；非空=端点回环，全系统过桥）。
+    // 与 g_devMutex 同锁，理由同 g_selectedKey。
+    std::string g_captureKey;
     // 双重声风险标志（1=源与桥输出同端点，原声无法消除；控制台据此告示）
     std::atomic<int> g_dualRisk{0};
+    // 实际生效的采集模式（0=进程回环 1=端点回环）与音量映射状态（0=未启用 1=启用）
+    std::atomic<int> g_capMode{0};
+    std::atomic<int> g_volMapOn{0};
+    // 端点回环下「采集源无音频」标志：系统默认输出没有指向采集源端点时，
+    // 该端点收不到任何音频、采集端不产生数据包，桥静默空转（用户看到「没声音」
+    // 却查不出原因）。控制台据此给出明确告示。
+    std::atomic<int> g_capIdle{0};
     int selMissingStreak = 0;    // 选中设备连续缺席次数（容忍 USB 声卡瞬时缺席，见重扫处）
     // 在线升级（可选：cfg update_url 指定更新源；空=内置 GitHub Releases）
     UpdateState updateState;
@@ -1497,8 +1509,9 @@ int wmain(int argc, wchar_t** argv) {
         &specIn, &specRes, &specSeq,
         &targetPid, &targetActive,
         &g_devices, &g_devMutex, &g_selectedKey,
+        &g_captureKey,
         &updateState,
-        &g_dualRisk
+        &g_dualRisk, &g_capMode, &g_volMapOn, &g_capIdle
     };
     // 装配升级状态锁：Web 线程启动第一毫秒就可能读 update 状态（UI 轮询
     // /api/status 会 lock(*update->mutex)），锁必须先于 startWebConsole 就位，
@@ -1547,9 +1560,11 @@ int wmain(int argc, wchar_t** argv) {
         if (!updateUrl.empty())
             fprintf(f, "update_url=%s\n", updateUrl.c_str());   // 保留在线升级更新源配置
         fprintf(f, "bridge_on=%d\n", bridgeOn.load(std::memory_order_relaxed) ? 1 : 0);  // 桥开关状态（首次运行默认待机）
-        {   // 选中设备稳定键：空=未选择；与设备列表同锁，避免读撕裂
+        {   // 选中设备稳定键 / 采集源：与设备列表同锁，避免读撕裂
             std::lock_guard<std::mutex> lk(g_devMutex);
             fprintf(f, "selected_device_id=%s\n", g_selectedKey.c_str());  // 手动选定的输出设备键(持久化，列表刷新不漂移)
+            // 采集源端点键（空=进程回环跟随播放器；非空=端点回环，全系统过桥）
+            fprintf(f, "capture_device_id=%s\n", g_captureKey.c_str());
         }
         fclose(f);
     };
@@ -1610,6 +1625,13 @@ int wmain(int argc, wchar_t** argv) {
                     {
                         std::lock_guard<std::mutex> lk(g_devMutex);
                         g_selectedKey = val;
+                    }
+                }
+                else if (!strcmp(key, "capture_device_id")) {
+                    // 采集源端点稳定键：空=进程回环（默认）；非空=端点回环全系统过桥
+                    {
+                        std::lock_guard<std::mutex> lk(g_devMutex);
+                        g_captureKey = val;
                     }
                 }
                 else if (!strcmp(key, "selected_device")) {
@@ -1753,6 +1775,7 @@ int wmain(int argc, wchar_t** argv) {
             asioType.store(0, std::memory_order_relaxed);
             wmNow.store(0, std::memory_order_relaxed);
             targetActive.store(false, std::memory_order_relaxed);
+            g_capIdle.store(0, std::memory_order_relaxed);
             static int offStreak = 0;
             if ((offStreak++ % 25) == 0)
                 printf(restoredThisPass > 0
@@ -1820,6 +1843,63 @@ int wmain(int argc, wchar_t** argv) {
                 }
             };
         bool capOk = false;
+        WasapiEndpointCapture ecap;   // 端点回环（会话作用域：每次重建重新打开）
+        // ===== 采集侧一：端点回环（全系统过桥）=====
+        // 语义：用户在控制台选定一个「采集源端点」，通常是一个哑端点（无物理扬声器
+        // 的板载输出 / 虚拟声卡）。把系统默认输出指向它，全系统音频即经桥渲染到
+        // 真实输出设备 —— 不需要逐个应用改输出设备。
+        // 两条硬约束在这里校验：
+        //   1) 采集源不得等于桥的输出端点，否则桥采到自己的输出 = 自激无限回环；
+        //   2) 采集源必须是 WASAPI 渲染端点（ASIO 驱动无端点 ID，不能做回环）。
+        // 任一不满足即回退进程回环，不影响桥继续工作。
+        std::wstring capDevId;
+        {
+            std::string capKey;
+            {
+                std::lock_guard<std::mutex> lk(g_devMutex);
+                capKey = g_captureKey;
+                if (!capKey.empty()) {
+                    if (!g_selectedKey.empty() && capKey == g_selectedKey) {
+                        printf("[采集] 采集源与桥的输出是同一个端点——会形成自激回环"
+                               "（桥采到自己的输出），本会话回退为进程回环。"
+                               "请在控制台把采集源改成别的端点。\n");
+                    } else {
+                        for (const auto& d : g_devices) {
+                            if (d.key == capKey) {
+                                // 只要求带 WASAPI 渲染端点 ID —— 不能加 !d.asio：
+                                // Realtek 这类设备同时暴露 ASIO 驱动与 WASAPI 端点，
+                                // 扫描出的条目是 asio=1 且 id 非空，加 !d.asio 会把它误判
+                                // 为「不可采集」而回退进程回环。
+                                if (!d.id.empty()) capDevId = d.id;
+                                break;
+                            }
+                        }
+                        if (capDevId.empty())
+                            printf("[采集] 采集源端点不是可回环采集的渲染端点"
+                                   "（无端点 ID / 已被移除或禁用），本会话回退为进程回环\n");
+                    }
+                }
+            }
+        }
+        if (!capDevId.empty()) {
+            capOk = ecap.open(capDevId, onData, oerr);
+            if (capOk) {
+                g_capMode.store(1, std::memory_order_relaxed);
+                g_dualRisk.store(0, std::memory_order_relaxed);
+                targetPid.store(0, std::memory_order_relaxed);
+                uint16_t srcCh = ecap.format().channels ? ecap.format().channels : 2;
+                capCh = (uint16_t)std::min<uint16_t>(srcCh, 2);
+                printf("[采集] 端点回环（全系统过桥）：系统默认输出指向该端点后，"
+                       "所有应用的声音都会经桥输出到所选设备；采集源端点不做静音，"
+                       "其主音量用于音量映射（系统滑块/静音键照常生效）\n");
+            } else {
+                printf("[采集] 端点回环打开失败: %s（本会话回退为进程回环）\n", oerr.c_str());
+                oerr.clear();
+            }
+        }
+        if (!capOk) {
+        g_capMode.store(0, std::memory_order_relaxed);
+        // ===== 采集侧二：进程回环（跟随播放器）=====
         // Bridge 采集：优先沿用上次目标；失效/首次启动时自动发现正在播放的进程
         {
             DWORD pid = targetPid.load(std::memory_order_relaxed);
@@ -1912,6 +1992,7 @@ int wmain(int argc, wchar_t** argv) {
                 }
             }
         }
+        }   // end 进程回环（if (!capOk)）
         if (!capOk) {
             // 首次打开即失败：置 g_stop 再 break，否则 discoveryThread.join() 永久挂死
             if (first) { printf("采集打开失败: %s\n", oerr.c_str()); g_stop.store(true); break; }
@@ -1923,16 +2004,33 @@ int wmain(int argc, wchar_t** argv) {
         first = false;
         sessionActive.store(true, std::memory_order_release);
 
-        uint32_t capSr = pcap.format().sampleRate;
-        uint16_t capBits = pcap.format().bitsPerSample;
-        bool capFloat = pcap.format().isFloat;
+        const bool epCapture = (g_capMode.load(std::memory_order_relaxed) == 1);
+        uint32_t capSr = epCapture ? ecap.format().sampleRate : pcap.format().sampleRate;
+        uint16_t capBits = epCapture ? ecap.format().bitsPerSample : pcap.format().bitsPerSample;
+        bool capFloat = epCapture ? ecap.format().isFloat : pcap.format().isFloat;
         capRate.store(capSr, std::memory_order_relaxed);
-        printf("[采集] %u Hz / %u 通道 / %u bit (%s)  模式: Bridge 进程回环\n",
-               capSr, capCh, capBits, capFloat ? "float32" : "PCM");
+        printf("[采集] %u Hz / %u 通道 / %u bit (%s)  模式: %s\n",
+               capSr, capCh, capBits, capFloat ? "float32" : "PCM",
+               epCapture ? "端点回环（全系统过桥）" : "进程回环（单进程）");
 
         // 预填充：~46ms（够 ASIO 启动初期即可；环形缓冲吸收两时钟漂移）
+        // 必须带超时：端点回环在「采集源端点当前没有音频」时不产生任何数据包，
+        // 无限等待会卡死在这里 —— 症状是会话看似已建立（capMode=1）但输出后端
+        // 迟迟不初始化、水位/写读计数全为 0。超时后照常启动输出链路（环空即输出
+        // 静音），有声音时 onData 触发重新 prime 自然接上。
         const size_t prefill = 2048;
-        while (rb.available() < prefill && !g_stop.load() && !needRestart.load()) Sleep(10);
+        {
+            ULONGLONG pfBegin = GetTickCount64();
+            while (rb.available() < prefill && !g_stop.load() && !needRestart.load()) {
+                if (GetTickCount64() - pfBegin > 500) {
+                    printf("[采集] 预填充等待 500ms 无数据（%s），先启动输出链路，"
+                           "有声音时自动开始渲染\n",
+                           epCapture ? "端点当前无音频" : "采集源当前无数据");
+                    break;
+                }
+                Sleep(10);
+            }
+        }
 
         // 自适应水位目标倍数（v2 预判式，声明于桥作用域；每次重建重置为下限）：
         //   硬触发：新欠载 → 立即 +4（上限 32 倍）
@@ -2182,16 +2280,19 @@ int wmain(int argc, wchar_t** argv) {
         // ===== 逐个尝试候选：创建 → setPullCallback → init，第一个成功即用 =====
         std::unique_ptr<AudioOutput> out;
         bool outAsio = false;
+        std::wstring usedOutId;   // 实际用上的 WASAPI 输出端点 ID（音量映射目标）
         {
             std::string lastErr;
             for (const auto& c : cands) {
                 if (c.asio) {
                     out = std::make_unique<AsioRender>(c.driver);
                     outAsio = true;
+                    usedOutId.clear();
                     printf("[设备] 尝试 ASIO: %s\n", c.driver.c_str());
                 } else {
                     out = std::make_unique<WasapiOutput>(c.id);
                     outAsio = false;
+                    usedOutId = c.id;
                     printf("[设备] 尝试 WASAPI 独占: %s\n", ws2s(c.name).c_str());
                 }
                 out->setDither(ditherOn.load(std::memory_order_relaxed));
@@ -2200,6 +2301,7 @@ int wmain(int argc, wchar_t** argv) {
                 if (out->init((double)capSr, e2, reqBuffer)) break;   // 成功
                 printf("     初始化失败: %s\n", e2.c_str());
                 out.reset();   // 失败候选释放，试下一个
+                usedOutId.clear();
                 lastErr = e2;
             }
             if (!out) {
@@ -2227,6 +2329,27 @@ int wmain(int argc, wchar_t** argv) {
         printf("== 桥接运行中: Bridge -> 输出后端 @ %g Hz (%s) ==\n",
                oi.sampleRate,
                "分数重采样");
+
+        // ===== 音量映射（端点回环专属）=====
+        // 全系统过桥拓扑下，任务栏音量滑块/静音键控制的是「系统默认设备」= 采集源
+        // 端点，而真正出声的是桥的输出端点 —— 不映射用户就完全控不到音量。
+        // 仅当输出是 WASAPI 端点时才有映射目标：ASIO 输出不经过端点主音量
+        // （音量在硬件旋钮/驱动面板上），无端点可写。
+        VolumeMapper vmap;
+        if (epCapture && !outAsio && !usedOutId.empty()) {
+            std::string vmerr;
+            if (vmap.open(capDevId, usedOutId, vmerr)) {
+                g_volMapOn.store(1, std::memory_order_relaxed);
+            } else {
+                g_volMapOn.store(0, std::memory_order_relaxed);
+                printf("[音量映射] 启用失败: %s（系统音量将无法控制输出设备音量）\n",
+                       vmerr.c_str());
+            }
+        } else {
+            g_volMapOn.store(0, std::memory_order_relaxed);
+            if (epCapture && outAsio)
+                printf("[音量映射] 输出为 ASIO（不经端点主音量），无映射目标，已跳过\n");
+        }
         const size_t neededPerBuf = (size_t)oi.bufferSize * capCh;
 
         // 主线程（ASIO 的 STA）绝不做阻塞式 COM 调用——实测会饿死 MADIface
@@ -2297,7 +2420,11 @@ int wmain(int argc, wchar_t** argv) {
                     lastConsumedW = c;
                     lastConsumedAt = now;
                 } else if (c != lastConsumedW) { lastConsumedW = c; lastConsumedAt = now; }
-                else if (now - lastConsumedAt > 4000 && written.load() > c) {
+                // 停滞判定必须要求「环里有待消费数据」：用 written > consumed 会把
+                // 「端点回环空转」（采集源端点当前无音频 → 环为空 → 消费不增长）
+                // 误判成驱动停滞，进而在 120 秒后反复强制重建。环里有数据却没人消费
+                // 才是真停滞。
+                else if (now - lastConsumedAt > 4000 && rb.available() > 0) {
                     if (now - lastConsumedAt > 120000) {
                         printf("[自适应] ASIO 停滞 120 秒未恢复，强制重建...\n");
                         needRestart.store(true);
@@ -2449,13 +2576,26 @@ int wmain(int argc, wchar_t** argv) {
                     };
                     histWrite.store(hi + 1, std::memory_order_release);
                 }
+                // 端点回环「采集源无音频」诊断（5 秒无数据包即判定）：
+                // 最常见的原因是系统默认输出没指向采集源端点 —— 此时发往该端点的
+                // 音频根本不存在，桥只能空转。控制台据此提示用户去改默认设备。
+                {
+                    LARGE_INTEGER qg2;
+                    QueryPerformanceCounter(&qg2);
+                    uint64_t lpq2 = lastCapQpc.load(std::memory_order_relaxed);
+                    bool idle2 = !lpq2 ||
+                                 ((uint64_t)qg2.QuadPart - lpq2) > (uint64_t)(qpcFreq * 5.0);
+                    g_capIdle.store((epCapture && idle2) ? 1 : 0, std::memory_order_relaxed);
+                }
                 SYSTEMTIME st;
                 GetLocalTime(&st);
                 float peakVal = peak.exchange(0.0f);
                 targetActive.store(peakVal > 0.005f, std::memory_order_relaxed);
                 // 目标自动切换：发现到「明显更响」的进程时重建锁定。
                 // 冷却 20 秒防抖；候选需比当前目标响 ≥1.5 倍才切换
-                {
+                // 端点回环模式下不存在「目标进程」概念（采的是整个端点的混音），
+                // 目标切换逻辑必须停用，否则发现线程会不断塞入 PID 触发无谓重建。
+                if (!epCapture) {
                     DWORD dp = discoveredPid.load(std::memory_order_relaxed);
                     float dpeak = discoveredPeak.load(std::memory_order_relaxed);
                     DWORD cur = targetPid.load(std::memory_order_relaxed);
@@ -2514,8 +2654,13 @@ int wmain(int argc, wchar_t** argv) {
             Sleep(50);
         }
         sessionActive.store(false, std::memory_order_release);
+        g_capIdle.store(0, std::memory_order_relaxed);
         rebuildCount.fetch_add(1, std::memory_order_relaxed);
+        printf("[自适应] 关闭音量映射...\n");
+        vmap.close();
+        g_volMapOn.store(0, std::memory_order_relaxed);
         printf("[自适应] 关闭采集端...\n");
+        ecap.close();
         pcap.close();
         printf("[自适应] 关闭输出端...\n");
         out->shutdown();
