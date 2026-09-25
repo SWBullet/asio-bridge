@@ -105,7 +105,10 @@ def main():
     files = args if args else (DEFAULT + INSTALLER if "--installer" in sys.argv else DEFAULT)
     bad = 0
     for f in files:
-        rel = os.path.relpath(f, ROOT)
+        try:
+            rel = os.path.relpath(f, ROOT)
+        except ValueError:      # 跨盘符（如已安装目录在 C:、源码在 E:）
+            rel = f
         if not os.path.exists(f):
             print("MISSING  %s" % rel)
             bad += 1
