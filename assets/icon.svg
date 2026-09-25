@@ -1,63 +1,27 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<svg width="256" height="256" viewBox="0 0 256 256" xmlns="http://www.w3.org/2000/svg">
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
   <defs>
-    <!-- 暗色仪表面板渐变（与 Web 控制台面板一致） -->
     <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0"   stop-color="#333a43"/>
-      <stop offset="0.55" stop-color="#20262d"/>
-      <stop offset="1"   stop-color="#121519"/>
+      <stop offset="0" stop-color="#333a43"/><stop offset="1" stop-color="#121519"/>
     </linearGradient>
-    <!-- 顶部高光斜角 -->
-    <linearGradient id="edgeHi" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0"   stop-color="#6c757f"/>
-      <stop offset="0.5" stop-color="#3a4048"/>
-      <stop offset="1"   stop-color="#191d22"/>
-    </linearGradient>
-    <!-- 琥珀色强调渐变（与控制台 #ffd27f 一致） -->
-    <linearGradient id="amber" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0"   stop-color="#ffe7b0"/>
-      <stop offset="0.45" stop-color="#ffc257"/>
-      <stop offset="1"   stop-color="#ff8f2e"/>
-    </linearGradient>
-    <linearGradient id="amberDim" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0"   stop-color="#caa05a"/>
-      <stop offset="1"   stop-color="#8a5a1e"/>
-    </linearGradient>
-    <!-- 暖色辉光 -->
-    <radialGradient id="glow" cx="0.5" cy="0.46" r="0.5">
-      <stop offset="0"   stop-color="#ffd27f" stop-opacity="0.55"/>
-      <stop offset="0.55" stop-color="#ffb24d" stop-opacity="0.18"/>
-      <stop offset="1"   stop-color="#ffb24d" stop-opacity="0"/>
+    <radialGradient id="glow" cx="0.5" cy="0.46" r="0.375">
+      <stop offset="0" stop-color="#ffd27f" stop-opacity="0.59"/>
+      <stop offset="1" stop-color="#ffd27f" stop-opacity="0"/>
     </radialGradient>
-    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
-      <feGaussianBlur stdDeviation="3.2"/>
-    </filter>
+    <linearGradient id="gold" x1="0" y1="0.2" x2="0" y2="0.8">
+      <stop offset="0" stop-color="#ffe7b0"/><stop offset="1" stop-color="#a86f25"/>
+    </linearGradient>
   </defs>
-
-  <!-- 磁贴底 -->
-  <rect x="10" y="10" width="236" height="236" rx="50" ry="50" fill="url(#tile)" stroke="#0a0c0f" stroke-width="2"/>
-  <rect x="11" y="11" width="234" height="234" rx="49" ry="49" fill="none" stroke="url(#edgeHi)" stroke-width="1.4"/>
-
-  <!-- 暖色辉光 -->
-  <ellipse cx="128" cy="118" rx="96" ry="88" fill="url(#glow)"/>
-
-  <!-- 桥面（桥接弧线，连接左右端点） -->
-  <path d="M52 204 Q128 226 204 204" fill="none" stroke="url(#amberDim)" stroke-width="7" stroke-linecap="round"/>
-  <!-- 桥墩 -->
-  <rect x="44" y="204" width="14" height="20" rx="3" fill="url(#amberDim)"/>
-  <rect x="198" y="204" width="14" height="20" rx="3" fill="url(#amberDim)"/>
-
-  <!-- 音频波形（发光主体） -->
-  <path id="wave" d="M44 132 C 62 86 86 86 104 132 C 122 178 146 178 164 132 C 182 86 206 86 218 132"
-        fill="none" stroke="url(#amber)" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
-  <!-- 波形辉光（模糊副本） -->
-  <use href="#wave" stroke="#ffd27f" stroke-width="20" opacity="0.30" filter="url(#soft)"/>
-
-  <!-- 端点节点（输入/输出端口） -->
-  <circle cx="44" cy="132" r="12" fill="url(#amber)"/>
-  <circle cx="218" cy="132" r="12" fill="url(#amber)"/>
-  <circle cx="44" cy="132" r="12" fill="none" stroke="#fff3da" stroke-width="1.6" opacity="0.85"/>
-  <circle cx="218" cy="132" r="12" fill="none" stroke="#fff3da" stroke-width="1.6" opacity="0.85"/>
-  <circle cx="44" cy="132" r="4.5" fill="#3a2a12"/>
-  <circle cx="218" cy="132" r="4.5" fill="#3a2a12"/>
+  <rect x="0" y="0" width="256" height="256" rx="50" fill="url(#tile)"/>
+  <rect x="0" y="0" width="256" height="256" rx="50" fill="url(#glow)"/>
+  <rect x="2" y="2" width="252" height="252" rx="48" fill="none"
+        stroke="#6c757f" stroke-opacity="0.47" stroke-width="1.4"/>
+  <line x1="39.75" y1="112.96" x2="39.75" y2="143.04" stroke="url(#gold)" stroke-width="7.50" stroke-linecap="round"/>
+  <line x1="61.81" y1="90.24" x2="61.81" y2="165.76" stroke="url(#gold)" stroke-width="7.50" stroke-linecap="round"/>
+  <line x1="83.88" y1="56.50" x2="83.88" y2="199.50" stroke="url(#gold)" stroke-width="7.50" stroke-linecap="round"/>
+  <line x1="105.94" y1="94.26" x2="105.94" y2="161.74" stroke="url(#gold)" stroke-width="7.50" stroke-linecap="round"/>
+  <line x1="128.00" y1="112.96" x2="128.00" y2="143.04" stroke="url(#gold)" stroke-width="7.50" stroke-linecap="round"/>
+  <line x1="150.06" y1="94.26" x2="150.06" y2="161.74" stroke="url(#gold)" stroke-width="7.50" stroke-linecap="round"/>
+  <line x1="172.12" y1="56.50" x2="172.12" y2="199.50" stroke="url(#gold)" stroke-width="7.50" stroke-linecap="round"/>
+  <line x1="194.19" y1="90.24" x2="194.19" y2="165.76" stroke="url(#gold)" stroke-width="7.50" stroke-linecap="round"/>
+  <line x1="216.25" y1="112.96" x2="216.25" y2="143.04" stroke="url(#gold)" stroke-width="7.50" stroke-linecap="round"/>
 </svg>

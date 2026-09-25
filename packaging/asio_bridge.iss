@@ -13,7 +13,7 @@
 ;   - 可选勾选「开机自动启动」「桌面快捷方式」
 ; ============================================================================
 #define MyAppName "ASIO Bridge"
-#define MyAppVersion "1.0.12"
+#define MyAppVersion "1.0.13"
 #define MyAppPublisher "文超工作室"
 #define MyAppExeName "asio_bridge.exe"
 
@@ -72,6 +72,8 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameter
 Filename: "{app}\{#MyAppExeName}"; Parameters: "--hidden"; Description: "立即运行 ASIO Bridge"; Flags: nowait postinstall skipifsilent unchecked
 ; 勾选「开机自动启动」时安装计划任务(隐藏窗口)
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\tools\install_autostart.ps1"""; Tasks: autostart; Flags: runhidden
+; 刷新资源管理器图标缓存：Windows 会缓存 exe 图标，不刷新的话升级后可能仍显示旧图标
+Filename: "{sys}\ie4uinit.exe"; Parameters: "-show"; Flags: runhidden; StatusMsg: "刷新图标缓存..."
 
 [UninstallRun]
 ; 卸载时移除计划任务(忽略错误)
